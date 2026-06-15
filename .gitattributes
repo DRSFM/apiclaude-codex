@@ -1,5 +1,8 @@
 * text=auto
 apiclaude text eol=lf
+apicodex text eol=lf
+apiagent text eol=lf
+install.sh text eol=lf
 *.py text eol=lf
 *.md text eol=lf
 *.bat text eol=crlf
