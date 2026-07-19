@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tauri API 测试</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            max-width: 800px;
+            margin: 50px auto;
+            padding: 20px;
+            background: #f5f5f5;
+        }
+        .test-card {
+            background: white;
+            padding: 20px;
+            margin: 10px 0;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .status {
+            display: inline-block;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+            font-weight: 600;
+        }
+        .status.success { background: #10b981; color: white; }
+        .status.error { background: #ef4444; color: white; }
+        .status.pending { background: #f59e0b; color: white; }
+        button {
+            background: #3b82f6;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 14px;
+        }
+        button:hover { background: #2563eb; }
+        pre {
+            background: #1e293b;
+            color: #e2e8f0;
+            padding: 15px;
+            border-radius: 6px;
+            overflow-x: auto;
+            font-size: 13px;
+        }
+    </style>
+</head>
+<body>
+    <h1>🔧 Tauri API 测试</h1>
+
+    <div class="test-card">
+        <h3>1. Tauri 环境检查</h3>
+        <p>状态: <span id="tauri-status" class="status pending">检测中...</span></p>
+        <pre id="tauri-info">等待检测...</pre>
+    </div>
+
+    <div class="test-card">
+        <h3>2. API 模块加载</h3>
+        <p>状态: <span id="api-status" class="status pending">检测中...</span></p>
+        <pre id="api-info">等待检测...</pre>
+    </div>
+
+    <div class="test-card">
+        <h3>3. 获取 Claude 节点</h3>
+        <button onclick="testGetNodes()">测试获取节点</button>
+        <p>状态: <span id="nodes-status" class="status pending">未测试</span></p>
+        <pre id="nodes-result">点击按钮测试...</pre>
+    </div>
+
+    <div class="test-card">
+        <h3>4. 文件夹选择对话框</h3>
+        <button onclick="testDialog()">测试对话框</button>
+        <p>状态: <span id="dialog-status" class="status pending">未测试</span></p>
+        <pre id="dialog-result">点击按钮测试...</pre>
+    </div>
+
+    <script type="module">
+        // 1. 检查 Tauri 环境
+        const tauriStatus = document.getElementById('tauri-status');
+        const tauriInfo = document.getElementById('tauri-info');
+
+        if (window.__TAURI__) {
+            tauriStatus.textContent = '✓ 已加载';
+            tauriStatus.className = 'status success';
+            tauriInfo.textContent = JSON.stringify({
+                version: window.__TAURI__?.version || 'unknown',
+                platform: window.__TAURI__?.os || 'unknown'
+            }, null, 2);
+        } else {
+            tauriStatus.textContent = '✗ 未加载';
+            tauriStatus.className = 'status error';
+            tauriInfo.textContent = 'Tauri 环境未找到！可能原因：\n1. 不在 Tauri 开发模式下运行\n2. withGlobalTauri 未启用';
+        }
+
+        // 2. 检查 API 模块
+        const apiStatus = document.getElementById('api-status');
+        const apiInfo = document.getElementById('api-info');
+
+        try {
+            const invoke = window.__TAURI__?.core?.invoke;
+            if (typeof invoke !== 'function') {
+                throw new Error('window.__TAURI__.core.invoke 不可用');
+            }
+            const open = (options) => invoke('plugin:dialog|open', { options });
+
+            apiStatus.textContent = '✓ 加载成功';
+            apiStatus.className = 'status success';
+            apiInfo.textContent = `invoke: ${typeof invoke}\nopen: ${typeof open}`;
+
+            // 保存到 window 供按钮使用
+            window.tauriInvoke = invoke;
+            window.tauriOpen = open;
+        } catch (err) {
+            apiStatus.textContent = '✗ 加载失败';
+            apiStatus.className = 'status error';
+            apiInfo.textContent = `错误: ${err.message}\n\n可能原因：\n1. 不在 Tauri 窗口中运行\n2. withGlobalTauri 未启用\n3. dialog 权限未配置`;
+        }
+
+        // 3. 测试获取节点
+        window.testGetNodes = async function() {
+            const status = document.getElementById('nodes-status');
+            const result = document.getElementById('nodes-result');
+
+            status.textContent = '测试中...';
+            status.className = 'status pending';
+
+            try {
+                const nodes = await window.tauriInvoke('get_claude_nodes');
+                status.textContent = '✓ 成功';
+                status.className = 'status success';
+                result.textContent = JSON.stringify(nodes, null, 2);
+            } catch (err) {
+                status.textContent = '✗ 失败';
+                status.className = 'status error';
+                result.textContent = `错误: ${err}\n\n可能原因：\n1. Rust 后端未编译\n2. 命令名称不匹配\n3. 配置文件读取失败`;
+            }
+        };
+
+        // 4. 测试对话框
+        window.testDialog = async function() {
+            const status = document.getElementById('dialog-status');
+            const result = document.getElementById('dialog-result');
+
+            status.textContent = '测试中...';
+            status.className = 'status pending';
+
+            try {
+                const folder = await window.tauriOpen({
+                    directory: true,
+                    multiple: false,
+                    title: '测试：选择文件夹'
+                });
+                status.textContent = '✓ 成功';
+                status.className = 'status success';
+                result.textContent = `选择的文件夹:\n${folder || '(已取消)'}`;
+            } catch (err) {
+                status.textContent = '✗ 失败';
+                status.className = 'status error';
+                result.textContent = `错误: ${err}`;
+            }
+        };
+    </script>
+</body>
+</html>

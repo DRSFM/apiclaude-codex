@@ -1,0 +1,41 @@
+# 请先阅读
+
+## 最简单的使用方式
+
+日常使用直接双击：
+
+  启动应用.bat
+
+它会优先打开：
+
+  dist\API-Node-Manager.exe
+
+如果 dist 里还没有 exe，会自动使用源码构建 release 版本后打开。
+
+## 需要重新打包 exe
+
+双击：
+
+  打包EXE.bat
+
+生成位置：
+
+  dist\API-Node-Manager.exe
+
+这个脚本默认只生成可直接运行的 exe，不下载 NSIS 安装包，避免网络超时。
+
+## 需要从源码启动
+
+双击：
+
+  启动源码版.bat
+
+它会检查 release exe 是否过期；源码更新后会自动重新构建，然后打开应用。
+
+## 其他脚本
+
+  启动环境检查.bat  检查 Node.js / npm / Rust
+  启动开发模式.bat  开发调试用，会显示 Tauri dev 输出
+  初始化配置.bat    创建示例 Claude 配置
+
+现在 .bat 已经改成 PowerShell 包装器，可以在中文路径下双击使用。

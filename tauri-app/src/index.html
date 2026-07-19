@@ -1,0 +1,703 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>API Node Manager</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="window-frame">
+        <!-- Title Bar -->
+        <div class="title-bar">
+            <div class="traffic-lights">
+                <span class="dot red"></span>
+                <span class="dot yellow"></span>
+                <span class="dot green"></span>
+            </div>
+            <div class="title-bar-center">
+                <div class="search-box">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg>
+                    <input type="text" placeholder="搜索模型 / API 节点" id="searchInput">
+                </div>
+            </div>
+            <div class="title-bar-right">
+                <span class="connection-badge"><span class="dot-sm green"></span> 已连接</span>
+                <button class="btn-switch" id="quickSwitchBtn">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
+                    一键切换
+                </button>
+            </div>
+        </div>
+
+        <div class="app-body">
+            <!-- Sidebar -->
+            <nav class="sidebar">
+                <div class="nav-section">
+                    <a class="nav-item active" data-view="claude">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
+                        <span>Claude 节点</span>
+                    </a>
+                    <a class="nav-item" data-view="codex">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg>
+                        <span>Codex 配置</span>
+                    </a>
+                    <a class="nav-item" data-view="settings">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+                        <span>设置</span>
+                    </a>
+                </div>
+                <div class="sidebar-stats">
+                    <p class="stats-label">节点总数（今日）</p>
+                    <p class="stats-value" id="totalNodesCount">0</p>
+                    <div class="stats-bar">
+                        <div class="stats-bar-fill" id="activeBar" style="width: 0%"></div>
+                    </div>
+                    <p class="stats-sub" id="activeNodesLabel">活跃: 0</p>
+                </div>
+            </nav>
+
+            <!-- Main Content -->
+            <main class="main-content">
+                <!-- Claude View -->
+                <div id="claude-view" class="view active">
+                    <!-- Stats Cards -->
+                    <div class="stats-cards" id="claudeStatsCards">
+                        <div class="stat-card">
+                            <div class="stat-icon blue">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+                            </div>
+                            <div class="stat-info">
+                                <span class="stat-label">当前节点</span>
+                                <span class="stat-main" id="claudeCurrentName">-</span>
+                                <span class="stat-sub green" id="claudeCurrentStatus">未选择</span>
+                            </div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-icon purple">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20V10M18 20V4M6 20v-4"/></svg>
+                            </div>
+                            <div class="stat-info">
+                                <span class="stat-label">节点数量</span>
+                                <span class="stat-main" id="claudeNodeCount">0</span>
+                                <span class="stat-sub">已配置</span>
+                            </div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-icon green">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
+                            </div>
+                            <div class="stat-info">
+                                <span class="stat-label">可用状态</span>
+                                <span class="stat-main green" id="claudeAvailCount">0</span>
+                                <span class="stat-sub">可用</span>
+                            </div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-icon orange">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="16 3 21 3 21 8"/><line x1="4" y1="20" x2="21" y2="3"/><polyline points="21 16 21 21 16 21"/><line x1="15" y1="15" x2="21" y2="21"/><line x1="4" y1="4" x2="9" y2="9"/></svg>
+                            </div>
+                            <div class="stat-info">
+                                <span class="stat-label">切换模式</span>
+                                <span class="stat-main">手动切换</span>
+                                <span class="stat-sub">点击节点即可切换</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Table Header -->
+                    <div class="table-toolbar">
+                        <h3>快捷切换 Claude API 节点</h3>
+                        <div class="toolbar-actions">
+                            <button class="btn-outline" onclick="loadData()">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+                                刷新
+                            </button>
+                            <button class="btn-primary" id="addClaudeBtn">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+                                添加节点
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- Node Table -->
+                    <div class="table-container">
+                        <table class="node-table">
+                            <thead>
+                                <tr>
+                                    <th>节点名称</th>
+                                    <th>提供商</th>
+                                    <th>Base URL</th>
+                                    <th>Token</th>
+                                    <th>状态</th>
+                                    <th>操作</th>
+                                </tr>
+                            </thead>
+                            <tbody id="claudeTableBody">
+                            </tbody>
+                        </table>
+                    </div>
+                    <div class="table-footer">
+                        <span id="claudeFooterCount">共 0 个节点</span>
+                    </div>
+                </div>
+
+                <!-- Codex View -->
+                <div id="codex-view" class="view">
+                    <div class="stats-cards" id="codexStatsCards">
+                        <div class="stat-card">
+                            <div class="stat-icon blue">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+                            </div>
+                            <div class="stat-info">
+                                <span class="stat-label">当前配置</span>
+                                <span class="stat-main" id="codexCurrentName">-</span>
+                                <span class="stat-sub">Codex CLI</span>
+                            </div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-icon purple">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20V10M18 20V4M6 20v-4"/></svg>
+                            </div>
+                            <div class="stat-info">
+                                <span class="stat-label">配置数量</span>
+                                <span class="stat-main" id="codexProfileCount">0</span>
+                                <span class="stat-sub">已保存</span>
+                            </div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-icon green">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
+                            </div>
+                            <div class="stat-info">
+                                <span class="stat-label">可用状态</span>
+                                <span class="stat-main green" id="codexAvailCount">0</span>
+                                <span class="stat-sub">可用</span>
+                            </div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-icon orange">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg>
+                            </div>
+                            <div class="stat-info">
+                                <span class="stat-label">最近使用</span>
+                                <span class="stat-main" id="codexLastUsed">-</span>
+                                <span class="stat-sub" id="codexLastUsedSub">无记录</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="table-toolbar">
+                        <h3>快捷切换 Codex API 配置</h3>
+                        <div class="toolbar-actions">
+                            <button class="btn-outline" onclick="loadData()">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+                                刷新
+                            </button>
+                            <button class="btn-primary" id="addCodexBtn">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+                                添加配置
+                            </button>
+                        </div>
+                    </div>
+
+                    <div class="table-container">
+                        <table class="node-table">
+                            <thead>
+                                <tr>
+                                    <th>配置名称</th>
+                                    <th>Base URL</th>
+                                    <th>上次使用</th>
+                                    <th>状态</th>
+                                    <th>操作</th>
+                                </tr>
+                            </thead>
+                            <tbody id="codexTableBody">
+                            </tbody>
+                        </table>
+                    </div>
+                    <div class="table-footer">
+                        <span id="codexFooterCount">共 0 个配置</span>
+                    </div>
+                </div>
+
+                <!-- Settings View -->
+                <div id="settings-view" class="view">
+                    <div class="settings-header">
+                        <h2>应用设置</h2>
+                        <p>自定义 API Node Manager 的行为和偏好</p>
+                    </div>
+
+                    <!-- 启动默认值 -->
+                    <div class="settings-section">
+                        <div class="section-header">
+                            <div class="section-icon blue">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
+                            </div>
+                            <div>
+                                <h3>启动默认值</h3>
+                                <p>设置快速启动时的默认选项</p>
+                            </div>
+                        </div>
+                        <div class="settings-grid">
+                            <div class="setting-item">
+                                <label class="setting-label">
+                                    <span>默认启动模式</span>
+                                    <span class="setting-desc">选择节点启动时的默认行为</span>
+                                </label>
+                                <select id="settingDefaultMode" class="setting-select">
+                                    <option value="new">新对话</option>
+                                    <option value="resume">Resume 上次会话</option>
+                                </select>
+                            </div>
+                            <div class="setting-item">
+                                <label class="setting-label">
+                                    <span>默认权限模式</span>
+                                    <span class="setting-desc">控制 CLI 工具的文件系统访问权限</span>
+                                </label>
+                                <select id="settingDefaultPerm" class="setting-select">
+                                    <option value="default">默认权限（交互式）</option>
+                                    <option value="bypassPermissions">完全访问（自动允许）</option>
+                                    <option value="sandbox">沙盒模式（安全优先）</option>
+                                </select>
+                            </div>
+                            <div class="setting-item">
+                                <label class="setting-label">
+                                    <span>记住工作目录</span>
+                                    <span class="setting-desc">启动时自动填充上次使用的文件夹</span>
+                                </label>
+                                <label class="toggle-switch">
+                                    <input type="checkbox" id="settingRememberFolder">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- 应用行为 -->
+                    <div class="settings-section">
+                        <div class="section-header">
+                            <div class="section-icon purple">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 1v6m0 6v6m5.2-14.2l-4.2 4.2m0 6l4.2 4.2M23 12h-6m-6 0H1m18.2 5.2l-4.2-4.2m0-6l-4.2-4.2"/></svg>
+                            </div>
+                            <div>
+                                <h3>应用行为</h3>
+                                <p>控制应用的自动化行为和交互方式</p>
+                            </div>
+                        </div>
+                        <div class="settings-grid">
+                            <div class="setting-item">
+                                <label class="setting-label">
+                                    <span>启动时自动刷新</span>
+                                    <span class="setting-desc">打开应用时自动加载最新节点列表</span>
+                                </label>
+                                <label class="toggle-switch">
+                                    <input type="checkbox" id="settingAutoRefresh" checked>
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </div>
+                            <div class="setting-item">
+                                <label class="setting-label">
+                                    <span>删除前二次确认</span>
+                                    <span class="setting-desc">删除节点或配置前弹出确认对话框</span>
+                                </label>
+                                <label class="toggle-switch">
+                                    <input type="checkbox" id="settingConfirmDelete" checked>
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </div>
+                            <div class="setting-item">
+                                <label class="setting-label">
+                                    <span>节点排序方式</span>
+                                    <span class="setting-desc">表格中节点的默认排序规则</span>
+                                </label>
+                                <select id="settingSortBy" class="setting-select">
+                                    <option value="name">按名称排序</option>
+                                    <option value="time">按使用时间排序</option>
+                                    <option value="provider">按提供商排序</option>
+                                </select>
+                            </div>
+                            <div class="setting-item">
+                                <label class="setting-label">
+                                    <span>显示完整 Token</span>
+                                    <span class="setting-desc">在表格中显示完整 Token 而非脱敏</span>
+                                </label>
+                                <label class="toggle-switch">
+                                    <input type="checkbox" id="settingShowFullToken">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- 主题外观 -->
+                    <div class="settings-section">
+                        <div class="section-header">
+                            <div class="section-icon orange">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="5"/><path d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72l1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
+                            </div>
+                            <div>
+                                <h3>主题与外观</h3>
+                                <p>自定义界面的视觉风格</p>
+                            </div>
+                        </div>
+                        <div class="settings-grid">
+                            <div class="setting-item">
+                                <label class="setting-label">
+                                    <span>主题模式</span>
+                                    <span class="setting-desc">选择浅色或深色界面风格</span>
+                                </label>
+                                <select id="settingTheme" class="setting-select">
+                                    <option value="light">浅色模式</option>
+                                    <option value="dark">深色模式</option>
+                                    <option value="auto">跟随系统</option>
+                                </select>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- 使用统计 -->
+                    <div class="settings-section">
+                        <div class="section-header">
+                            <div class="section-icon purple">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20V10M18 20V4M6 20v-4"/></svg>
+                            </div>
+                            <div>
+                                <h3>使用统计</h3>
+                                <p>查看节点 Token 消耗和使用趋势</p>
+                            </div>
+                        </div>
+
+                        <div id="statsUnavailable" style="display:none">
+                            <div class="stats-unavailable-notice">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+                                <p>统计数据不可用</p>
+                                <span>需要安装并运行「Token 记录应用」来收集使用数据</span>
+                            </div>
+                        </div>
+
+                        <div id="statsAvailable" style="display:none">
+                            <!-- 概览卡片 -->
+                            <div class="stats-overview-cards">
+                                <div class="stats-overview-card">
+                                    <div class="stats-card-icon blue">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg>
+                                    </div>
+                                    <div class="stats-card-content">
+                                        <span class="stats-card-label">今日 Token</span>
+                                        <span class="stats-card-value" id="statsTodayTokens">0</span>
+                                        <span class="stats-card-sub" id="statsTodayRequests">0 次请求</span>
+                                    </div>
+                                </div>
+                                <div class="stats-overview-card">
+                                    <div class="stats-card-icon green">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+                                    </div>
+                                    <div class="stats-card-content">
+                                        <span class="stats-card-label">本周 Token</span>
+                                        <span class="stats-card-value" id="statsWeekTokens">0</span>
+                                        <span class="stats-card-sub" id="statsWeekRequests">0 次请求</span>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- Top 节点排行 -->
+                            <div class="stats-ranking">
+                                <h4>Top 节点排行（按 Token 消耗）</h4>
+                                <div id="statsTopNodes" class="stats-ranking-list">
+                                    <!-- 动态生成 -->
+                                </div>
+                            </div>
+
+                            <div class="stats-actions">
+                                <button class="btn-outline" onclick="refreshUsageStats()">
+                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+                                    刷新统计
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- 数据管理 -->
+                    <div class="settings-section">
+                        <div class="section-header">
+                            <div class="section-icon green">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                            </div>
+                            <div>
+                                <h3>数据管理</h3>
+                                <p>管理配置文件和应用数据</p>
+                            </div>
+                        </div>
+                        <div class="settings-grid">
+                            <div class="setting-item wide">
+                                <label class="setting-label">
+                                    <span>Claude 配置文件路径</span>
+                                    <span class="setting-desc">~/.apiclaude_config.json</span>
+                                </label>
+                                <button class="btn-outline-sm" onclick="openConfigFolder('claude')">
+                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+                                    打开文件夹
+                                </button>
+                            </div>
+                            <div class="setting-item wide">
+                                <label class="setting-label">
+                                    <span>Codex 配置文件路径</span>
+                                    <span class="setting-desc">~/.codex-api/</span>
+                                </label>
+                                <button class="btn-outline-sm" onclick="openConfigFolder('codex')">
+                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+                                    打开文件夹
+                                </button>
+                            </div>
+                        </div>
+                        <div class="settings-actions">
+                            <button class="btn-outline" onclick="exportSettings()">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                                导出配置（不含敏感信息）
+                            </button>
+                            <button class="btn-outline" onclick="clearUsageData()">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+                                清除使用记录
+                            </button>
+                            <button class="btn-danger" onclick="resetSettings()">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg>
+                                重置所有设置
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- 关于 -->
+                    <div class="settings-section">
+                        <div class="section-header">
+                            <div class="section-icon gray">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
+                            </div>
+                            <div>
+                                <h3>关于</h3>
+                                <p>应用版本和项目信息</p>
+                            </div>
+                        </div>
+                        <div class="about-box">
+                            <div class="about-logo">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
+                            </div>
+                            <h4>API Node Manager</h4>
+                            <p class="version-tag">v1.0.0</p>
+                            <p class="about-desc">跨平台 Claude Code 和 Codex CLI 的 API 节点管理器</p>
+                            <div class="about-links">
+                                <a href="#" onclick="openExternal('https://github.com/yourusername/apiclaude-codex');return false" class="about-link">
+                                    <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/></svg>
+                                    GitHub
+                                </a>
+                                <a href="#" onclick="openExternal('https://github.com/yourusername/apiclaude-codex/issues');return false" class="about-link">
+                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
+                                    报告问题
+                                </a>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </main>
+
+            <!-- Detail Panel -->
+            <aside class="detail-panel" id="detailPanel">
+                <div class="panel-head">
+                    <div class="panel-title">
+                        <div class="panel-icon" id="panelIcon">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/></svg>
+                        </div>
+                        <div>
+                            <h3 id="panelName">-</h3>
+                            <p id="panelSub">选择一个节点查看详情</p>
+                        </div>
+                    </div>
+                    <span class="panel-badge" id="panelBadge" style="display:none">当前节点</span>
+                </div>
+
+                <div class="panel-section">
+                    <h4>节点信息 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="width:14px;height:14px;vertical-align:middle;opacity:0.4"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg></h4>
+                    <div class="info-grid">
+                        <div class="info-row">
+                            <span class="info-label">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg>
+                                类型
+                            </span>
+                            <span class="info-value" id="panelType">-</span>
+                        </div>
+                        <div class="info-row">
+                            <span class="info-label">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
+                                Base URL
+                            </span>
+                            <span class="info-value mono" id="panelUrl">-</span>
+                        </div>
+                        <div class="info-row">
+                            <span class="info-label">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+                                Token
+                            </span>
+                            <span class="info-value mono" id="panelToken">-</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="panel-section">
+                    <h4>端点地址</h4>
+                    <div class="endpoint-box">
+                        <span id="panelEndpoint">-</span>
+                        <button class="btn-copy" onclick="copyEndpoint()" title="复制">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+                        </button>
+                    </div>
+                </div>
+
+                <div class="panel-actions">
+                    <button class="btn-switch-full" id="panelSwitchBtn" onclick="panelSwitch()">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
+                        切换到此节点
+                    </button>
+                    <div class="panel-actions-row">
+                        <button class="btn-outline-sm" onclick="panelDelete()">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+                            删除
+                        </button>
+                    </div>
+                </div>
+            </aside>
+        </div>
+
+        <!-- Status Bar -->
+        <div class="status-bar">
+            <div class="status-bar-left">
+                <span class="dot-sm green"></span>
+                <span>API Manager 已启动</span>
+                <span class="status-sep">·</span>
+                <span id="statusText">就绪</span>
+            </div>
+            <div class="status-bar-center">
+                <span id="statusTime"></span>
+            </div>
+            <div class="status-bar-right">
+                <span class="dot-sm green"></span>
+                <span>v1.0.0</span>
+            </div>
+        </div>
+    </div>
+
+    <!-- Add Modal -->
+    <div class="modal-overlay" id="modal">
+        <div class="modal-box">
+            <div class="modal-header">
+                <h3 id="modalTitle">添加 Claude 节点</h3>
+                <button class="btn-close" onclick="closeModal()">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                </button>
+            </div>
+            <form id="addForm" onsubmit="submitForm(event)">
+                <div class="field">
+                    <label>名称</label>
+                    <input type="text" id="fName" required placeholder="例如: bohe-relay">
+                </div>
+                <div class="field">
+                    <label>Base URL</label>
+                    <input type="text" id="fBaseUrl" placeholder="https://api.example.com">
+                </div>
+                <div class="field">
+                    <label id="fTokenLabel">API Token</label>
+                    <input type="password" id="fToken" required placeholder="sk-...">
+                </div>
+                <div class="field" id="fModelField" style="display:none">
+                    <label>Model</label>
+                    <input type="text" id="fModel" placeholder="gpt-5.5">
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn-cancel" onclick="closeModal()">取消</button>
+                    <button type="submit" class="btn-primary">确认添加</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Launch Config Modal -->
+    <div class="modal-overlay" id="launchModal">
+        <div class="modal-box">
+            <div class="modal-header">
+                <h3 id="launchModalTitle">启动配置</h3>
+                <button class="btn-close" onclick="closeLaunchModal()">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                </button>
+            </div>
+            <div style="padding: 20px;">
+                <div class="field">
+                    <label>工作目录</label>
+                    <div style="display: flex; gap: 8px;">
+                        <input type="text" id="launchFolder" readonly style="flex: 1; background: #f5f6fa;">
+                        <button type="button" class="btn-outline" onclick="reSelectFolder()" style="padding: 9px 14px;">重选</button>
+                    </div>
+                </div>
+
+                <div class="field" id="launchModeField">
+                    <label id="launchModeLabel">启动模式</label>
+                    <div class="radio-group">
+                        <label class="radio-option">
+                            <input type="radio" name="launchMode" value="new" checked>
+                            <span class="radio-label">
+                                <span class="radio-title" id="launchModeNewTitle">新对话</span>
+                                <span class="radio-desc" id="launchModeNewDesc">从零开始新的对话会话</span>
+                            </span>
+                        </label>
+                        <label class="radio-option">
+                            <input type="radio" name="launchMode" value="resume">
+                            <span class="radio-label">
+                                <span class="radio-title" id="launchModeResumeTitle">Resume 上次会话</span>
+                                <span class="radio-desc" id="launchModeResumeDesc">继续上一次的对话内容</span>
+                            </span>
+                        </label>
+                    </div>
+                </div>
+
+                <div class="field" id="launchPermField">
+                    <label id="launchPermLabel">权限模式</label>
+                    <div class="radio-group">
+                        <label class="radio-option">
+                            <input type="radio" name="launchPerm" value="default" checked>
+                            <span class="radio-label">
+                                <span class="radio-title" id="launchPermDefaultTitle">默认权限</span>
+                                <span class="radio-desc" id="launchPermDefaultDesc">根据提示选择允许或拒绝操作</span>
+                            </span>
+                        </label>
+                        <label class="radio-option">
+                            <input type="radio" name="launchPerm" value="bypassPermissions">
+                            <span class="radio-label">
+                                <span class="radio-title" id="launchPermBypassTitle">完全访问（bypassPermissions）</span>
+                                <span class="radio-desc" id="launchPermBypassDesc">自动允许所有操作，无需确认</span>
+                            </span>
+                        </label>
+                        <label class="radio-option">
+                            <input type="radio" name="launchPerm" value="sandbox">
+                            <span class="radio-label">
+                                <span class="radio-title" id="launchPermSandboxTitle">沙盒模式</span>
+                                <span class="radio-desc" id="launchPermSandboxDesc">限制文件系统访问，安全优先</span>
+                            </span>
+                        </label>
+                    </div>
+                </div>
+
+                <div class="field" id="launchModelField">
+                    <label id="launchModelLabel">模型选择</label>
+                    <input type="text" id="launchModel" list="launchModelList" placeholder="留空使用配置默认模型">
+                    <datalist id="launchModelList"></datalist>
+                </div>
+
+                <div class="modal-footer">
+                    <button type="button" class="btn-cancel" onclick="closeLaunchModal()">取消</button>
+                    <button type="button" class="btn-primary" onclick="confirmLaunch()">确认启动</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script type="module" src="app.js"></script>
+</body>
+</html>
