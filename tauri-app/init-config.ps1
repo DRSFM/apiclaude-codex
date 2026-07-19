@@ -1,8 +1,8 @@
-# 初始化示例配置
+# 初始化空配置
 
 $configPath = "$env:USERPROFILE\.apiclaude_config.json"
 
-Write-Host "正在创建示例 Claude API 配置..."
+Write-Host "正在创建 Claude API 配置..."
 Write-Host ""
 
 # 检查配置文件是否已存在
@@ -16,19 +16,10 @@ if (Test-Path $configPath) {
     }
 }
 
-# 创建示例配置
+# API Token 不写入此文件；请通过应用或 apiclaude add 安全录入。
 $config = @{
-    current = "示例节点 1"
-    nodes = @{
-        "示例节点 1" = @{
-            base_url = "https://api.anthropic.com/v1"
-            token = "sk-ant-api03-示例密钥-请替换为真实密钥"
-        }
-        "示例节点 2" = @{
-            base_url = "https://api.example.com/v1"
-            token = "sk-example-key-12345"
-        }
-    }
+    current = $null
+    nodes = @{}
 }
 
 # 保存配置
@@ -37,11 +28,8 @@ $json = $config | ConvertTo-Json -Depth 10
 
 Write-Host "✓ 配置文件已创建: $configPath" -ForegroundColor Green
 Write-Host ""
-Write-Host "包含 2 个示例节点："
-Write-Host "  1. 示例节点 1 (当前节点)"
-Write-Host "  2. 示例节点 2"
-Write-Host ""
-Write-Host "请编辑配置文件，替换为真实的 API 密钥。" -ForegroundColor Yellow
+Write-Host "请通过应用的「添加节点」功能或 apiclaude add 录入 API Token。" -ForegroundColor Yellow
+Write-Host "Token 将使用 Windows DPAPI 加密，不会写入此 JSON 文件。"
 Write-Host ""
 Write-Host "现在可以启动应用查看效果："
 Write-Host "  .\dev.ps1"

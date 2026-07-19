@@ -22,15 +22,24 @@ from getpass import getpass
 from pathlib import Path
 from typing import Any
 
+from secure_store import SecureStore, SecureStoreError
+
 
 HOME = Path.home()
 CODEX_HOME = HOME / ".codex-api"
 CODEX_PROFILES_PATH = CODEX_HOME / "profiles.json"
 CODEX_ARCHIVE_ROOT = CODEX_HOME / "archived-profiles"
 CLAUDE_CONFIG_PATH = HOME / ".apiclaude_config.json"
+SECRET_STORE = SecureStore(HOME / ".apiagent-secrets")
 DEFAULT_CODEX_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_CODEX_MODEL = "gpt-5.5"
 HIDDEN_PREFIX_CHARS = "\ufeff\u200b\u200c\u200d\u2060\ufffd"
+CODEX_PARENT_CONTEXT_ENV = (
+    "CODEX_INTERNAL_ORIGINATOR_OVERRIDE",
+    "CODEX_PERMISSION_PROFILE",
+    "CODEX_SHELL",
+    "CODEX_THREAD_ID",
+)
 
 
 def now_iso() -> str:
@@ -69,13 +78,21 @@ def write_json(path: Path, data: Any) -> None:
     path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
-def run_command(command: str, args: list[str], env: dict[str, str] | None = None, input_text: str | None = None) -> int:
+def run_command(
+    command: str,
+    args: list[str],
+    env: dict[str, str] | None = None,
+    input_text: str | None = None,
+    env_remove: tuple[str, ...] | list[str] = (),
+) -> int:
     exe = shutil.which(command)
     if not exe:
         print(f"Error: command not found: {command}", file=sys.stderr)
         return 1
 
     proc_env = os.environ.copy()
+    for key in env_remove:
+        proc_env.pop(key, None)
     if env:
         proc_env.update(env)
 
@@ -118,11 +135,100 @@ def codex_profile_home(profile: dict[str, Any]) -> Path:
 def load_codex_profiles() -> list[dict[str, Any]]:
     initialize_codex_store()
     data = read_json(CODEX_PROFILES_PATH, {"version": 1, "profiles": []})
-    return list(data.get("profiles") or [])
+    profiles = list(data.get("profiles") or [])
+    if migrate_codex_secrets(profiles, SECRET_STORE):
+        save_codex_profiles(profiles)
+        finalize_codex_migration(profiles, SECRET_STORE)
+    return profiles
 
 
 def save_codex_profiles(profiles: list[dict[str, Any]]) -> None:
     write_json(CODEX_PROFILES_PATH, {"version": 1, "profiles": profiles})
+
+
+def codex_credential_id(profile: dict[str, Any]) -> str:
+    identity = profile.get("id") or profile.get("name") or "default"
+    return f"codex:{identity}"
+
+
+def get_codex_secret(profile: dict[str, Any]) -> str:
+    credential_id = profile.get("credentialId") or codex_credential_id(profile)
+    return SECRET_STORE.get(credential_id)
+
+
+def _saved_api_key(auth_path: Path) -> str:
+    if not auth_path.exists():
+        return ""
+    data = read_json(auth_path, {})
+    key_name = next(
+        (
+            name
+            for name in data
+            if "API_KEY" in name.upper() or name.upper() == "OPENAI_API_KEY"
+        ),
+        None,
+    )
+    value = data.get(key_name, "") if key_name else ""
+    return clean_hidden_prefix(value) if isinstance(value, str) else ""
+
+
+def migrate_codex_secrets(
+    profiles: list[dict[str, Any]],
+    store: SecureStore,
+) -> bool:
+    changed = False
+    for profile in profiles:
+        credential_id = profile.get("credentialId") or codex_credential_id(profile)
+        home = codex_profile_home(profile)
+        auth_path = home / "auth.json"
+        embedded = profile.get("api_key") or profile.get("apiKey") or ""
+        saved = _saved_api_key(auth_path)
+        secret = clean_hidden_prefix(embedded) if isinstance(embedded, str) else ""
+        secret = secret or saved
+
+        if secret:
+            store.set(credential_id, secret)
+            if store.get(credential_id) != secret:
+                raise SecureStoreError(
+                    f"Failed to verify migrated credential '{credential_id}'"
+                )
+            profile["credentialId"] = credential_id
+            profile.pop("api_key", None)
+            profile.pop("apiKey", None)
+            base_url = (
+                profile.get("baseUrl")
+                or profile.get("base_url")
+                or DEFAULT_CODEX_BASE_URL
+            )
+            model = profile.get("model") or DEFAULT_CODEX_MODEL
+            write_codex_config(home, base_url, model)
+            changed = True
+    return changed
+
+
+def finalize_codex_migration(
+    profiles: list[dict[str, Any]],
+    store: SecureStore,
+) -> None:
+    for profile in profiles:
+        credential_id = profile.get("credentialId")
+        if not credential_id:
+            continue
+        auth_path = codex_profile_home(profile) / "auth.json"
+        saved = _saved_api_key(auth_path)
+        if not saved:
+            continue
+        if store.get(credential_id) != saved:
+            raise SecureStoreError(
+                f"Refusing to sanitize unverified credential '{credential_id}'"
+            )
+        write_json(
+            auth_path,
+            {
+                "credential_store": "windows-dpapi",
+                "credential_id": credential_id,
+            },
+        )
 
 
 def initialize_codex_store() -> None:
@@ -152,16 +258,23 @@ def write_codex_config(home: Path, base_url: str, model: str = DEFAULT_CODEX_MOD
     config = f'''model = "{model}"
 model_provider = "apicodex"
 model_reasoning_effort = "high"
-auth_credentials_store = "file"
 
 [windows]
 sandbox = "unelevated"
+
+[shell_environment_policy]
+exclude = ["APICODEX_API_KEY"]
+
+[features]
+apps = false
+plugins = false
 
 [model_providers.apicodex]
 name = "API Codex"
 base_url = "{base_url}"
 wire_api = "responses"
-requires_openai_auth = true
+env_key = "APICODEX_API_KEY"
+requires_openai_auth = false
 '''
     (home / "config.toml").write_text(config, encoding="utf-8")
 
@@ -196,27 +309,6 @@ def show_codex_profiles(profiles: list[dict[str, Any]]) -> None:
             f"[{index}] {profile.get('name')}  {profile.get('baseUrl')}  "
             f"lastUsed={profile.get('lastUsedAt') or '-'}"
         )
-
-
-def clean_saved_codex_auth(home: Path) -> None:
-    auth_path = home / "auth.json"
-    if not auth_path.exists():
-        return
-    data = read_json(auth_path, {})
-    key_name = next((name for name in data if "API_KEY" in name.upper() or "OPENAI" in name.upper()), None)
-    if not key_name or not isinstance(data.get(key_name), str):
-        return
-    cleaned = clean_hidden_prefix(data[key_name])
-    if cleaned != data[key_name]:
-        data[key_name] = cleaned
-        write_json(auth_path, data)
-
-
-def codex_login_with_key(home: Path, api_key: str) -> int:
-    api_key = clean_hidden_prefix(api_key)
-    code = run_command("codex", ["login", "--with-api-key"], env={"CODEX_HOME": str(home)}, input_text=api_key + "\n")
-    clean_saved_codex_auth(home)
-    return code
 
 
 def add_codex_profile() -> int:
@@ -254,17 +346,17 @@ def add_codex_profile() -> int:
         }
         home = codex_profile_home(profile)
 
-    write_codex_config(home, base_url)
     api_key = getpass("API key: ")
     if not api_key.strip():
         print("Error: API key cannot be empty.", file=sys.stderr)
         return 1
-    code = codex_login_with_key(home, api_key)
-    if code != 0:
-        return code
+    credential_id = codex_credential_id(profile)
+    SECRET_STORE.set(credential_id, clean_hidden_prefix(api_key))
+    write_codex_config(home, base_url, profile.get("model") or DEFAULT_CODEX_MODEL)
 
     profile["name"] = name
     profile["baseUrl"] = base_url
+    profile["credentialId"] = credential_id
     profile["lastUsedAt"] = now_iso()
     updated = [profile if item.get("id") == profile.get("id") else item for item in profiles]
     if not any(item.get("id") == profile.get("id") for item in profiles):
@@ -292,6 +384,8 @@ def remove_codex_profile() -> int:
         print("Cancelled.")
         return 0
     save_codex_profiles([item for item in profiles if item.get("id") != profile.get("id")])
+    if profile.get("credentialId"):
+        SECRET_STORE.clear(profile["credentialId"])
     if profile.get("home") != ".":
         home = codex_profile_home(profile)
         if home.exists():
@@ -392,30 +486,77 @@ def codex_main(args: list[str]) -> int:
         if code != 0 or not pass_through:
             return code
 
-    selected = select_codex_profile(load_codex_profiles(), requested)
+    profiles = load_codex_profiles()
+    selected = select_codex_profile(profiles, requested)
     if not selected:
         return 1
     home = codex_profile_home(selected)
     if not (home / "config.toml").exists():
-        write_codex_config(home, selected.get("baseUrl", DEFAULT_CODEX_BASE_URL))
-    if not (home / "auth.json").exists():
+        write_codex_config(
+            home,
+            selected.get("baseUrl", DEFAULT_CODEX_BASE_URL),
+            selected.get("model") or DEFAULT_CODEX_MODEL,
+        )
+    try:
+        api_key = get_codex_secret(selected)
+    except (KeyError, SecureStoreError):
         print(f"Profile '{selected.get('name')}' has no saved API key yet.")
         api_key = getpass("API key: ")
-        code = codex_login_with_key(home, api_key)
-        if code != 0:
-            return code
+        if not api_key.strip():
+            print("Error: API key cannot be empty.", file=sys.stderr)
+            return 1
+        credential_id = codex_credential_id(selected)
+        SECRET_STORE.set(credential_id, clean_hidden_prefix(api_key))
+        selected["credentialId"] = credential_id
+        save_codex_profiles(profiles)
 
     add_current_project_trust(home)
     update_codex_last_used(selected)
-    return run_command("codex", pass_through, env={"CODEX_HOME": str(home)})
+    return run_command(
+        "codex",
+        ["--disable", "apps", "--disable", "plugins", *pass_through],
+        env={
+            "CODEX_HOME": str(home),
+            "APICODEX_API_KEY": clean_hidden_prefix(api_key),
+        },
+        env_remove=CODEX_PARENT_CONTEXT_ENV,
+    )
 
 
 def load_claude_config() -> dict[str, Any]:
-    return read_json(CLAUDE_CONFIG_PATH, {"nodes": {}, "current": None})
+    config = read_json(CLAUDE_CONFIG_PATH, {"nodes": {}, "current": None})
+    if migrate_claude_secrets(config, SECRET_STORE):
+        save_claude_config(config)
+    return config
 
 
 def save_claude_config(config: dict[str, Any]) -> None:
     write_json(CLAUDE_CONFIG_PATH, config)
+
+
+def claude_credential_id(name: str) -> str:
+    return f"claude:{name}"
+
+
+def migrate_claude_secrets(config: dict[str, Any], store: SecureStore) -> bool:
+    changed = False
+    for name, node in (config.get("nodes") or {}).items():
+        token = clean_hidden_prefix(node.get("token", ""))
+        if not token:
+            continue
+        credential_id = node.get("credential_id") or claude_credential_id(name)
+        store.set(credential_id, token)
+        if store.get(credential_id) != token:
+            raise SecureStoreError(f"Failed to verify migrated credential '{credential_id}'")
+        node["credential_id"] = credential_id
+        node.pop("token", None)
+        changed = True
+    return changed
+
+
+def get_claude_secret(name: str, node: dict[str, Any]) -> str:
+    credential_id = node.get("credential_id") or claude_credential_id(name)
+    return SECRET_STORE.get(credential_id)
 
 
 def show_claude_nodes(config: dict[str, Any]) -> None:
@@ -428,7 +569,11 @@ def show_claude_nodes(config: dict[str, Any]) -> None:
         marker = " [current]" if name == current else ""
         print(f"[{index}] {name}{marker}")
         print(f"    Base URL: {node.get('base_url')}")
-        print(f"    Token: {mask_secret(node.get('token', ''))}")
+        try:
+            token = get_claude_secret(name, node)
+        except (KeyError, SecureStoreError):
+            token = ""
+        print(f"    Token: {mask_secret(token)}")
 
 
 def add_claude_node(config: dict[str, Any]) -> int:
@@ -445,7 +590,12 @@ def add_claude_node(config: dict[str, Any]) -> int:
     if not base_url or not token:
         print("Error: base URL and token cannot be empty.", file=sys.stderr)
         return 1
-    config.setdefault("nodes", {})[name] = {"base_url": base_url, "token": token}
+    credential_id = claude_credential_id(name)
+    SECRET_STORE.set(credential_id, token)
+    config.setdefault("nodes", {})[name] = {
+        "base_url": base_url,
+        "credential_id": credential_id,
+    }
     if not config.get("current"):
         config["current"] = name
     save_claude_config(config)
@@ -464,10 +614,12 @@ def remove_claude_node(config: dict[str, Any], name: str | None) -> int:
     if input(f"Remove '{name}'? Type YES to confirm: ") != "YES":
         print("Cancelled.")
         return 0
+    credential_id = nodes[name].get("credential_id") or claude_credential_id(name)
     del nodes[name]
     if config.get("current") == name:
         config["current"] = None
     save_claude_config(config)
+    SECRET_STORE.clear(credential_id)
     print(f"Removed Claude node '{name}'.")
     return 0
 
@@ -502,7 +654,7 @@ def run_claude_node(config: dict[str, Any], name: str, claude_args: list[str]) -
     save_claude_config(config)
     env = {
         "ANTHROPIC_BASE_URL": clean_hidden_prefix(node.get("base_url", "")),
-        "ANTHROPIC_AUTH_TOKEN": clean_hidden_prefix(node.get("token", "")),
+        "ANTHROPIC_AUTH_TOKEN": get_claude_secret(name, node),
     }
     print(f"Using Claude node '{name}' ({env['ANTHROPIC_BASE_URL']})")
     return run_command("claude", claude_args, env=env)
@@ -545,7 +697,11 @@ def claude_main(args: list[str]) -> int:
             return 1
         print(f"Current Claude node: {current}")
         print(f"ANTHROPIC_BASE_URL={node.get('base_url')}")
-        print(f"ANTHROPIC_AUTH_TOKEN={mask_secret(node.get('token', ''))}")
+        try:
+            token = get_claude_secret(current, node)
+        except (KeyError, SecureStoreError):
+            token = ""
+        print(f"ANTHROPIC_AUTH_TOKEN={mask_secret(token)}")
         return 0
     if command == "remove":
         return remove_claude_node(config, args[1] if len(args) > 1 else None)

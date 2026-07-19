@@ -6,7 +6,9 @@ Cross-platform API profile launchers for Codex CLI and Claude Code.
 - `apiclaude` manages Claude Code API nodes in `~/.apiclaude_config.json`.
 - `apiagent` is a shared entrypoint for both.
 
-The config files contain API keys/tokens and should not be committed.
+On Windows, API keys and tokens are encrypted with DPAPI under
+`~/.apiagent-secrets`. The JSON/TOML config files contain only profile metadata
+and credential references.
 
 ## Requirements
 
@@ -152,3 +154,18 @@ apiagent claude resume
 Both Codex API keys and Claude tokens are cleaned for common invisible prefix
 characters such as UTF-8 BOM (`U+FEFF`) and zero-width characters before they are
 saved or passed to the underlying CLI.
+
+## Credential Storage
+
+- Encryption is bound to the current Windows user through DPAPI. No master
+  password is required.
+- Existing plaintext Claude `token` fields and Codex `auth.json` API keys are
+  migrated on the first `apiclaude` or `apicodex` load.
+- Migration writes and reads back the encrypted value before removing plaintext
+  from configuration files.
+- Normal account login state under `~/.codex` and `~/.claude` is not changed.
+- `apicodex` disables ChatGPT-hosted apps/plugins for API profiles so the CLI
+  does not attempt unavailable `codex_apps` host authentication. This does not
+  affect ordinary `codex` account sessions.
+- Secure credential storage is currently supported on Windows. macOS and Linux
+  secure backends are not implemented yet.

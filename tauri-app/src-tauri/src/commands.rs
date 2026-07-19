@@ -1,9 +1,10 @@
 use crate::config::{
     add_codex_project_trust, clean_hidden_prefix, codex_profile_home, get_codex_archive_root,
     get_codex_home, load_claude_config, load_codex_config, mask_secret, now_iso,
-    save_claude_config, save_codex_config, slugify, write_codex_auth, write_codex_config,
-    ClaudeNode, CodexProfile, DEFAULT_CODEX_BASE_URL, DEFAULT_CODEX_MODEL,
+    save_claude_config, save_codex_config, slugify, write_codex_config, ClaudeNode, CodexProfile,
+    DEFAULT_CODEX_BASE_URL, DEFAULT_CODEX_MODEL,
 };
+use crate::secure_store::{clear_secret, get_secret, set_secret};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -69,11 +70,16 @@ pub async fn get_claude_nodes() -> Result<ClaudeNodesResponse, String> {
         .nodes
         .iter()
         .map(|(name, node)| {
+            let token = node
+                .credential_id
+                .as_deref()
+                .and_then(|credential_id| get_secret(credential_id).ok())
+                .unwrap_or_default();
             (
                 name.clone(),
                 ClaudeSafeNode {
                     base_url: node.base_url.clone(),
-                    token: mask_secret(&node.token),
+                    token: mask_secret(&token),
                 },
             )
         })
@@ -98,13 +104,16 @@ pub async fn add_claude_node(request: AddClaudeNodeRequest) -> Result<(), String
     }
 
     let mut config = load_claude_config()?;
+    let credential_id = format!("claude:{}", name);
+    set_secret(&credential_id, &token)?;
     config.nodes.insert(
         name.to_string(),
         ClaudeNode {
             base_url: clean_hidden_prefix(&request.base_url)
                 .trim_end_matches('/')
                 .to_string(),
-            token,
+            token: String::new(),
+            credential_id: Some(credential_id),
         },
     );
 
@@ -119,15 +128,19 @@ pub async fn add_claude_node(request: AddClaudeNodeRequest) -> Result<(), String
 pub async fn remove_claude_node(name: String) -> Result<(), String> {
     let mut config = load_claude_config()?;
 
-    if config.nodes.remove(&name).is_none() {
-        return Err(format!("Node '{}' not found", name));
-    }
-
+    let node = config
+        .nodes
+        .remove(&name)
+        .ok_or_else(|| format!("Node '{}' not found", name))?;
     if config.current.as_deref() == Some(&name) {
         config.current = None;
     }
 
-    save_claude_config(&config)
+    save_claude_config(&config)?;
+    if let Some(credential_id) = node.credential_id {
+        clear_secret(&credential_id)?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -150,6 +163,11 @@ pub async fn start_claude(name: String, request: StartClaudeRequest) -> Result<(
         .get(&name)
         .cloned()
         .ok_or_else(|| format!("Node '{}' not found", name))?;
+    let credential_id = node
+        .credential_id
+        .as_deref()
+        .ok_or_else(|| format!("Node '{}' has no stored credential", name))?;
+    let token = get_secret(credential_id)?;
 
     config.current = Some(name);
     save_claude_config(&config)?;
@@ -173,7 +191,7 @@ pub async fn start_claude(name: String, request: StartClaudeRequest) -> Result<(
         claude_args.push(request.permission);
     }
 
-    launch_claude_terminal(&request.folder, &node.base_url, &node.token, &claude_args)
+    launch_claude_terminal(&request.folder, &node.base_url, &token, &claude_args)
 }
 
 #[tauri::command]
@@ -229,7 +247,8 @@ pub async fn add_codex_profile(request: AddCodexProfileRequest) -> Result<(), St
     };
 
     write_codex_config(&home, &base_url, &model)?;
-    write_codex_auth(&home, &api_key)?;
+    let credential_id = format!("codex:{}", slug);
+    set_secret(&credential_id, &api_key)?;
 
     let now = now_iso();
     config.profiles.push(CodexProfile {
@@ -241,6 +260,7 @@ pub async fn add_codex_profile(request: AddCodexProfileRequest) -> Result<(), St
         last_used_at: Some(now),
         model: Some(model),
         api_key: None,
+        credential_id: Some(credential_id),
     });
 
     save_codex_config(&config)
@@ -257,6 +277,9 @@ pub async fn remove_codex_profile(name: String) -> Result<(), String> {
 
     let profile = config.profiles.remove(index);
     save_codex_config(&config)?;
+    if let Some(credential_id) = &profile.credential_id {
+        clear_secret(credential_id)?;
+    }
 
     if profile.home != "." {
         let home = codex_profile_home(&profile);
@@ -294,18 +317,23 @@ pub async fn start_codex(name: String, request: StartCodexRequest) -> Result<(),
         write_codex_config(&home, &profile.base_url, model)?;
     }
 
-    if !home.join("auth.json").exists() {
-        if let Some(api_key) = profile.api_key.as_deref() {
-            write_codex_auth(&home, api_key)?;
-        }
-    }
+    let credential_id = profile
+        .credential_id
+        .as_deref()
+        .ok_or_else(|| format!("Profile '{}' has no stored credential", name))?;
+    let api_key = get_secret(credential_id)?;
 
     add_codex_project_trust(&home, &request.folder)?;
 
     config.profiles[index].last_used_at = Some(now_iso());
     save_codex_config(&config)?;
 
-    let mut codex_args = Vec::new();
+    let mut codex_args = vec![
+        "--disable".to_string(),
+        "apps".to_string(),
+        "--disable".to_string(),
+        "plugins".to_string(),
+    ];
 
     if let Some(model) = request.model {
         let model = model.trim();
@@ -332,7 +360,7 @@ pub async fn start_codex(name: String, request: StartCodexRequest) -> Result<(),
         codex_args.push("resume".to_string());
     }
 
-    launch_codex_terminal(&request.folder, &home, &codex_args)
+    launch_codex_terminal(&request.folder, &home, &api_key, &codex_args)
 }
 
 fn launch_claude_terminal(
@@ -351,10 +379,14 @@ fn launch_claude_terminal(
 fn launch_codex_terminal(
     working_dir: &str,
     codex_home: &Path,
+    api_key: &str,
     args: &[String],
 ) -> Result<(), String> {
     let codex_home = codex_home.to_string_lossy();
-    let env = [("CODEX_HOME", codex_home.as_ref())];
+    let env = [
+        ("CODEX_HOME", codex_home.as_ref()),
+        ("APICODEX_API_KEY", api_key),
+    ];
     launch_in_terminal(working_dir, &env, "codex", args)
 }
 
@@ -366,7 +398,7 @@ fn launch_in_terminal(
 ) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
-        let cmd_line = build_cmd_line(env, command, args);
+        let cmd_line = build_cmd_line(command, args);
         let use_wt = Command::new("where")
             .arg("wt")
             .output()
@@ -374,17 +406,23 @@ fn launch_in_terminal(
             .unwrap_or(false);
 
         if use_wt {
-            Command::new("wt")
+            let mut terminal = Command::new("wt");
+            terminal
                 .arg("-d")
                 .arg(working_dir)
                 .arg("--")
                 .arg("cmd")
                 .arg("/k")
-                .arg(&cmd_line)
+                .arg(&cmd_line);
+            for (key, value) in env {
+                terminal.env(key, value);
+            }
+            terminal
                 .spawn()
                 .map_err(|e| format!("Failed to launch Windows Terminal: {}", e))?;
         } else {
-            Command::new("cmd")
+            let mut terminal = Command::new("cmd");
+            terminal
                 .arg("/c")
                 .arg("start")
                 .arg("cmd")
@@ -393,7 +431,11 @@ fn launch_in_terminal(
                     "cd /d \"{}\" && {}",
                     escape_cmd_value(working_dir),
                     cmd_line
-                ))
+                ));
+            for (key, value) in env {
+                terminal.env(key, value);
+            }
+            terminal
                 .spawn()
                 .map_err(|e| format!("Failed to launch cmd: {}", e))?;
         }
@@ -449,22 +491,11 @@ fn launch_in_terminal(
 }
 
 #[cfg(target_os = "windows")]
-fn build_cmd_line(env: &[(&str, &str)], command: &str, args: &[String]) -> String {
-    let env_part = env
-        .iter()
-        .map(|(key, value)| format!("set \"{}={}\"", key, escape_cmd_value(value)))
-        .collect::<Vec<_>>()
-        .join(" && ");
-    let command_part = std::iter::once(command.to_string())
+fn build_cmd_line(command: &str, args: &[String]) -> String {
+    std::iter::once(command.to_string())
         .chain(args.iter().map(|arg| quote_cmd_arg(arg)))
         .collect::<Vec<_>>()
-        .join(" ");
-
-    if env_part.is_empty() {
-        command_part
-    } else {
-        format!("{} && {}", env_part, command_part)
-    }
+        .join(" ")
 }
 
 #[cfg(target_os = "windows")]
@@ -516,4 +547,19 @@ fn build_shell_script(
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn sh_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::build_cmd_line;
+
+    #[test]
+    fn windows_command_line_contains_only_command_and_arguments() {
+        let command_line =
+            build_cmd_line("claude", &["--model".to_string(), "test model".to_string()]);
+
+        assert_eq!(command_line, "claude --model \"test model\"");
+        assert!(!command_line.contains("TOKEN"));
+        assert!(!command_line.contains("set \""));
+    }
 }

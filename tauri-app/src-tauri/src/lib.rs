@@ -1,5 +1,6 @@
 mod commands;
 mod config;
+mod secure_store;
 mod stats;
 
 use commands::{

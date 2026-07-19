@@ -8,7 +8,8 @@
 双击运行 `dev.bat`（开发模式）或 `build.bat`（构建正式版）
 
 ### macOS / Linux 用户
-运行 `./dev.sh`（开发模式）或 `./build.sh`（构建正式版）
+源码仍可构建，但安全凭据后端尚未实现；当前安全存储版本以 Windows
+为正式支持平台。
 
 **📖 详细说明请查看 [QUICK_START.md](./QUICK_START.md)**
 
@@ -19,7 +20,7 @@
 - **一键启动** — 点击启动按钮，选择工作目录，配置启动参数，在新终端窗口中打开 CLI
 - **Token 脱敏** — API Token 在界面中自动脱敏显示（sk-xxx***xxx）
 - **启动配置** — Claude 支持新对话/Resume、权限模式选择（默认/完全访问/沙盒）、模型选择
-- **跨平台** — 支持 Windows、macOS、Linux
+- **Windows 安全存储** — API Key/Token 使用当前 Windows 用户的 DPAPI 加密
 
 ## 技术栈
 
@@ -28,6 +29,7 @@
 - **存储** — 复用 `apiagent.py` 的配置文件：
   - Claude: `~/.apiclaude_config.json`
   - Codex: `~/.codex-api/profiles.json`
+  - 密钥: `~/.apiagent-secrets/*.bin`（Windows DPAPI 密文）
 
 ## 环境要求
 
@@ -97,7 +99,7 @@ npm run build
 ## 环境变量处理
 
 **重要说明：**
-- 启动功能会在**新终端进程中**设置环境变量（ANTHROPIC_BASE_URL, ANTHROPIC_AUTH_TOKEN, CODEX_HOME）
+- 启动功能会通过子进程环境传递认证信息，不会把 Token 拼入终端命令行
 - **不会修改当前会话的环境变量**
 - 不会影响你已登录的账号环境
 - 每个启动的终端都是独立的进程，互不干扰

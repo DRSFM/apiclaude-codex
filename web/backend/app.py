@@ -95,23 +95,20 @@ async def create_codex_profile(profile: CodexProfileCreate):
     model = profile.model or apiagent.DEFAULT_CODEX_MODEL
 
     new_profile = {
+        "id": slug,
         "name": slug,
         "home": slug,
-        "api_key": cleaned_key,
-        "base_url": base_url,
+        "baseUrl": base_url,
         "model": model,
-        "created_at": apiagent.now_iso(),
-        "updated_at": apiagent.now_iso(),
+        "createdAt": apiagent.now_iso(),
+        "lastUsedAt": None,
     }
+    credential_id = apiagent.codex_credential_id(new_profile)
+    apiagent.SECRET_STORE.set(credential_id, cleaned_key)
+    new_profile["credentialId"] = credential_id
 
     home = apiagent.CODEX_HOME / slug
-    home.mkdir(parents=True, exist_ok=True)
-    config_path = home / "config.toml"
-    config_path.write_text(
-        f'base_url = {apiagent.toml_basic_string(base_url)}\n'
-        f'model = {apiagent.toml_basic_string(model)}\n',
-        encoding="utf-8"
-    )
+    apiagent.write_codex_config(home, base_url, model)
 
     profiles.append(new_profile)
     apiagent.save_codex_profiles(profiles)
@@ -129,6 +126,8 @@ async def delete_codex_profile(name: str):
 
     profiles.remove(match)
     apiagent.save_codex_profiles(profiles)
+    if match.get("credentialId"):
+        apiagent.SECRET_STORE.clear(match["credentialId"])
 
     home = apiagent.codex_profile_home(match)
     if home.exists() and home != apiagent.CODEX_HOME:
@@ -146,9 +145,13 @@ async def list_claude_nodes():
     current = config.get("current")
     safe_nodes = {}
     for name, node in nodes.items():
+        try:
+            token = apiagent.get_claude_secret(name, node)
+        except Exception:
+            token = ""
         safe_nodes[name] = {
             "base_url": node.get("base_url", ""),
-            "token": apiagent.mask_secret(node.get("token", "")),
+            "token": apiagent.mask_secret(token),
         }
     return {"nodes": safe_nodes, "current": current}
 
@@ -164,12 +167,23 @@ async def create_claude_node(node: ClaudeNodeCreate):
     cleaned_token = apiagent.clean_hidden_prefix(node.api_key)
     base_url = apiagent.clean_hidden_prefix(node.base_url or "")
 
-    nodes[node.name] = {"base_url": base_url, "token": cleaned_token}
+    credential_id = apiagent.claude_credential_id(node.name)
+    apiagent.SECRET_STORE.set(credential_id, cleaned_token)
+    nodes[node.name] = {
+        "base_url": base_url,
+        "credential_id": credential_id,
+    }
     if not config.get("current"):
         config["current"] = node.name
     apiagent.save_claude_config(config)
 
-    return {"node": nodes[node.name], "message": f"Node '{node.name}' created"}
+    return {
+        "node": {
+            "base_url": base_url,
+            "token": apiagent.mask_secret(cleaned_token),
+        },
+        "message": f"Node '{node.name}' created",
+    }
 
 
 @app.delete("/api/claude/nodes/{name}")
@@ -180,10 +194,12 @@ async def delete_claude_node(name: str):
     if name not in nodes:
         raise HTTPException(status_code=404, detail=f"Node '{name}' not found")
 
+    credential_id = nodes[name].get("credential_id") or apiagent.claude_credential_id(name)
     del nodes[name]
     if config.get("current") == name:
         config["current"] = None
     apiagent.save_claude_config(config)
+    apiagent.SECRET_STORE.clear(credential_id)
 
     return {"message": f"Node '{name}' removed"}
 
@@ -320,4 +336,3 @@ async def start_codex(name: str, request: CodexStartRequest):
         return {"message": f"Codex launched in {folder}", "success": True}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to launch: {str(e)}")
-

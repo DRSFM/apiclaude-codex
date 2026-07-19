@@ -1,3 +1,4 @@
+use crate::secure_store::{get_secret, set_secret};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -15,8 +16,10 @@ const HIDDEN_PREFIX_CHARS: &[char] = &[
 pub struct ClaudeNode {
     #[serde(default)]
     pub base_url: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -47,6 +50,12 @@ pub struct CodexProfile {
     pub model: Option<String>,
     #[serde(default, skip_serializing)]
     pub api_key: Option<String>,
+    #[serde(
+        rename = "credentialId",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub credential_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -158,12 +167,17 @@ pub fn load_claude_config() -> Result<ClaudeConfig, String> {
                     .or_else(|| node.get("api_key"))
                     .and_then(Value::as_str)
                     .unwrap_or_default();
+                let credential_id = node
+                    .get("credential_id")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
 
                 config.nodes.insert(
                     name.clone(),
                     ClaudeNode {
                         base_url: clean_hidden_prefix(base_url),
                         token: clean_hidden_prefix(token),
+                        credential_id,
                     },
                 );
             }
@@ -186,6 +200,10 @@ pub fn load_claude_config() -> Result<ClaudeConfig, String> {
                     .or_else(|| node.get("api_key"))
                     .and_then(Value::as_str)
                     .unwrap_or_default();
+                let credential_id = node
+                    .get("credential_id")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
 
                 if config.current.is_none()
                     && node
@@ -201,6 +219,7 @@ pub fn load_claude_config() -> Result<ClaudeConfig, String> {
                     ClaudeNode {
                         base_url: clean_hidden_prefix(base_url),
                         token: clean_hidden_prefix(token),
+                        credential_id,
                     },
                 );
             }
@@ -212,6 +231,30 @@ pub fn load_claude_config() -> Result<ClaudeConfig, String> {
         if !config.nodes.contains_key(current) {
             config.current = None;
         }
+    }
+
+    let mut migrated = false;
+    for (name, node) in &mut config.nodes {
+        if node.token.is_empty() {
+            continue;
+        }
+        let credential_id = node
+            .credential_id
+            .clone()
+            .unwrap_or_else(|| format!("claude:{}", name));
+        set_secret(&credential_id, &node.token)?;
+        if get_secret(&credential_id)? != node.token {
+            return Err(format!(
+                "Failed to verify migrated credential '{}'",
+                credential_id
+            ));
+        }
+        node.credential_id = Some(credential_id);
+        node.token.clear();
+        migrated = true;
+    }
+    if migrated {
+        save_claude_config(&config)?;
     }
 
     Ok(config)
@@ -250,7 +293,81 @@ pub fn load_codex_config() -> Result<CodexConfig, String> {
         .map_err(|e| format!("Failed to parse Codex profiles: {}", e))?;
 
     normalize_codex_profiles(&mut config);
+    let mut migrated = false;
+    let mut pending_sanitization = Vec::new();
+    for profile in &mut config.profiles {
+        let credential_id = profile
+            .credential_id
+            .clone()
+            .unwrap_or_else(|| format!("codex:{}", profile.id));
+        let home = if profile.home == "." {
+            get_codex_home()
+        } else {
+            get_codex_home().join(&profile.home)
+        };
+        let auth_path = home.join("auth.json");
+        let saved_key = read_codex_api_key(&auth_path);
+        let embedded_key = profile.api_key.clone().unwrap_or_default();
+        let secret = if embedded_key.trim().is_empty() {
+            saved_key.clone()
+        } else {
+            clean_hidden_prefix(&embedded_key)
+        };
+
+        if !secret.is_empty() {
+            set_secret(&credential_id, &secret)?;
+            if get_secret(&credential_id)? != secret {
+                return Err(format!(
+                    "Failed to verify migrated credential '{}'",
+                    credential_id
+                ));
+            }
+            profile.credential_id = Some(credential_id.clone());
+            profile.api_key = None;
+            write_codex_config(
+                &home,
+                &profile.base_url,
+                profile.model.as_deref().unwrap_or(DEFAULT_CODEX_MODEL),
+            )?;
+            if !saved_key.is_empty() {
+                pending_sanitization.push((auth_path, credential_id.clone(), saved_key));
+            }
+            migrated = true;
+        }
+    }
+    if migrated {
+        save_codex_config(&config)?;
+        for (auth_path, credential_id, saved_key) in pending_sanitization {
+            if get_secret(&credential_id)? != saved_key {
+                return Err(format!(
+                    "Refusing to sanitize unverified credential '{}'",
+                    credential_id
+                ));
+            }
+            let sanitized = serde_json::to_string_pretty(&serde_json::json!({
+                "credential_store": "windows-dpapi",
+                "credential_id": credential_id,
+            }))
+            .map_err(|error| format!("Failed to sanitize Codex auth: {}", error))?;
+            fs::write(&auth_path, sanitized)
+                .map_err(|error| format!("Failed to sanitize Codex auth.json: {}", error))?;
+        }
+    }
     Ok(config)
+}
+
+fn read_codex_api_key(path: &Path) -> String {
+    let Ok(content) = fs::read_to_string(path) else {
+        return String::new();
+    };
+    let Ok(value) = serde_json::from_str::<Value>(content.trim_start_matches('\u{feff}')) else {
+        return String::new();
+    };
+    value
+        .get("OPENAI_API_KEY")
+        .and_then(Value::as_str)
+        .map(clean_hidden_prefix)
+        .unwrap_or_default()
 }
 
 pub fn save_codex_config(config: &CodexConfig) -> Result<(), String> {
@@ -274,28 +391,13 @@ pub fn write_codex_config(home: &Path, base_url: &str, model: &str) -> Result<()
         .map_err(|e| format!("Failed to create Codex profile directory: {}", e))?;
 
     let content = format!(
-        "model = {}\nmodel_provider = \"apicodex\"\nmodel_reasoning_effort = \"high\"\nauth_credentials_store = \"file\"\n\n[windows]\nsandbox = \"unelevated\"\n\n[model_providers.apicodex]\nname = \"API Codex\"\nbase_url = {}\nwire_api = \"responses\"\nrequires_openai_auth = true\n",
+        "model = {}\nmodel_provider = \"apicodex\"\nmodel_reasoning_effort = \"high\"\n\n[windows]\nsandbox = \"unelevated\"\n\n[shell_environment_policy]\nexclude = [\"APICODEX_API_KEY\"]\n\n[features]\napps = false\nplugins = false\n\n[model_providers.apicodex]\nname = \"API Codex\"\nbase_url = {}\nwire_api = \"responses\"\nenv_key = \"APICODEX_API_KEY\"\nrequires_openai_auth = false\n",
         toml_basic_string(model),
         toml_basic_string(base_url),
     );
 
     fs::write(home.join("config.toml"), content)
         .map_err(|e| format!("Failed to write Codex config.toml: {}", e))?;
-
-    Ok(())
-}
-
-pub fn write_codex_auth(home: &Path, api_key: &str) -> Result<(), String> {
-    fs::create_dir_all(home)
-        .map_err(|e| format!("Failed to create Codex profile directory: {}", e))?;
-
-    let content = serde_json::to_string_pretty(&serde_json::json!({
-        "OPENAI_API_KEY": clean_hidden_prefix(api_key),
-    }))
-    .map_err(|e| format!("Failed to serialize Codex auth: {}", e))?;
-
-    fs::write(home.join("auth.json"), content)
-        .map_err(|e| format!("Failed to write Codex auth.json: {}", e))?;
 
     Ok(())
 }
@@ -368,6 +470,7 @@ fn initialize_codex_store() -> Result<(), String> {
             last_used_at: Some(now),
             model: None,
             api_key: None,
+            credential_id: None,
         });
     }
 

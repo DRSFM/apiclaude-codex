@@ -78,22 +78,9 @@ chmod +x start.sh
 - 不会影响你已登录的账号环境
 - 每个启动的终端都是独立的进程，互不干扰
 
-**实际执行的命令示例：**
-
-Claude (Windows Terminal):
-```
-wt -d "C:\project" -- cmd /k "set ANTHROPIC_BASE_URL=https://api.example.com && set ANTHROPIC_AUTH_TOKEN=sk-xxx && claude --permission-mode bypassPermissions --model claude-opus-4-6"
-```
-
-Claude (cmd.exe fallback):
-```
-start cmd /k "cd /d C:\project && set ANTHROPIC_BASE_URL=https://api.example.com && set ANTHROPIC_AUTH_TOKEN=sk-xxx && claude resume --model claude-opus-4-6"
-```
-
-Codex:
-```
-wt -d "C:\project" -- cmd /k "set CODEX_HOME=C:\Users\xxx\.codex-api\profiles\bohe && codex"
-```
+Token 只通过子进程环境传递，不会出现在 Windows Terminal 或 `cmd.exe`
+的命令字符串中。CLI 等价入口为 `apiclaude run` 和
+`apicodex --api-profile <名称>`。
 
 ## API 接口
 
@@ -135,6 +122,9 @@ wt -d "C:\project" -- cmd /k "set CODEX_HOME=C:\Users\xxx\.codex-api\profiles\bo
 - **存储** — 复用 `apiagent.py` 的配置文件：
   - Claude: `~/.apiclaude_config.json`
   - Codex: `~/.codex-api/profiles.json`
+  - 密钥（Windows）: `~/.apiagent-secrets/*.bin`，由当前 Windows 用户的 DPAPI 加密
+
+配置接口只返回脱敏值；API Key/Token 不再写入上述 JSON 文件。
 
 ## 注意事项
 
