@@ -10,6 +10,85 @@ from secure_store import SecureStore
 
 
 class ApiAgentAuthTests(unittest.TestCase):
+    def test_codex_vscode_launch_uses_selected_profile_and_current_folder(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            codex_home = root / "codex-api"
+            vscode_root = root / "vscode-data"
+            profile = {
+                "id": "relay",
+                "name": "relay",
+                "home": "profiles/relay",
+                "baseUrl": "https://example.test/v1",
+                "model": "test-model",
+                "credentialId": "codex:relay",
+            }
+            store = SecureStore(root / "secrets")
+            store.set("codex:relay", "sk-test-secret")
+
+            with (
+                patch.object(apiagent, "CODEX_HOME", codex_home),
+                patch.object(apiagent, "CODEX_VSCODE_DATA_ROOT", vscode_root),
+                patch.object(apiagent, "SECRET_STORE", store),
+                patch.object(apiagent, "load_codex_profiles", return_value=[profile]),
+                patch.object(apiagent, "select_codex_profile", return_value=profile) as select,
+                patch.object(apiagent, "update_codex_last_used"),
+                patch.object(apiagent, "add_current_project_trust"),
+                patch.object(apiagent, "run_command", return_value=0) as run,
+            ):
+                code = apiagent.codex_main(
+                    ["--vscode", "--api-profile", "relay"]
+                )
+
+            self.assertEqual(code, 0)
+            select.assert_called_once_with([profile], "relay")
+            self.assertEqual(run.call_args.args[0], "code")
+            self.assertEqual(
+                run.call_args.args[1],
+                [
+                    "--new-window",
+                    "--user-data-dir",
+                    str(vscode_root / "relay"),
+                    str(Path.cwd()),
+                ],
+            )
+            self.assertEqual(
+                run.call_args.kwargs["env"],
+                {
+                    "CODEX_HOME": str(codex_home / "profiles" / "relay"),
+                    "APICODEX_API_KEY": "sk-test-secret",
+                },
+            )
+            self.assertEqual(
+                set(run.call_args.kwargs["env_remove"]),
+                {
+                    "CODEX_INTERNAL_ORIGINATOR_OVERRIDE",
+                    "CODEX_PERMISSION_PROFILE",
+                    "CODEX_SHELL",
+                    "CODEX_THREAD_ID",
+                },
+            )
+
+    def test_codex_upgrade_invokes_official_installer(self) -> None:
+        with (
+            patch.object(apiagent.shutil, "which", return_value="pwsh"),
+            patch.object(apiagent, "run_command", return_value=0) as run,
+        ):
+            code = apiagent.codex_main(["--up"])
+
+        self.assertEqual(code, 0)
+        self.assertEqual(run.call_args.args[0], "pwsh")
+        self.assertEqual(
+            run.call_args.args[1],
+            [
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                apiagent.CODEX_INSTALL_SCRIPT,
+            ],
+        )
+
     def test_codex_config_uses_profile_scoped_environment_key(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
@@ -179,6 +258,27 @@ class ApiAgentAuthTests(unittest.TestCase):
         self.assertNotIn("CODEX_INTERNAL_ORIGINATOR_OVERRIDE", child_env)
         self.assertNotIn("CODEX_THREAD_ID", child_env)
         self.assertEqual(child_env["KEEP_ME"], "yes")
+
+    def test_run_command_calls_windows_batch_shims_through_cmd(self) -> None:
+        completed = unittest.mock.Mock(returncode=0)
+        with (
+            patch.object(
+                apiagent.shutil,
+                "which",
+                return_value=r"C:\Program Files\Microsoft VS Code\bin\code.cmd",
+            ),
+            patch.object(apiagent.subprocess, "run", return_value=completed) as run,
+        ):
+            code = apiagent.run_command("code", ["--version"])
+
+        self.assertEqual(code, 0)
+        command = run.call_args.args[0]
+        self.assertIsInstance(command, str)
+        self.assertIn(" /d /s /c call ", command)
+        self.assertIn(
+            r'"C:\Program Files\Microsoft VS Code\bin\code.cmd" --version',
+            command,
+        )
 
 
 if __name__ == "__main__":

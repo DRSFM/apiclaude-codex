@@ -87,6 +87,22 @@ Choose a profile and start Codex:
 apicodex
 ```
 
+Choose a profile and open the current folder in an isolated VS Code instance:
+
+```bash
+apicodex --vscode
+```
+
+Open VS Code with a specific profile without prompting:
+
+```bash
+apicodex --vscode --api-profile muyuanpub
+```
+
+Each profile uses a separate VS Code user-data directory under
+`~/.apicodex-vscode`. The Codex extension inherits that profile's `CODEX_HOME`
+and API key without placing the key on the command line.
+
 Run a specific profile:
 
 ```bash
@@ -97,8 +113,12 @@ Other management commands:
 
 ```bash
 apicodex --api-remove
+apicodex --up
 apicodex --api-help
 ```
+
+`apicodex --up` runs the official Codex installer to update the standalone
+Codex CLI. On Windows, PowerShell (`pwsh` or `powershell`) must be available.
 
 ## Claude Usage
 

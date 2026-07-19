@@ -29,10 +29,12 @@ HOME = Path.home()
 CODEX_HOME = HOME / ".codex-api"
 CODEX_PROFILES_PATH = CODEX_HOME / "profiles.json"
 CODEX_ARCHIVE_ROOT = CODEX_HOME / "archived-profiles"
+CODEX_VSCODE_DATA_ROOT = HOME / ".apicodex-vscode"
 CLAUDE_CONFIG_PATH = HOME / ".apiclaude_config.json"
 SECRET_STORE = SecureStore(HOME / ".apiagent-secrets")
 DEFAULT_CODEX_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_CODEX_MODEL = "gpt-5.5"
+CODEX_INSTALL_SCRIPT = "$env:CODEX_NON_INTERACTIVE=1; irm https://chatgpt.com/codex/install.ps1 | iex"
 HIDDEN_PREFIX_CHARS = "\ufeff\u200b\u200c\u200d\u2060\ufffd"
 CODEX_PARENT_CONTEXT_ENV = (
     "CODEX_INTERNAL_ORIGINATOR_OVERRIDE",
@@ -97,8 +99,14 @@ def run_command(
         proc_env.update(env)
 
     if os.name == "nt":
-        cmdline = subprocess.list2cmdline([exe, *args])
-        cmd = [os.environ.get("ComSpec", "cmd.exe"), "/d", "/c", cmdline]
+        if Path(exe).suffix.lower() in {".bat", ".cmd"}:
+            comspec = os.environ.get("ComSpec", "cmd.exe")
+            command_line = subprocess.list2cmdline([exe, *args])
+            cmd: list[str] | str = (
+                f"{subprocess.list2cmdline([comspec])} /d /s /c call {command_line}"
+            )
+        else:
+            cmd = [exe, *args]
     else:
         cmd = [exe, *args]
 
@@ -433,6 +441,82 @@ def update_codex_last_used(selected: dict[str, Any]) -> None:
     save_codex_profiles(profiles)
 
 
+def upgrade_codex() -> int:
+    """Update the standalone Codex CLI through the official installer."""
+    if shutil.which("pwsh"):
+        powershell = "pwsh"
+    elif shutil.which("powershell"):
+        powershell = "powershell"
+    else:
+        print(
+            "Error: PowerShell (pwsh or powershell) is required to update Codex.",
+            file=sys.stderr,
+        )
+        return 1
+
+    print("Updating Codex CLI...")
+    return run_command(
+        powershell,
+        [
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            CODEX_INSTALL_SCRIPT,
+        ],
+    )
+
+
+def launch_codex_vscode(
+    profiles: list[dict[str, Any]],
+    selected: dict[str, Any],
+) -> int:
+    home = codex_profile_home(selected)
+    if not (home / "config.toml").exists():
+        write_codex_config(
+            home,
+            selected.get("baseUrl", DEFAULT_CODEX_BASE_URL),
+            selected.get("model") or DEFAULT_CODEX_MODEL,
+        )
+
+    try:
+        api_key = get_codex_secret(selected)
+    except (KeyError, SecureStoreError):
+        print(f"Profile '{selected.get('name')}' has no saved API key yet.")
+        api_key = getpass("API key: ")
+        if not api_key.strip():
+            print("Error: API key cannot be empty.", file=sys.stderr)
+            return 1
+        credential_id = codex_credential_id(selected)
+        SECRET_STORE.set(credential_id, clean_hidden_prefix(api_key))
+        selected["credentialId"] = credential_id
+        save_codex_profiles(profiles)
+
+    profile_id = slugify(str(selected.get("id") or selected.get("name") or "default"))
+    vscode_data = CODEX_VSCODE_DATA_ROOT / profile_id
+    vscode_data.mkdir(parents=True, exist_ok=True)
+    add_current_project_trust(home)
+    update_codex_last_used(selected)
+    print(
+        f"Opening VS Code with Codex profile '{selected.get('name')}' "
+        f"({selected.get('baseUrl')})"
+    )
+    return run_command(
+        "code",
+        [
+            "--new-window",
+            "--user-data-dir",
+            str(vscode_data),
+            str(Path.cwd()),
+        ],
+        env={
+            "CODEX_HOME": str(home),
+            "APICODEX_API_KEY": clean_hidden_prefix(api_key),
+        },
+        env_remove=CODEX_PARENT_CONTEXT_ENV,
+    )
+
+
 def codex_help() -> None:
     print(
         """apicodex commands
@@ -442,6 +526,8 @@ def codex_help() -> None:
   apicodex --api-list              List saved API profiles
   apicodex --api-profile <name>    Start a specific API profile
   apicodex --api-remove            Unregister/archive a saved API profile
+  apicodex --vscode                Choose a profile and open VS Code here
+  apicodex --up                    Update the Codex CLI
   apicodex --api-help              Show this help
 
 Any remaining arguments are passed to codex."""
@@ -451,7 +537,7 @@ Any remaining arguments are passed to codex."""
 def codex_main(args: list[str]) -> int:
     pass_through: list[str] = []
     requested: str | None = None
-    do_add = do_list = do_remove = do_help = False
+    do_add = do_list = do_remove = do_help = do_upgrade = do_vscode = False
     i = 0
     while i < len(args):
         arg = args[i]
@@ -461,6 +547,10 @@ def codex_main(args: list[str]) -> int:
             do_list = True
         elif arg == "--api-remove":
             do_remove = True
+        elif arg == "--up":
+            do_upgrade = True
+        elif arg == "--vscode":
+            do_vscode = True
         elif arg == "--api-help":
             do_help = True
         elif arg == "--api-profile":
@@ -476,6 +566,20 @@ def codex_main(args: list[str]) -> int:
     if do_help:
         codex_help()
         return 0
+    if do_upgrade:
+        return upgrade_codex()
+    if do_vscode:
+        if pass_through:
+            print(
+                f"Error: unexpected VS Code arguments: {' '.join(pass_through)}",
+                file=sys.stderr,
+            )
+            return 1
+        profiles = load_codex_profiles()
+        selected = select_codex_profile(profiles, requested)
+        if not selected:
+            return 1
+        return launch_codex_vscode(profiles, selected)
     if do_list:
         show_codex_profiles(load_codex_profiles())
         return 0
