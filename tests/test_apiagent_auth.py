@@ -10,6 +10,175 @@ from secure_store import SecureStore
 
 
 class ApiAgentAuthTests(unittest.TestCase):
+    def test_marker_in_dpapi_store_is_not_used_as_api_key(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SecureStore(Path(tmp) / "secrets")
+            store.set("codex:relay", apiagent.CODEX_API_AUTH_MARKER)
+            profile = {"id": "relay", "credentialId": "codex:relay"}
+
+            with patch.object(apiagent, "SECRET_STORE", store):
+                with self.assertRaises(KeyError):
+                    apiagent.get_codex_secret(profile)
+
+    @unittest.skipUnless(__import__("os").name == "nt", "Windows keyring test")
+    def test_codex_keyring_auth_uses_stdin_and_removes_legacy_auth(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            apiagent.write_codex_config(home, "https://example.test/v1", "test-model")
+            (home / "auth.json").write_text(
+                '{"OPENAI_API_KEY":"apicodex-managed-key-in-child-environment"}',
+                encoding="utf-8",
+            )
+
+            with patch.object(apiagent, "run_command", return_value=0) as run:
+                result = apiagent.ensure_codex_keyring_auth(home, "sk-test-secret")
+
+            self.assertTrue(result)
+            self.assertEqual(run.call_args.args, ("codex", ["login", "--with-api-key"]))
+            self.assertEqual(run.call_args.kwargs["input_text"], "sk-test-secret\n")
+            self.assertEqual(run.call_args.kwargs["env"], {"CODEX_HOME": str(home)})
+            self.assertNotIn("sk-test-secret", " ".join(run.call_args.args[1]))
+            self.assertFalse((home / "auth.json").exists())
+
+    @unittest.skipUnless(__import__("os").name == "nt", "Windows desktop app test")
+    def test_codex_desktop_launch_isolates_account_and_profile_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            account_home = root / ".codex"
+            account_home.mkdir()
+            account_auth = account_home / "auth.json"
+            account_auth.write_text('{"account":"must-stay-untouched"}', encoding="utf-8")
+            codex_home = root / ".codex-api"
+            desktop_root = root / ".apicodex-desktop"
+            desktop_exe = root / "app" / "ChatGPT.exe"
+            profile = {
+                "id": "relay",
+                "name": "relay",
+                "home": "profiles/relay",
+                "baseUrl": "https://example.test/v1",
+                "model": "test-model",
+                "credentialId": "codex:relay",
+            }
+            store = SecureStore(root / "secrets")
+            store.set("codex:relay", "sk-test-secret")
+
+            with (
+                patch.object(apiagent, "HOME", root),
+                patch.object(apiagent, "CODEX_HOME", codex_home),
+                patch.object(apiagent, "CODEX_DESKTOP_DATA_ROOT", desktop_root),
+                patch.object(apiagent, "SECRET_STORE", store),
+                patch.object(apiagent, "load_codex_profiles", return_value=[profile]),
+                patch.object(apiagent, "select_codex_profile", return_value=profile),
+                patch.object(apiagent, "find_codex_desktop_executable", return_value=desktop_exe),
+                patch.object(apiagent, "ensure_codex_keyring_auth", return_value=True) as keyring,
+                patch.object(apiagent, "update_codex_last_used"),
+                patch.object(apiagent, "add_current_project_trust"),
+                patch.object(apiagent, "start_detached_process", return_value=0) as start,
+            ):
+                code = apiagent.codex_main(
+                    ["--desktop", "--api-profile", "relay"]
+                )
+
+            self.assertEqual(code, 0)
+            self.assertEqual(
+                account_auth.read_text(encoding="utf-8"),
+                '{"account":"must-stay-untouched"}',
+            )
+            self.assertEqual(start.call_args.args[0], str(desktop_exe))
+            keyring.assert_called_once_with(
+                codex_home / "profiles" / "relay", "sk-test-secret"
+            )
+            self.assertEqual(
+                start.call_args.args[1],
+                [f"--user-data-dir={desktop_root / 'relay'}"],
+            )
+            self.assertEqual(
+                start.call_args.kwargs["env"],
+                {
+                    "CODEX_HOME": str(codex_home / "profiles" / "relay"),
+                    "APICODEX_API_KEY": "sk-test-secret",
+                },
+            )
+            self.assertNotIn(
+                "sk-test-secret",
+                " ".join([start.call_args.args[0], *start.call_args.args[1]]),
+            )
+            self.assertIn(
+                "OPENAI_API_KEY",
+                start.call_args.kwargs["env_remove"],
+            )
+            profile_home = codex_home / "profiles" / "relay"
+            self.assertFalse((profile_home / "auth.json").exists())
+            self.assertIn(
+                'conversationDetailMode = "STEPS_COMMANDS"',
+                (profile_home / "config.toml").read_text(encoding="utf-8"),
+            )
+
+    @unittest.skipUnless(__import__("os").name == "nt", "Windows desktop app test")
+    def test_codex_desktop_does_not_start_when_keyring_login_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            profile = {
+                "id": "relay",
+                "name": "relay",
+                "home": "profiles/relay",
+                "baseUrl": "https://example.test/v1",
+                "credentialId": "codex:relay",
+            }
+            store = SecureStore(root / "secrets")
+            store.set("codex:relay", "sk-test-secret")
+
+            with (
+                patch.object(apiagent, "CODEX_HOME", root / ".codex-api"),
+                patch.object(apiagent, "CODEX_DESKTOP_DATA_ROOT", root / "desktop"),
+                patch.object(apiagent, "SECRET_STORE", store),
+                patch.object(apiagent, "find_codex_desktop_executable", return_value=root / "ChatGPT.exe"),
+                patch.object(apiagent, "ensure_codex_keyring_auth", return_value=False),
+                patch.object(apiagent, "start_detached_process") as start,
+            ):
+                code = apiagent.launch_codex_desktop([profile], profile)
+
+            self.assertEqual(code, 1)
+            start.assert_not_called()
+
+    @unittest.skipUnless(__import__("os").name == "nt", "Windows desktop app test")
+    def test_codex_desktop_refuses_profile_outside_api_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            account_home = root / ".codex"
+            account_home.mkdir()
+            account_auth = account_home / "auth.json"
+            account_auth.write_text('{"account":"must-stay-untouched"}', encoding="utf-8")
+            profile = {
+                "id": "unsafe",
+                "name": "unsafe",
+                "home": "../.codex",
+                "baseUrl": "https://example.test/v1",
+                "credentialId": "codex:unsafe",
+            }
+
+            with (
+                patch.object(apiagent, "HOME", root),
+                patch.object(apiagent, "CODEX_HOME", root / ".codex-api"),
+                patch.object(apiagent, "load_codex_profiles", return_value=[profile]),
+                patch.object(apiagent, "select_codex_profile", return_value=profile),
+                patch.object(apiagent, "find_codex_desktop_executable") as find_desktop,
+                patch.object(apiagent, "write_codex_config") as write_config,
+                patch.object(apiagent, "start_detached_process") as start,
+            ):
+                code = apiagent.codex_main(
+                    ["--desktop", "--api-profile", "unsafe"]
+                )
+
+            self.assertEqual(code, 1)
+            find_desktop.assert_not_called()
+            write_config.assert_not_called()
+            start.assert_not_called()
+            self.assertEqual(
+                account_auth.read_text(encoding="utf-8"),
+                '{"account":"must-stay-untouched"}',
+            )
+
     def test_codex_vscode_launch_uses_selected_profile_and_current_folder(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -100,7 +269,39 @@ class ApiAgentAuthTests(unittest.TestCase):
             self.assertIn('exclude = ["APICODEX_API_KEY"]', config)
             self.assertIn("[features]\napps = false\nplugins = false", config)
             self.assertNotIn("requires_openai_auth = true", config)
-            self.assertNotIn('auth_credentials_store = "file"', config)
+            self.assertIn('cli_auth_credentials_store = "keyring"', config)
+            self.assertIn(
+                '[desktop]\nconversationDetailMode = "STEPS_COMMANDS"',
+                config,
+            )
+
+    def test_codex_desktop_repairs_work_mode_without_losing_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / "config.toml").write_text(
+                'model = "test-model"\n\n'
+                '[desktop]\n'
+                'conversationDetailMode = "STEPS_PROSE"\n'
+                'sansFontSize = 15\n\n'
+                '[mcp_servers.example]\n'
+                'url = "https://example.test/mcp"\n',
+                encoding="utf-8",
+            )
+            profile = {
+                "id": "relay",
+                "name": "relay",
+                "credentialId": "codex:relay",
+            }
+
+            apiagent.prepare_codex_desktop_profile(home, profile)
+
+            config = (home / "config.toml").read_text(encoding="utf-8")
+            self.assertIn('cli_auth_credentials_store = "keyring"', config)
+            self.assertNotIn('conversationDetailMode = "STEPS_PROSE"', config)
+            self.assertIn('conversationDetailMode = "STEPS_COMMANDS"', config)
+            self.assertIn("sansFontSize = 15", config)
+            self.assertIn("https://example.test/mcp", config)
+            self.assertFalse((home / "auth.json").exists())
 
     def test_claude_legacy_token_migrates_out_of_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

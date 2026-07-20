@@ -30,10 +30,13 @@ CODEX_HOME = HOME / ".codex-api"
 CODEX_PROFILES_PATH = CODEX_HOME / "profiles.json"
 CODEX_ARCHIVE_ROOT = CODEX_HOME / "archived-profiles"
 CODEX_VSCODE_DATA_ROOT = HOME / ".apicodex-vscode"
+CODEX_DESKTOP_DATA_ROOT = HOME / ".apicodex-desktop"
 CLAUDE_CONFIG_PATH = HOME / ".apiclaude_config.json"
 SECRET_STORE = SecureStore(HOME / ".apiagent-secrets")
 DEFAULT_CODEX_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_CODEX_MODEL = "gpt-5.5"
+CODEX_API_AUTH_MARKER = "apicodex-managed-key-in-child-environment"
+CODEX_AUTH_STORE = "keyring"
 CODEX_INSTALL_SCRIPT = "$env:CODEX_NON_INTERACTIVE=1; irm https://chatgpt.com/codex/install.ps1 | iex"
 HIDDEN_PREFIX_CHARS = "\ufeff\u200b\u200c\u200d\u2060\ufffd"
 CODEX_PARENT_CONTEXT_ENV = (
@@ -41,6 +44,13 @@ CODEX_PARENT_CONTEXT_ENV = (
     "CODEX_PERMISSION_PROFILE",
     "CODEX_SHELL",
     "CODEX_THREAD_ID",
+)
+CODEX_DESKTOP_ENV_REMOVE = CODEX_PARENT_CONTEXT_ENV + (
+    "CODEX_HOME",
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+    "OPENAI_ORG_ID",
+    "OPENAI_PROJECT_ID",
 )
 
 
@@ -123,6 +133,45 @@ def run_command(
         return 130
 
 
+def start_detached_process(
+    command: str,
+    args: list[str],
+    env: dict[str, str] | None = None,
+    env_remove: tuple[str, ...] | list[str] = (),
+) -> int:
+    command_path = Path(command)
+    exe = str(command_path) if command_path.is_file() else shutil.which(command)
+    if not exe:
+        print(f"Error: command not found: {command}", file=sys.stderr)
+        return 1
+
+    proc_env = os.environ.copy()
+    for key in env_remove:
+        proc_env.pop(key, None)
+    if env:
+        proc_env.update(env)
+
+    creationflags = 0
+    if os.name == "nt":
+        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        creationflags |= getattr(subprocess, "DETACHED_PROCESS", 0)
+
+    try:
+        subprocess.Popen(
+            [exe, *args],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=proc_env,
+            close_fds=True,
+            creationflags=creationflags,
+        )
+        return 0
+    except OSError as exc:
+        print(f"Error: failed to start {command}: {exc}", file=sys.stderr)
+        return 1
+
+
 def toml_basic_string(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
@@ -161,7 +210,10 @@ def codex_credential_id(profile: dict[str, Any]) -> str:
 
 def get_codex_secret(profile: dict[str, Any]) -> str:
     credential_id = profile.get("credentialId") or codex_credential_id(profile)
-    return SECRET_STORE.get(credential_id)
+    value = clean_hidden_prefix(SECRET_STORE.get(credential_id))
+    if not value or value == CODEX_API_AUTH_MARKER:
+        raise KeyError(f"Credential '{credential_id}' does not contain a valid API key")
+    return value
 
 
 def _saved_api_key(auth_path: Path) -> str:
@@ -177,7 +229,10 @@ def _saved_api_key(auth_path: Path) -> str:
         None,
     )
     value = data.get(key_name, "") if key_name else ""
-    return clean_hidden_prefix(value) if isinstance(value, str) else ""
+    if not isinstance(value, str):
+        return ""
+    value = clean_hidden_prefix(value)
+    return "" if value == CODEX_API_AUTH_MARKER else value
 
 
 def migrate_codex_secrets(
@@ -266,6 +321,7 @@ def write_codex_config(home: Path, base_url: str, model: str = DEFAULT_CODEX_MOD
     config = f'''model = "{model}"
 model_provider = "apicodex"
 model_reasoning_effort = "high"
+cli_auth_credentials_store = "keyring"
 
 [windows]
 sandbox = "unelevated"
@@ -283,8 +339,122 @@ base_url = "{base_url}"
 wire_api = "responses"
 env_key = "APICODEX_API_KEY"
 requires_openai_auth = false
+
+[desktop]
+conversationDetailMode = "STEPS_COMMANDS"
 '''
     (home / "config.toml").write_text(config, encoding="utf-8")
+
+
+def ensure_codex_keyring_store(home: Path) -> None:
+    config_path = home / "config.toml"
+    raw = config_path.read_text(encoding="utf-8-sig")
+    newline = "\r\n" if "\r\n" in raw else "\n"
+    lines = raw.splitlines(keepends=True)
+    first_table_index = next(
+        (
+            index
+            for index, line in enumerate(lines)
+            if line.strip().startswith("[") and line.strip().endswith("]")
+        ),
+        len(lines),
+    )
+    key_indices = [
+        index
+        for index, line in enumerate(lines[:first_table_index])
+        if re.match(r"^\s*cli_auth_credentials_store\s*=", line)
+    ]
+    replacement = f'cli_auth_credentials_store = "{CODEX_AUTH_STORE}"{newline}'
+    if key_indices:
+        lines[key_indices[0]] = replacement
+        for index in reversed(key_indices[1:]):
+            del lines[index]
+    else:
+        lines.insert(first_table_index, replacement)
+    updated = "".join(lines)
+    if updated != raw:
+        config_path.write_text(updated, encoding="utf-8")
+
+
+def ensure_codex_desktop_coding_mode(home: Path) -> None:
+    config_path = home / "config.toml"
+    raw = config_path.read_text(encoding="utf-8-sig")
+    newline = "\r\n" if "\r\n" in raw else "\n"
+    lines = raw.splitlines(keepends=True)
+    desktop_header_index: int | None = None
+    detail_index: int | None = None
+    in_desktop = False
+
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            in_desktop = stripped == "[desktop]"
+            if in_desktop:
+                desktop_header_index = index
+            continue
+        if in_desktop and re.match(r"^conversationDetailMode\s*=", stripped):
+            detail_index = index
+            break
+
+    if detail_index is not None:
+        current = lines[detail_index]
+        replacement = f'conversationDetailMode = "STEPS_COMMANDS"{newline}'
+        if current != replacement:
+            lines[detail_index] = replacement
+    elif desktop_header_index is not None:
+        lines.insert(
+            desktop_header_index + 1,
+            f'conversationDetailMode = "STEPS_COMMANDS"{newline}',
+        )
+    else:
+        suffix = "" if not raw or raw.endswith(("\n", "\r")) else newline
+        lines.append(
+            f'{suffix}[desktop]{newline}'
+            f'conversationDetailMode = "STEPS_COMMANDS"{newline}'
+        )
+
+    updated = "".join(lines)
+    if updated != raw:
+        config_path.write_text(updated, encoding="utf-8")
+
+
+def prepare_codex_desktop_profile(home: Path, profile: dict[str, Any]) -> None:
+    # Older versions wrote a marker here, but official Codex sends that field
+    # as a real bearer token instead of falling back to the provider env key.
+    auth_path = home / "auth.json"
+    if auth_path.exists():
+        auth_path.unlink()
+    ensure_codex_keyring_store(home)
+    ensure_codex_desktop_coding_mode(home)
+
+
+def ensure_codex_keyring_auth(home: Path, api_key: str) -> bool:
+    """Sync one API profile's key into the official Codex keyring."""
+    if os.name != "nt":
+        print("Error: Codex keyring authentication requires Windows.", file=sys.stderr)
+        return False
+    prepare_codex_desktop_profile(home, {})
+    code = run_command(
+        "codex",
+        ["login", "--with-api-key"],
+        env={"CODEX_HOME": str(home)},
+        input_text=clean_hidden_prefix(api_key) + "\n",
+        env_remove=CODEX_DESKTOP_ENV_REMOVE + (
+            "APICODEX_API_KEY",
+            "CODEX_ACCESS_TOKEN",
+        ),
+    )
+    if code != 0:
+        print(
+            f"Error: failed to store the API key in Codex keyring for {home}.",
+            file=sys.stderr,
+        )
+        return False
+    # Do not retain a plaintext fallback if an older Codex build created one.
+    auth_path = home / "auth.json"
+    if auth_path.exists():
+        auth_path.unlink()
+    return True
 
 
 def add_current_project_trust(home: Path) -> None:
@@ -467,6 +637,120 @@ def upgrade_codex() -> int:
     )
 
 
+def find_codex_desktop_executable() -> Path | None:
+    override = clean_hidden_prefix(os.environ.get("APICODEX_DESKTOP_EXE", ""))
+    if override:
+        candidate = Path(override).expanduser()
+        return candidate if candidate.is_file() else None
+
+    if os.name != "nt":
+        return None
+
+    powershell = shutil.which("pwsh") or shutil.which("powershell")
+    if not powershell:
+        return None
+
+    script = (
+        "$package = Get-AppxPackage -Name OpenAI.Codex -ErrorAction "
+        "SilentlyContinue | Sort-Object Version -Descending | "
+        "Select-Object -First 1; "
+        "if ($package) { Join-Path $package.InstallLocation "
+        "'app\\ChatGPT.exe' }"
+    )
+    try:
+        completed = subprocess.run(
+            [powershell, "-NoProfile", "-Command", script],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except OSError:
+        return None
+
+    if completed.returncode != 0:
+        return None
+    output = completed.stdout.strip().splitlines()
+    if not output:
+        return None
+    candidate = Path(output[-1].strip())
+    return candidate if candidate.is_file() else None
+
+
+def is_isolated_codex_home(home: Path) -> bool:
+    resolved_home = home.resolve()
+    api_root = CODEX_HOME.resolve()
+    account_home = (HOME / ".codex").resolve()
+    return resolved_home != account_home and resolved_home.is_relative_to(api_root)
+
+
+def launch_codex_desktop(
+    profiles: list[dict[str, Any]],
+    selected: dict[str, Any],
+) -> int:
+    if os.name != "nt":
+        print("Error: --desktop is currently supported only on Windows.", file=sys.stderr)
+        return 1
+
+    home = codex_profile_home(selected)
+    if not is_isolated_codex_home(home):
+        print(
+            "Error: refusing to launch a desktop profile outside ~/.codex-api.",
+            file=sys.stderr,
+        )
+        return 1
+
+    desktop_exe = find_codex_desktop_executable()
+    if not desktop_exe:
+        print(
+            "Error: the ChatGPT desktop app was not found. Install the official "
+            "Windows app or set APICODEX_DESKTOP_EXE.",
+            file=sys.stderr,
+        )
+        return 1
+
+    if not (home / "config.toml").exists():
+        write_codex_config(
+            home,
+            selected.get("baseUrl", DEFAULT_CODEX_BASE_URL),
+            selected.get("model") or DEFAULT_CODEX_MODEL,
+        )
+
+    try:
+        api_key = get_codex_secret(selected)
+    except (KeyError, SecureStoreError):
+        print(f"Profile '{selected.get('name')}' has no saved API key yet.")
+        api_key = getpass("API key: ")
+        if not api_key.strip():
+            print("Error: API key cannot be empty.", file=sys.stderr)
+            return 1
+        credential_id = codex_credential_id(selected)
+        SECRET_STORE.set(credential_id, clean_hidden_prefix(api_key))
+        selected["credentialId"] = credential_id
+        save_codex_profiles(profiles)
+
+    profile_id = slugify(str(selected.get("id") or selected.get("name") or "default"))
+    desktop_data = CODEX_DESKTOP_DATA_ROOT / profile_id
+    desktop_data.mkdir(parents=True, exist_ok=True)
+    if not ensure_codex_keyring_auth(home, api_key):
+        return 1
+    add_current_project_trust(home)
+    update_codex_last_used(selected)
+    print(
+        f"Opening ChatGPT desktop with isolated Codex profile "
+        f"'{selected.get('name')}' ({selected.get('baseUrl')})"
+    )
+    return start_detached_process(
+        str(desktop_exe),
+        [f"--user-data-dir={desktop_data}"],
+        env={
+            "CODEX_HOME": str(home),
+            "APICODEX_API_KEY": clean_hidden_prefix(api_key),
+        },
+        env_remove=CODEX_DESKTOP_ENV_REMOVE,
+    )
+
+
 def launch_codex_vscode(
     profiles: list[dict[str, Any]],
     selected: dict[str, Any],
@@ -527,6 +811,7 @@ def codex_help() -> None:
   apicodex --api-profile <name>    Start a specific API profile
   apicodex --api-remove            Unregister/archive a saved API profile
   apicodex --vscode                Choose a profile and open VS Code here
+  apicodex --desktop               Choose a profile and open an isolated desktop app
   apicodex --up                    Update the Codex CLI
   apicodex --api-help              Show this help
 
@@ -538,6 +823,7 @@ def codex_main(args: list[str]) -> int:
     pass_through: list[str] = []
     requested: str | None = None
     do_add = do_list = do_remove = do_help = do_upgrade = do_vscode = False
+    do_desktop = False
     i = 0
     while i < len(args):
         arg = args[i]
@@ -551,6 +837,8 @@ def codex_main(args: list[str]) -> int:
             do_upgrade = True
         elif arg == "--vscode":
             do_vscode = True
+        elif arg == "--desktop":
+            do_desktop = True
         elif arg == "--api-help":
             do_help = True
         elif arg == "--api-profile":
@@ -568,6 +856,21 @@ def codex_main(args: list[str]) -> int:
         return 0
     if do_upgrade:
         return upgrade_codex()
+    if do_desktop and do_vscode:
+        print("Error: --desktop and --vscode cannot be used together.", file=sys.stderr)
+        return 1
+    if do_desktop:
+        if pass_through:
+            print(
+                f"Error: unexpected desktop arguments: {' '.join(pass_through)}",
+                file=sys.stderr,
+            )
+            return 1
+        profiles = load_codex_profiles()
+        selected = select_codex_profile(profiles, requested)
+        if not selected:
+            return 1
+        return launch_codex_desktop(profiles, selected)
     if do_vscode:
         if pass_through:
             print(

@@ -103,6 +103,27 @@ Each profile uses a separate VS Code user-data directory under
 `~/.apicodex-vscode`. The Codex extension inherits that profile's `CODEX_HOME`
 and API key without placing the key on the command line.
 
+Open the official ChatGPT desktop app with an isolated Codex API profile:
+
+```bash
+apicodex --desktop
+apicodex --desktop --api-profile muyuanpub
+```
+
+Desktop profiles use separate browser/app data under
+`~/.apicodex-desktop/<profile>` and the same profile-scoped `CODEX_HOME` used by
+the CLI and VS Code extension. The launcher does not read or modify the normal
+ChatGPT account-backed Codex home at `~/.codex`. The API key is passed only in
+the child process environment or login stdin and is not placed on the command
+line. Desktop launch is currently supported on Windows with the official
+ChatGPT app.
+The launcher also keeps the API desktop in Codex coding mode, so the project
+menu includes local folders instead of falling back to ChatGPT cloud projects.
+The API profile's master key remains DPAPI-encrypted by this launcher. When the
+desktop starts, it is synchronized through stdin into the official Codex
+Windows keyring for that isolated `CODEX_HOME`; no API key is placed on the
+command line or written to plaintext `auth.json`.
+
 Run a specific profile:
 
 ```bash
