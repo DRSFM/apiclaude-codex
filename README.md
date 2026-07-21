@@ -124,6 +124,14 @@ desktop starts, it is synchronized through stdin into the official Codex
 Windows keyring for that isolated `CODEX_HOME`; no API key is placed on the
 command line or written to plaintext `auth.json`.
 
+For an opt-in Dream Skin instance, set `APICODEX_DREAM_SKIN_SCRIPT` to the
+skin launcher's PowerShell path and `APICODEX_DREAM_SKIN_PORT` to a dedicated
+loopback port before running `apicodex --desktop --api-profile <profile>`.
+The launcher then passes the profile-scoped `CODEX_HOME`, API key, and Desktop
+data directory to the skin entry point; the key is not placed in its arguments.
+The Dream Skin path waits for its own startup verification, while the default
+Desktop path remains detached.
+
 Run a specific profile:
 
 ```bash

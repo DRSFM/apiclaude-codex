@@ -47,6 +47,8 @@ CODEX_PARENT_CONTEXT_ENV = (
 )
 CODEX_DESKTOP_ENV_REMOVE = CODEX_PARENT_CONTEXT_ENV + (
     "CODEX_HOME",
+    "APICODEX_DREAM_SKIN_SCRIPT",
+    "APICODEX_DREAM_SKIN_PORT",
     "OPENAI_API_KEY",
     "OPENAI_BASE_URL",
     "OPENAI_ORG_ID",
@@ -740,13 +742,72 @@ def launch_codex_desktop(
         f"Opening ChatGPT desktop with isolated Codex profile "
         f"'{selected.get('name')}' ({selected.get('baseUrl')})"
     )
+    command = str(desktop_exe)
+    args = [f"--user-data-dir={desktop_data}"]
+    launch_env = {
+        "CODEX_HOME": str(home),
+        "APICODEX_API_KEY": clean_hidden_prefix(api_key),
+    }
+    dream_skin_script_value = clean_hidden_prefix(
+        os.environ.get("APICODEX_DREAM_SKIN_SCRIPT", "")
+    )
+    if dream_skin_script_value:
+        dream_skin_script = Path(dream_skin_script_value).expanduser().resolve()
+        if not dream_skin_script.is_file():
+            print(
+                f"Error: Dream Skin launcher was not found: {dream_skin_script}",
+                file=sys.stderr,
+            )
+            return 1
+        powershell = shutil.which("pwsh") or shutil.which("powershell")
+        if not powershell:
+            print(
+                "Error: PowerShell is required for Dream Skin desktop launch.",
+                file=sys.stderr,
+            )
+            return 1
+        port_value = clean_hidden_prefix(
+            os.environ.get("APICODEX_DREAM_SKIN_PORT", "")
+        )
+        try:
+            dream_skin_port = int(port_value)
+        except ValueError:
+            dream_skin_port = 0
+        if dream_skin_port < 1024 or dream_skin_port > 65535:
+            print(
+                "Error: APICODEX_DREAM_SKIN_PORT must be between 1024 and 65535.",
+                file=sys.stderr,
+            )
+            return 1
+        command = powershell
+        args = [
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(dream_skin_script),
+            "-InstanceId",
+            profile_id,
+            "-Port",
+            str(dream_skin_port),
+            "-ProfilePath",
+            str(desktop_data),
+            "-RestartExisting",
+        ]
+        print(
+            f"Dream Skin instance '{profile_id}' will use loopback port "
+            f"{dream_skin_port}."
+        )
+        return run_command(
+            command,
+            args,
+            env=launch_env,
+            env_remove=CODEX_DESKTOP_ENV_REMOVE,
+        )
     return start_detached_process(
-        str(desktop_exe),
-        [f"--user-data-dir={desktop_data}"],
-        env={
-            "CODEX_HOME": str(home),
-            "APICODEX_API_KEY": clean_hidden_prefix(api_key),
-        },
+        command,
+        args,
+        env=launch_env,
         env_remove=CODEX_DESKTOP_ENV_REMOVE,
     )
 

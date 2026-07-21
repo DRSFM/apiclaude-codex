@@ -115,6 +115,87 @@ class ApiAgentAuthTests(unittest.TestCase):
             )
 
     @unittest.skipUnless(__import__("os").name == "nt", "Windows desktop app test")
+    def test_codex_desktop_can_delegate_to_instance_scoped_dream_skin(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            codex_home = root / ".codex-api"
+            desktop_root = root / ".apicodex-desktop"
+            desktop_exe = root / "app" / "ChatGPT.exe"
+            skin_script = root / "start-dream-skin.ps1"
+            skin_script.write_text("Write-Output test", encoding="utf-8")
+            profile = {
+                "id": "anyrouter",
+                "name": "anyrouter",
+                "home": "profiles/anyrouter",
+                "baseUrl": "https://example.test/v1",
+                "model": "test-model",
+                "credentialId": "codex:anyrouter",
+            }
+            store = SecureStore(root / "secrets")
+            store.set("codex:anyrouter", "sk-test-secret")
+
+            with (
+                patch.object(apiagent, "HOME", root),
+                patch.object(apiagent, "CODEX_HOME", codex_home),
+                patch.object(apiagent, "CODEX_DESKTOP_DATA_ROOT", desktop_root),
+                patch.object(apiagent, "SECRET_STORE", store),
+                patch.object(apiagent, "load_codex_profiles", return_value=[profile]),
+                patch.object(apiagent, "select_codex_profile", return_value=profile),
+                patch.object(apiagent, "find_codex_desktop_executable", return_value=desktop_exe),
+                patch.object(apiagent, "ensure_codex_keyring_auth", return_value=True),
+                patch.object(apiagent, "update_codex_last_used"),
+                patch.object(apiagent, "add_current_project_trust"),
+                patch.object(apiagent.shutil, "which", return_value="C:\\pwsh.exe"),
+                patch.object(apiagent, "run_command", return_value=0) as run,
+                patch.object(apiagent, "start_detached_process") as start,
+                patch.dict(
+                    __import__("os").environ,
+                    {
+                        "APICODEX_DREAM_SKIN_SCRIPT": str(skin_script),
+                        "APICODEX_DREAM_SKIN_PORT": "9336",
+                    },
+                    clear=False,
+                ),
+            ):
+                code = apiagent.codex_main(
+                    ["--desktop", "--api-profile", "anyrouter"]
+                )
+
+            self.assertEqual(code, 0)
+            start.assert_not_called()
+            self.assertEqual(run.call_args.args[0], "C:\\pwsh.exe")
+            self.assertEqual(
+                run.call_args.args[1],
+                [
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(skin_script.resolve()),
+                    "-InstanceId",
+                    "anyrouter",
+                    "-Port",
+                    "9336",
+                    "-ProfilePath",
+                    str(desktop_root / "anyrouter"),
+                    "-RestartExisting",
+                ],
+            )
+            self.assertEqual(
+                run.call_args.kwargs["env"]["CODEX_HOME"],
+                str(codex_home / "profiles" / "anyrouter"),
+            )
+            self.assertEqual(
+                run.call_args.kwargs["env"]["APICODEX_API_KEY"],
+                "sk-test-secret",
+            )
+            self.assertNotIn(
+                "sk-test-secret",
+                " ".join([run.call_args.args[0], *run.call_args.args[1]]),
+            )
+            self.assertIn("APICODEX_DREAM_SKIN_SCRIPT", run.call_args.kwargs["env_remove"])
+
+    @unittest.skipUnless(__import__("os").name == "nt", "Windows desktop app test")
     def test_codex_desktop_does_not_start_when_keyring_login_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
