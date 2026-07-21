@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import io
+import json
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -10,6 +13,50 @@ from secure_store import SecureStore
 
 
 class ApiAgentAuthTests(unittest.TestCase):
+    def test_api_profile_json_lists_only_non_sensitive_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            profile = {
+                "id": "relay_profile",
+                "name": "中继配置",
+                "home": "profiles/relay_profile",
+                "baseUrl": "https://example.test/v1",
+                "credentialId": "codex:relay_profile",
+                "apiKey": "must-not-leak",
+                "createdAt": "2026-01-01T00:00:00+00:00",
+                "lastUsedAt": None,
+            }
+            output = io.StringIO()
+
+            with (
+                patch.object(apiagent, "CODEX_HOME", root / ".codex-api"),
+                patch.object(apiagent, "CODEX_DESKTOP_DATA_ROOT", root / ".desktop"),
+                patch.object(apiagent, "load_codex_profiles", return_value=[profile]),
+                redirect_stdout(output),
+            ):
+                code = apiagent.codex_main(["--api-list", "--json"])
+
+            self.assertEqual(code, 0)
+            payload = json.loads(output.getvalue())
+            self.assertEqual(payload["schemaVersion"], 1)
+            self.assertEqual(len(payload["profiles"]), 1)
+            metadata = payload["profiles"][0]
+            self.assertEqual(metadata["id"], "relay_profile")
+            self.assertRegex(metadata["instanceId"], r"^relay-profile-[a-f0-9]{8}$")
+            self.assertEqual(metadata["name"], "中继配置")
+            self.assertEqual(metadata["baseUrl"], "https://example.test/v1")
+            self.assertEqual(
+                metadata["desktopData"],
+                str((root / ".desktop" / "relay_profile").resolve()),
+            )
+            self.assertNotIn("credentialId", metadata)
+            self.assertNotIn("apiKey", metadata)
+            self.assertNotIn("must-not-leak", output.getvalue())
+
+    def test_json_flag_is_rejected_outside_profile_list(self) -> None:
+        code = apiagent.codex_main(["--json"])
+        self.assertEqual(code, 1)
+
     def test_marker_in_dpapi_store_is_not_used_as_api_key(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = SecureStore(Path(tmp) / "secrets")
@@ -124,15 +171,15 @@ class ApiAgentAuthTests(unittest.TestCase):
             skin_script = root / "start-dream-skin.ps1"
             skin_script.write_text("Write-Output test", encoding="utf-8")
             profile = {
-                "id": "anyrouter",
-                "name": "anyrouter",
-                "home": "profiles/anyrouter",
+                "id": "legacy_profile",
+                "name": "legacy profile",
+                "home": "profiles/legacy_profile",
                 "baseUrl": "https://example.test/v1",
                 "model": "test-model",
-                "credentialId": "codex:anyrouter",
+                "credentialId": "codex:legacy_profile",
             }
             store = SecureStore(root / "secrets")
-            store.set("codex:anyrouter", "sk-test-secret")
+            store.set("codex:legacy_profile", "sk-test-secret")
 
             with (
                 patch.object(apiagent, "HOME", root),
@@ -158,7 +205,7 @@ class ApiAgentAuthTests(unittest.TestCase):
                 ),
             ):
                 code = apiagent.codex_main(
-                    ["--desktop", "--api-profile", "anyrouter"]
+                    ["--desktop", "--api-profile", "legacy_profile"]
                 )
 
             self.assertEqual(code, 0)
@@ -173,17 +220,17 @@ class ApiAgentAuthTests(unittest.TestCase):
                     "-File",
                     str(skin_script.resolve()),
                     "-InstanceId",
-                    "anyrouter",
+                    "legacy-profile-0b393d0d",
                     "-Port",
                     "9336",
                     "-ProfilePath",
-                    str(desktop_root / "anyrouter"),
+                    str(desktop_root / "legacy_profile"),
                     "-RestartExisting",
                 ],
             )
             self.assertEqual(
                 run.call_args.kwargs["env"]["CODEX_HOME"],
-                str(codex_home / "profiles" / "anyrouter"),
+                str(codex_home / "profiles" / "legacy_profile"),
             )
             self.assertEqual(
                 run.call_args.kwargs["env"]["APICODEX_API_KEY"],

@@ -12,6 +12,7 @@ older local tools:
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import shutil
@@ -67,6 +68,15 @@ def clean_hidden_prefix(value: str) -> str:
 def slugify(value: str) -> str:
     slug = re.sub(r"[^a-zA-Z0-9._-]+", "-", value.strip().lower()).strip("-")
     return slug or "profile"
+
+
+def dream_skin_instance_id(profile: dict[str, Any]) -> str:
+    raw = slugify(str(profile.get("id") or profile.get("name") or "profile"))
+    if re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", raw):
+        return raw
+    normalized = re.sub(r"[^a-z0-9-]+", "-", raw).strip("-") or "profile"
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:8]
+    return f"{normalized[:54].rstrip('-')}-{digest}"
 
 
 def mask_secret(value: str, head: int = 8, tail: int = 5) -> str:
@@ -491,17 +501,49 @@ def show_codex_profiles(profiles: list[dict[str, Any]]) -> None:
         )
 
 
-def add_codex_profile() -> int:
+def codex_profile_metadata(profile: dict[str, Any]) -> dict[str, Any]:
+    profile_id = slugify(str(profile.get("id") or profile.get("name") or "profile"))
+    return {
+        "id": str(profile.get("id") or profile_id),
+        "instanceId": dream_skin_instance_id(profile),
+        "name": str(profile.get("name") or profile_id),
+        "baseUrl": str(profile.get("baseUrl") or ""),
+        "profileHome": str(codex_profile_home(profile).resolve()),
+        "desktopData": str((CODEX_DESKTOP_DATA_ROOT / profile_id).resolve()),
+        "createdAt": profile.get("createdAt"),
+        "lastUsedAt": profile.get("lastUsedAt"),
+    }
+
+
+def show_codex_profiles_json(profiles: list[dict[str, Any]]) -> None:
+    payload = {
+        "schemaVersion": 1,
+        "profiles": [codex_profile_metadata(profile) for profile in profiles],
+    }
+    print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+
+
+def add_codex_profile(requested: str | None = None) -> int:
     profiles = load_codex_profiles()
     print("Add or update a Codex API profile")
-    name = input("Profile name: ").strip()
+    selected = find_profile(profiles, requested) if requested else None
+    if requested and not selected:
+        print(f"Error: Codex profile '{requested}' was not found.", file=sys.stderr)
+        return 1
+    default_name = str(selected.get("name")) if selected else ""
+    prompt = f"Profile name [{default_name}]: " if default_name else "Profile name: "
+    name = input(prompt).strip() or default_name
     if not name:
         name = "default" if not profiles else ""
     if not name:
         print("Error: profile name cannot be empty.", file=sys.stderr)
         return 1
 
-    existing = find_profile(profiles, name)
+    existing = selected or find_profile(profiles, name)
+    conflict = find_profile(profiles, name)
+    if selected and conflict and conflict.get("id") != selected.get("id"):
+        print(f"Error: profile name '{name}' is already in use.", file=sys.stderr)
+        return 1
     default_url = existing.get("baseUrl") if existing else DEFAULT_CODEX_BASE_URL
     base_url = clean_hidden_prefix(input(f"API base URL [{default_url}]: ") or default_url).rstrip("/")
 
@@ -546,17 +588,20 @@ def add_codex_profile() -> int:
     return 0
 
 
-def remove_codex_profile() -> int:
+def remove_codex_profile(requested: str | None = None) -> int:
     profiles = load_codex_profiles()
-    show_codex_profiles(profiles)
     if not profiles:
+        show_codex_profiles(profiles)
         return 0
-    choice = input("Remove which profile number or name: ").strip()
-    profile = None
-    if choice.isdigit() and 1 <= int(choice) <= len(profiles):
-        profile = profiles[int(choice) - 1]
+    if requested:
+        profile = find_profile(profiles, requested)
     else:
-        profile = find_profile(profiles, choice)
+        show_codex_profiles(profiles)
+        choice = input("Remove which profile number or name: ").strip()
+        if choice.isdigit() and 1 <= int(choice) <= len(profiles):
+            profile = profiles[int(choice) - 1]
+        else:
+            profile = find_profile(profiles, choice)
     if not profile:
         print("Error: profile was not found.", file=sys.stderr)
         return 1
@@ -732,6 +777,7 @@ def launch_codex_desktop(
         save_codex_profiles(profiles)
 
     profile_id = slugify(str(selected.get("id") or selected.get("name") or "default"))
+    dream_skin_id = dream_skin_instance_id(selected)
     desktop_data = CODEX_DESKTOP_DATA_ROOT / profile_id
     desktop_data.mkdir(parents=True, exist_ok=True)
     if not ensure_codex_keyring_auth(home, api_key):
@@ -787,7 +833,7 @@ def launch_codex_desktop(
             "-File",
             str(dream_skin_script),
             "-InstanceId",
-            profile_id,
+            dream_skin_id,
             "-Port",
             str(dream_skin_port),
             "-ProfilePath",
@@ -795,7 +841,7 @@ def launch_codex_desktop(
             "-RestartExisting",
         ]
         print(
-            f"Dream Skin instance '{profile_id}' will use loopback port "
+            f"Dream Skin instance '{dream_skin_id}' will use loopback port "
             f"{dream_skin_port}."
         )
         return run_command(
@@ -869,6 +915,7 @@ def codex_help() -> None:
   apicodex --api-add               Add or update an API profile
   apicodex --setup                 Alias for --api-add
   apicodex --api-list              List saved API profiles
+  apicodex --api-list --json       List non-sensitive profile metadata as JSON
   apicodex --api-profile <name>    Start a specific API profile
   apicodex --api-remove            Unregister/archive a saved API profile
   apicodex --vscode                Choose a profile and open VS Code here
@@ -884,7 +931,7 @@ def codex_main(args: list[str]) -> int:
     pass_through: list[str] = []
     requested: str | None = None
     do_add = do_list = do_remove = do_help = do_upgrade = do_vscode = False
-    do_desktop = False
+    do_desktop = do_json = False
     i = 0
     while i < len(args):
         arg = args[i]
@@ -900,6 +947,8 @@ def codex_main(args: list[str]) -> int:
             do_vscode = True
         elif arg == "--desktop":
             do_desktop = True
+        elif arg == "--json":
+            do_json = True
         elif arg == "--api-help":
             do_help = True
         elif arg == "--api-profile":
@@ -915,6 +964,9 @@ def codex_main(args: list[str]) -> int:
     if do_help:
         codex_help()
         return 0
+    if do_json and not do_list:
+        print("Error: --json is only supported with --api-list.", file=sys.stderr)
+        return 1
     if do_upgrade:
         return upgrade_codex()
     if do_desktop and do_vscode:
@@ -945,12 +997,16 @@ def codex_main(args: list[str]) -> int:
             return 1
         return launch_codex_vscode(profiles, selected)
     if do_list:
-        show_codex_profiles(load_codex_profiles())
+        profiles = load_codex_profiles()
+        if do_json:
+            show_codex_profiles_json(profiles)
+        else:
+            show_codex_profiles(profiles)
         return 0
     if do_remove:
-        return remove_codex_profile()
+        return remove_codex_profile(requested)
     if do_add:
-        code = add_codex_profile()
+        code = add_codex_profile(requested)
         if code != 0 or not pass_through:
             return code
 

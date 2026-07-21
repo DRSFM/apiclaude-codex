@@ -81,6 +81,18 @@ List profiles:
 apicodex --api-list
 ```
 
+For GUI integrations, request the stable machine-readable contract:
+
+```bash
+apicodex --api-list --json
+```
+
+The JSON envelope has `schemaVersion` and `profiles`. Each profile exposes only
+non-sensitive metadata: `id`, `instanceId`, `name`, `baseUrl`, `profileHome`,
+`desktopData`, and `lastUsedAt`. It never includes API keys, tokens, cookies,
+`auth.json` contents, or keyring values. Consumers should reject unsupported
+schema versions and treat profile IDs as opaque validated identifiers.
+
 Choose a profile and start Codex:
 
 ```bash
