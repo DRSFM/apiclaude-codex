@@ -136,6 +136,60 @@ desktop starts, it is synchronized through stdin into the official Codex
 Windows keyring for that isolated `CODEX_HOME`; no API key is placed on the
 command line or written to plaintext `auth.json`.
 
+### Repair Missing Desktop History Images
+
+Codex session JSONL records can retain an attached image as an embedded data
+URL while the adjacent history marker still points at a short-lived
+`codex-clipboard-*` file under the Windows Temp directory. If that Temp file is
+removed during a restart or cleanup, Desktop can keep showing a spinner even
+though the image bytes still exist in the session. Tools that render the
+embedded data URL directly are not affected by the missing Temp file.
+
+`apicodex --desktop` now checks the selected API profile before Desktop starts
+and reconstructs missing, validated clipboard files. A repair failure is
+reported but does not block Desktop startup. The same operation can be run
+explicitly:
+
+```powershell
+# Inspect or repair one selected API profile.
+apicodex --repair-images --dry-run
+apicodex --repair-images --api-profile muyuanpub
+
+# Inspect or repair every API profile. This never includes the account home.
+apicodex --repair-images --all --dry-run
+apicodex --repair-images --all
+```
+
+The normal account-backed Codex home is separate and always requires the
+explicit `--account` flag:
+
+```powershell
+apicodex --repair-images --account --dry-run
+apicodex --repair-images --account
+```
+
+On Windows, account repair at sign-in is available as a reversible opt-in. No
+task is installed automatically:
+
+```powershell
+apicodex --repair-images --account --install-task
+apicodex --repair-images --account --uninstall-task
+```
+
+The repair engine reads only `<CODEX_HOME>/sessions`. It does not edit session
+JSONL, `auth.json`, `config.toml`, SQLite files, keyring data, or Desktop user
+data. Its index contains locations and hashes only and is stored under
+`%LOCALAPPDATA%\apicodex\history-images`. Restored files must be direct children
+of the current Temp directory, use a `codex-clipboard-UUID` image name, and
+pass MIME, extension, size, structure, and SHA-256 checks. Existing files with
+different contents are preserved and reported as conflicts.
+
+This is a launcher-side compatibility repair based on the locally verified
+session schema, not a promise about an official app-server storage contract.
+If a future Codex release changes that schema, unrecognized records are left
+untouched. After account repair, reopen the affected task if Desktop had
+already loaded its missing-image state.
+
 For an opt-in Dream Skin instance, set `APICODEX_DREAM_SKIN_SCRIPT` to the
 skin launcher's PowerShell path and `APICODEX_DREAM_SKIN_PORT` to a dedicated
 loopback port before running `apicodex --desktop --api-profile <profile>`.

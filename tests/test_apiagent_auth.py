@@ -13,6 +13,32 @@ from secure_store import SecureStore
 
 
 class ApiAgentAuthTests(unittest.TestCase):
+    def test_profile_storage_slug_cannot_be_dot_path(self) -> None:
+        self.assertEqual(apiagent.slugify("."), "profile")
+        self.assertEqual(apiagent.slugify(".."), "profile")
+        self.assertEqual(apiagent.slugify("../.."), "profile")
+        self.assertEqual(apiagent.slugify("..-.."), "profile")
+
+    def test_profile_metadata_normalizes_unsafe_id_for_desktop_data(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            profile = {
+                "id": "..",
+                "name": "legacy",
+                "home": "profiles/legacy",
+            }
+
+            with (
+                patch.object(apiagent, "CODEX_HOME", root / ".codex-api"),
+                patch.object(apiagent, "CODEX_DESKTOP_DATA_ROOT", root / ".desktop"),
+            ):
+                metadata = apiagent.codex_profile_metadata(profile)
+
+            self.assertEqual(
+                Path(metadata["desktopData"]),
+                (root / ".desktop" / "profile").resolve(),
+            )
+
     def test_api_profile_json_lists_only_non_sensitive_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -52,6 +78,36 @@ class ApiAgentAuthTests(unittest.TestCase):
             self.assertNotIn("credentialId", metadata)
             self.assertNotIn("apiKey", metadata)
             self.assertNotIn("must-not-leak", output.getvalue())
+
+    def test_api_profile_json_rejects_unsafe_home_without_exposing_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            account_home = root / ".codex"
+            account_home.mkdir()
+            account_auth = account_home / "auth.json"
+            account_auth.write_text('{"account":"sentinel"}', encoding="utf-8")
+            profile = {
+                "id": "unsafe",
+                "name": "unsafe",
+                "home": "../.codex",
+                "baseUrl": "https://example.test/v1",
+            }
+            output = io.StringIO()
+
+            with (
+                patch.object(apiagent, "HOME", root),
+                patch.object(apiagent, "CODEX_HOME", root / ".codex-api"),
+                patch.object(apiagent, "load_codex_profiles", return_value=[profile]),
+                redirect_stdout(output),
+            ):
+                code = apiagent.codex_main(["--api-list", "--json"])
+
+            self.assertEqual(code, 1)
+            self.assertEqual(output.getvalue(), "")
+            self.assertEqual(
+                account_auth.read_text(encoding="utf-8"),
+                '{"account":"sentinel"}',
+            )
 
     def test_json_flag_is_rejected_outside_profile_list(self) -> None:
         code = apiagent.codex_main(["--json"])
@@ -390,9 +446,15 @@ class ApiAgentAuthTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
 
-            apiagent.write_codex_config(home, "https://example.test/v1", "test-model")
+            apiagent.write_codex_config(
+                home,
+                "https://example.test/v1",
+                "test-model",
+                "xhigh",
+            )
 
             config = (home / "config.toml").read_text(encoding="utf-8")
+            self.assertIn('model_reasoning_effort = "xhigh"', config)
             self.assertIn('env_key = "APICODEX_API_KEY"', config)
             self.assertIn('exclude = ["APICODEX_API_KEY"]', config)
             self.assertIn("[features]\napps = false\nplugins = false", config)
@@ -402,6 +464,141 @@ class ApiAgentAuthTests(unittest.TestCase):
                 '[desktop]\nconversationDetailMode = "STEPS_COMMANDS"',
                 config,
             )
+
+    def test_api_add_preserves_profile_model_and_reasoning_effort(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            profile = {
+                "id": "muyuanpub",
+                "name": "muyuanpub",
+                "home": "profiles/muyuanpub",
+                "baseUrl": "https://example.test/v1",
+                "model": "gpt-5.6-sol",
+                "reasoningEffort": "xhigh",
+                "credentialId": "codex:muyuanpub",
+            }
+
+            with (
+                patch.object(apiagent, "CODEX_HOME", root / ".codex-api"),
+                patch.object(apiagent, "SECRET_STORE"),
+                patch.object(apiagent, "load_codex_profiles", return_value=[profile]),
+                patch.object(apiagent, "save_codex_profiles"),
+                patch.object(apiagent, "getpass", return_value="sk-test-secret"),
+                patch("builtins.input", side_effect=["", ""]),
+            ):
+                code = apiagent.add_codex_profile("muyuanpub")
+
+            self.assertEqual(code, 0)
+            config = (
+                root / ".codex-api" / "profiles" / "muyuanpub" / "config.toml"
+            ).read_text(encoding="utf-8")
+            self.assertIn('model = "gpt-5.6-sol"', config)
+            self.assertIn('model_reasoning_effort = "xhigh"', config)
+
+    def test_api_add_rejects_unsafe_existing_home_before_secret_or_config_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            account_home = root / ".codex"
+            account_home.mkdir()
+            account_config = account_home / "config.toml"
+            account_config.write_text('model = "sentinel"\n', encoding="utf-8")
+            profile = {
+                "id": "unsafe",
+                "name": "unsafe",
+                "home": "../.codex",
+                "baseUrl": "https://example.test/v1",
+            }
+
+            with (
+                patch.object(apiagent, "HOME", root),
+                patch.object(apiagent, "CODEX_HOME", root / ".codex-api"),
+                patch.object(apiagent, "load_codex_profiles", return_value=[profile]),
+                patch.object(apiagent, "SECRET_STORE") as store,
+                patch.object(apiagent, "write_codex_config") as write_config,
+                patch.object(apiagent, "save_codex_profiles") as save_profiles,
+                patch.object(apiagent, "getpass", side_effect=AssertionError("read secret")),
+                patch("builtins.input", side_effect=AssertionError("prompted")),
+            ):
+                code = apiagent.add_codex_profile("unsafe")
+
+            self.assertEqual(code, 1)
+            store.set.assert_not_called()
+            write_config.assert_not_called()
+            save_profiles.assert_not_called()
+            self.assertEqual(
+                account_config.read_text(encoding="utf-8"),
+                'model = "sentinel"\n',
+            )
+
+    def test_api_remove_rejects_unsafe_home_before_secret_clear_or_move(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            account_home = root / ".codex"
+            account_home.mkdir()
+            account_auth = account_home / "auth.json"
+            account_auth.write_text('{"account":"sentinel"}', encoding="utf-8")
+            profile = {
+                "id": "unsafe",
+                "name": "unsafe",
+                "home": "../.codex",
+                "credentialId": "codex:unsafe",
+            }
+
+            with (
+                patch.object(apiagent, "HOME", root),
+                patch.object(apiagent, "CODEX_HOME", root / ".codex-api"),
+                patch.object(apiagent, "load_codex_profiles", return_value=[profile]),
+                patch.object(apiagent, "SECRET_STORE") as store,
+                patch.object(apiagent, "save_codex_profiles") as save_profiles,
+                patch.object(apiagent.shutil, "move") as move,
+                patch("builtins.input", side_effect=AssertionError("prompted")),
+            ):
+                code = apiagent.remove_codex_profile("unsafe")
+
+            self.assertEqual(code, 1)
+            store.clear.assert_not_called()
+            save_profiles.assert_not_called()
+            move.assert_not_called()
+            self.assertEqual(
+                account_auth.read_text(encoding="utf-8"),
+                '{"account":"sentinel"}',
+            )
+
+    def test_api_remove_normalizes_profile_id_before_archive_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            api_root = root / ".codex-api"
+            archive_root = api_root / "archived-profiles"
+            profile_home = api_root / "profiles" / "legacy"
+            profile_home.mkdir(parents=True)
+            (profile_home / "sentinel.txt").write_text("profile", encoding="utf-8")
+            account_home = root / ".codex"
+            account_home.mkdir()
+            account_sentinel = account_home / "auth.json"
+            account_sentinel.write_text("account", encoding="utf-8")
+            profile = {
+                "id": "../account",
+                "name": "legacy",
+                "home": "profiles/legacy",
+            }
+
+            with (
+                patch.object(apiagent, "HOME", root),
+                patch.object(apiagent, "CODEX_HOME", api_root),
+                patch.object(apiagent, "CODEX_ARCHIVE_ROOT", archive_root),
+                patch.object(apiagent, "load_codex_profiles", return_value=[profile]),
+                patch.object(apiagent, "save_codex_profiles"),
+                patch.object(apiagent, "SECRET_STORE"),
+                patch("builtins.input", return_value="YES"),
+            ):
+                code = apiagent.remove_codex_profile("../account")
+
+            self.assertEqual(code, 0)
+            archives = list(archive_root.iterdir())
+            self.assertEqual(len(archives), 1)
+            self.assertTrue(archives[0].resolve().is_relative_to(archive_root.resolve()))
+            self.assertTrue((archives[0] / "sentinel.txt").is_file())
+            self.assertEqual(account_sentinel.read_text(encoding="utf-8"), "account")
 
     def test_codex_desktop_repairs_work_mode_without_losing_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

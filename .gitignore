@@ -1,5 +1,7 @@
 .apiclaude_config.json
 .apiclaude_env.*
+.work-progress/
+/codex-manual-markdown
 __pycache__/
 *.pyc
 .DS_Store

@@ -23,6 +23,11 @@ from getpass import getpass
 from pathlib import Path
 from typing import Any
 
+from codex_history_images import (
+    RepairReport,
+    default_state_root,
+    repair_codex_history_images,
+)
 from secure_store import SecureStore, SecureStoreError
 
 
@@ -35,10 +40,12 @@ CODEX_DESKTOP_DATA_ROOT = HOME / ".apicodex-desktop"
 CLAUDE_CONFIG_PATH = HOME / ".apiclaude_config.json"
 SECRET_STORE = SecureStore(HOME / ".apiagent-secrets")
 DEFAULT_CODEX_BASE_URL = "https://api.openai.com/v1"
-DEFAULT_CODEX_MODEL = "gpt-5.5"
+DEFAULT_CODEX_MODEL = "gpt-5.6-sol"
+DEFAULT_CODEX_REASONING_EFFORT = "high"
 CODEX_API_AUTH_MARKER = "apicodex-managed-key-in-child-environment"
 CODEX_AUTH_STORE = "keyring"
 CODEX_INSTALL_SCRIPT = "$env:CODEX_NON_INTERACTIVE=1; irm https://chatgpt.com/codex/install.ps1 | iex"
+CODEX_ACCOUNT_IMAGE_REPAIR_TASK = "ApiCodex Account History Image Repair"
 HIDDEN_PREFIX_CHARS = "\ufeff\u200b\u200c\u200d\u2060\ufffd"
 CODEX_PARENT_CONTEXT_ENV = (
     "CODEX_INTERNAL_ORIGINATOR_OVERRIDE",
@@ -66,7 +73,7 @@ def clean_hidden_prefix(value: str) -> str:
 
 
 def slugify(value: str) -> str:
-    slug = re.sub(r"[^a-zA-Z0-9._-]+", "-", value.strip().lower()).strip("-")
+    slug = re.sub(r"[^a-zA-Z0-9._-]+", "-", value.strip().lower()).strip(".-")
     return slug or "profile"
 
 
@@ -201,6 +208,210 @@ def codex_profile_home(profile: dict[str, Any]) -> Path:
     return CODEX_HOME if home == "." else CODEX_HOME / home
 
 
+def is_safe_api_profile_home(profile: dict[str, Any]) -> bool:
+    """Reject profile paths that could reach account or arbitrary state."""
+
+    raw_home = profile.get("home", ".")
+    if not isinstance(raw_home, str) or not raw_home:
+        return False
+    candidate = Path(raw_home)
+    if candidate.is_absolute() or ".." in candidate.parts:
+        return False
+    home = codex_profile_home(profile)
+    if not is_isolated_codex_home(home):
+        return False
+    try:
+        # Do not follow a profile directory link during credential migration.
+        return home.resolve() == home.absolute()
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def load_codex_profiles_for_image_repair() -> tuple[list[dict[str, Any]], int]:
+    """Read only non-sensitive profile metadata; never migrate credentials."""
+
+    if not CODEX_PROFILES_PATH.is_file():
+        return [], 0
+    try:
+        data = json.loads(CODEX_PROFILES_PATH.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        print(f"Error: failed to read Codex profile metadata: {exc}", file=sys.stderr)
+        return [], 1
+    raw_profiles = data.get("profiles") if isinstance(data, dict) else None
+    if not isinstance(raw_profiles, list):
+        print("Error: Codex profile metadata has an invalid profiles list.", file=sys.stderr)
+        return [], 1
+    profiles: list[dict[str, Any]] = []
+    invalid = 0
+    allowed = {"id", "name", "home", "baseUrl", "lastUsedAt"}
+    for raw in raw_profiles:
+        if not isinstance(raw, dict):
+            invalid += 1
+            continue
+        profile = {key: raw[key] for key in allowed if key in raw}
+        if not isinstance(profile.get("home", "."), str):
+            invalid += 1
+            continue
+        profile["id"] = str(profile.get("id") or profile.get("name") or "")
+        profile["name"] = str(profile.get("name") or profile["id"] or "profile")
+        profiles.append(profile)
+    return profiles, invalid
+
+
+def select_codex_image_repair_profile(
+    profiles: list[dict[str, Any]],
+    requested: str | None,
+) -> dict[str, Any] | None:
+    """Select metadata without the normal add/migrate side effects."""
+
+    if not profiles:
+        print("No Codex API profiles saved; nothing to repair.", file=sys.stderr)
+        return None
+    if requested:
+        profile = find_profile(profiles, requested)
+        if not profile:
+            print(f"Error: Codex profile '{requested}' was not found.", file=sys.stderr)
+        return profile
+    if len(profiles) == 1:
+        return profiles[0]
+    print("Choose Codex API profile for image repair")
+    for index, profile in enumerate(profiles, 1):
+        print(f"[{index}] {profile.get('name')}  {profile.get('baseUrl', '')}")
+    last = sorted(profiles, key=lambda item: item.get("lastUsedAt") or "", reverse=True)[0]
+    choice = input(f"Choose number or name [{last.get('name')}]: ").strip()
+    if not choice:
+        return last
+    if choice.isdigit() and 1 <= int(choice) <= len(profiles):
+        return profiles[int(choice) - 1]
+    profile = find_profile(profiles, choice)
+    if not profile:
+        print(f"Error: Codex profile '{choice}' was not found.", file=sys.stderr)
+    return profile
+
+
+def codex_image_repair_state_root() -> Path:
+    """Return the tool-owned image index location, outside every Codex home."""
+
+    return default_state_root()
+
+
+def repair_codex_home_images(
+    home: Path,
+    *,
+    label: str,
+    dry_run: bool = False,
+    quiet: bool = False,
+) -> RepairReport | None:
+    """Run image repair without touching credentials or Codex configuration."""
+
+    try:
+        report = repair_codex_history_images(
+            home,
+            state_root=codex_image_repair_state_root(),
+            protected_roots=(HOME / ".codex", CODEX_HOME),
+            dry_run=dry_run,
+        )
+    except Exception as exc:  # auxiliary self-heal must never block Desktop
+        print(
+            f"Warning: Codex history image repair failed for {label}: {exc}",
+            file=sys.stderr,
+        )
+        return None
+
+    if not quiet:
+        mode = "dry-run" if dry_run else "repair"
+        print(
+            f"Codex history images ({mode}, {label}): "
+            f"indexed={report.indexed_images}, "
+            f"restored={report.restored}, "
+            f"recoverable={report.recoverable}, "
+            f"present={report.already_present}, "
+            f"skipped={report.skipped}, "
+            f"conflicts={report.conflicts}, "
+            f"rejected={report.rejected}, "
+            f"stale={report.stale}, "
+            f"errors={report.errors}"
+        )
+        for issue in report.issues[:8]:
+            print(f"  - {issue}")
+    elif report.errors or report.conflicts or report.stale:
+        print(
+            f"Warning: history image repair for {label} reported "
+            f"conflicts={report.conflicts}, stale={report.stale}, "
+            f"errors={report.errors}.",
+            file=sys.stderr,
+        )
+    elif report.restored:
+        print(
+            f"Restored {report.restored} Codex history image(s) for {label}."
+        )
+    return report
+
+
+def finish_explicit_image_repair(
+    home: Path,
+    *,
+    label: str,
+    dry_run: bool,
+) -> int:
+    report = repair_codex_home_images(home, label=label, dry_run=dry_run)
+    if report is None:
+        return 1
+    return int(bool(report.errors or report.conflicts or report.stale or report.rejected))
+
+
+def configure_account_image_repair_task(*, install: bool) -> int:
+    """Install or remove the explicitly opted-in Windows logon repair task."""
+
+    if os.name != "nt":
+        print(
+            "Error: the account image repair task is supported only on Windows.",
+            file=sys.stderr,
+        )
+        return 1
+
+    if not install:
+        result = run_command(
+            "schtasks",
+            ["/Delete", "/TN", CODEX_ACCOUNT_IMAGE_REPAIR_TASK, "/F"],
+        )
+        if result == 0:
+            print("Removed the account history image repair logon task.")
+        return result
+
+    task_command = subprocess.list2cmdline(
+        [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "codex",
+            "--repair-images",
+            "--account",
+        ]
+    )
+    result = run_command(
+        "schtasks",
+        [
+            "/Create",
+            "/TN",
+            CODEX_ACCOUNT_IMAGE_REPAIR_TASK,
+            "/SC",
+            "ONLOGON",
+            "/TR",
+            task_command,
+            "/RL",
+            "LIMITED",
+            "/IT",
+            "/F",
+        ],
+    )
+    if result == 0:
+        print(
+            "Installed the account history image repair logon task. "
+            "It can be removed with --repair-images --account --uninstall-task."
+        )
+    return result
+
+
 def load_codex_profiles() -> list[dict[str, Any]]:
     initialize_codex_store()
     data = read_json(CODEX_PROFILES_PATH, {"version": 1, "profiles": []})
@@ -254,6 +465,12 @@ def migrate_codex_secrets(
     changed = False
     for profile in profiles:
         credential_id = profile.get("credentialId") or codex_credential_id(profile)
+        if not is_safe_api_profile_home(profile):
+            print(
+                f"Warning: skipping Codex profile with unsafe home '{profile.get('home')}'.",
+                file=sys.stderr,
+            )
+            continue
         home = codex_profile_home(profile)
         auth_path = home / "auth.json"
         embedded = profile.get("api_key") or profile.get("apiKey") or ""
@@ -276,7 +493,10 @@ def migrate_codex_secrets(
                 or DEFAULT_CODEX_BASE_URL
             )
             model = profile.get("model") or DEFAULT_CODEX_MODEL
-            write_codex_config(home, base_url, model)
+            reasoning_effort = (
+                profile.get("reasoningEffort") or DEFAULT_CODEX_REASONING_EFFORT
+            )
+            write_codex_config(home, base_url, model, reasoning_effort)
             changed = True
     return changed
 
@@ -288,6 +508,8 @@ def finalize_codex_migration(
     for profile in profiles:
         credential_id = profile.get("credentialId")
         if not credential_id:
+            continue
+        if not is_safe_api_profile_home(profile):
             continue
         auth_path = codex_profile_home(profile) / "auth.json"
         saved = _saved_api_key(auth_path)
@@ -328,11 +550,16 @@ def initialize_codex_store() -> None:
     save_codex_profiles(profiles)
 
 
-def write_codex_config(home: Path, base_url: str, model: str = DEFAULT_CODEX_MODEL) -> None:
+def write_codex_config(
+    home: Path,
+    base_url: str,
+    model: str = DEFAULT_CODEX_MODEL,
+    reasoning_effort: str = DEFAULT_CODEX_REASONING_EFFORT,
+) -> None:
     home.mkdir(parents=True, exist_ok=True)
     config = f'''model = "{model}"
 model_provider = "apicodex"
-model_reasoning_effort = "high"
+model_reasoning_effort = "{reasoning_effort}"
 cli_auth_credentials_store = "keyring"
 
 [windows]
@@ -502,6 +729,10 @@ def show_codex_profiles(profiles: list[dict[str, Any]]) -> None:
 
 
 def codex_profile_metadata(profile: dict[str, Any]) -> dict[str, Any]:
+    if not is_safe_api_profile_home(profile):
+        raise ValueError(
+            f"refusing to expose an unsafe Codex profile home: {profile.get('home')}"
+        )
     profile_id = slugify(str(profile.get("id") or profile.get("name") or "profile"))
     return {
         "id": str(profile.get("id") or profile_id),
@@ -515,12 +746,15 @@ def codex_profile_metadata(profile: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def show_codex_profiles_json(profiles: list[dict[str, Any]]) -> None:
-    payload = {
-        "schemaVersion": 1,
-        "profiles": [codex_profile_metadata(profile) for profile in profiles],
-    }
+def show_codex_profiles_json(profiles: list[dict[str, Any]]) -> bool:
+    try:
+        metadata = [codex_profile_metadata(profile) for profile in profiles]
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return False
+    payload = {"schemaVersion": 1, "profiles": metadata}
     print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+    return True
 
 
 def add_codex_profile(requested: str | None = None) -> int:
@@ -529,6 +763,12 @@ def add_codex_profile(requested: str | None = None) -> int:
     selected = find_profile(profiles, requested) if requested else None
     if requested and not selected:
         print(f"Error: Codex profile '{requested}' was not found.", file=sys.stderr)
+        return 1
+    if selected and not is_safe_api_profile_home(selected):
+        print(
+            "Error: refusing to update a Codex profile outside ~/.codex-api.",
+            file=sys.stderr,
+        )
         return 1
     default_name = str(selected.get("name")) if selected else ""
     prompt = f"Profile name [{default_name}]: " if default_name else "Profile name: "
@@ -543,6 +783,12 @@ def add_codex_profile(requested: str | None = None) -> int:
     conflict = find_profile(profiles, name)
     if selected and conflict and conflict.get("id") != selected.get("id"):
         print(f"Error: profile name '{name}' is already in use.", file=sys.stderr)
+        return 1
+    if existing and not is_safe_api_profile_home(existing):
+        print(
+            "Error: refusing to update a Codex profile outside ~/.codex-api.",
+            file=sys.stderr,
+        )
         return 1
     default_url = existing.get("baseUrl") if existing else DEFAULT_CODEX_BASE_URL
     base_url = clean_hidden_prefix(input(f"API base URL [{default_url}]: ") or default_url).rstrip("/")
@@ -568,13 +814,25 @@ def add_codex_profile(requested: str | None = None) -> int:
         }
         home = codex_profile_home(profile)
 
+    if not is_safe_api_profile_home(profile):
+        print(
+            "Error: refusing to create a Codex profile outside ~/.codex-api.",
+            file=sys.stderr,
+        )
+        return 1
+
     api_key = getpass("API key: ")
     if not api_key.strip():
         print("Error: API key cannot be empty.", file=sys.stderr)
         return 1
     credential_id = codex_credential_id(profile)
     SECRET_STORE.set(credential_id, clean_hidden_prefix(api_key))
-    write_codex_config(home, base_url, profile.get("model") or DEFAULT_CODEX_MODEL)
+    write_codex_config(
+        home,
+        base_url,
+        profile.get("model") or DEFAULT_CODEX_MODEL,
+        profile.get("reasoningEffort") or DEFAULT_CODEX_REASONING_EFFORT,
+    )
 
     profile["name"] = name
     profile["baseUrl"] = base_url
@@ -605,6 +863,12 @@ def remove_codex_profile(requested: str | None = None) -> int:
     if not profile:
         print("Error: profile was not found.", file=sys.stderr)
         return 1
+    if not is_safe_api_profile_home(profile):
+        print(
+            "Error: refusing to remove a Codex profile outside ~/.codex-api.",
+            file=sys.stderr,
+        )
+        return 1
     if input(f"Unregister '{profile['name']}'? Type YES to confirm: ") != "YES":
         print("Cancelled.")
         return 0
@@ -615,7 +879,8 @@ def remove_codex_profile(requested: str | None = None) -> int:
         home = codex_profile_home(profile)
         if home.exists():
             CODEX_ARCHIVE_ROOT.mkdir(parents=True, exist_ok=True)
-            archive_path = CODEX_ARCHIVE_ROOT / f"{profile['id']}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+            archive_id = slugify(str(profile.get("id") or profile.get("name") or "profile"))
+            archive_path = CODEX_ARCHIVE_ROOT / f"{archive_id}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
             shutil.move(str(home), str(archive_path))
             print(f"Archived profile directory to {archive_path}")
     else:
@@ -740,7 +1005,7 @@ def launch_codex_desktop(
         return 1
 
     home = codex_profile_home(selected)
-    if not is_isolated_codex_home(home):
+    if not is_safe_api_profile_home(selected):
         print(
             "Error: refusing to launch a desktop profile outside ~/.codex-api.",
             file=sys.stderr,
@@ -756,11 +1021,18 @@ def launch_codex_desktop(
         )
         return 1
 
+    repair_codex_home_images(
+        home,
+        label=f"API profile '{selected.get('name') or selected.get('id')}'",
+        quiet=True,
+    )
+
     if not (home / "config.toml").exists():
         write_codex_config(
             home,
             selected.get("baseUrl", DEFAULT_CODEX_BASE_URL),
             selected.get("model") or DEFAULT_CODEX_MODEL,
+            selected.get("reasoningEffort") or DEFAULT_CODEX_REASONING_EFFORT,
         )
 
     try:
@@ -863,11 +1135,18 @@ def launch_codex_vscode(
     selected: dict[str, Any],
 ) -> int:
     home = codex_profile_home(selected)
+    if not is_safe_api_profile_home(selected):
+        print(
+            "Error: refusing to launch a VS Code profile outside ~/.codex-api.",
+            file=sys.stderr,
+        )
+        return 1
     if not (home / "config.toml").exists():
         write_codex_config(
             home,
             selected.get("baseUrl", DEFAULT_CODEX_BASE_URL),
             selected.get("model") or DEFAULT_CODEX_MODEL,
+            selected.get("reasoningEffort") or DEFAULT_CODEX_REASONING_EFFORT,
         )
 
     try:
@@ -920,6 +1199,16 @@ def codex_help() -> None:
   apicodex --api-remove            Unregister/archive a saved API profile
   apicodex --vscode                Choose a profile and open VS Code here
   apicodex --desktop               Choose a profile and open an isolated desktop app
+  apicodex --repair-images         Repair one API profile's missing history images
+  apicodex --repair-images --all   Repair all API profiles (never the account home)
+  apicodex --repair-images --account
+                                   Repair the account home explicitly
+  apicodex --repair-images --dry-run
+                                   Scan and report without writing Temp or index files
+  apicodex --repair-images --account --install-task
+                                   Opt in to account repair at Windows logon
+  apicodex --repair-images --account --uninstall-task
+                                   Remove the opt-in Windows logon task
   apicodex --up                    Update the Codex CLI
   apicodex --api-help              Show this help
 
@@ -932,6 +1221,9 @@ def codex_main(args: list[str]) -> int:
     requested: str | None = None
     do_add = do_list = do_remove = do_help = do_upgrade = do_vscode = False
     do_desktop = do_json = False
+    repair_mode = "--repair-images" in args
+    do_repair = repair_all = repair_account = repair_dry_run = False
+    repair_install_task = repair_uninstall_task = False
     i = 0
     while i < len(args):
         arg = args[i]
@@ -947,6 +1239,18 @@ def codex_main(args: list[str]) -> int:
             do_vscode = True
         elif arg == "--desktop":
             do_desktop = True
+        elif arg == "--repair-images":
+            do_repair = True
+        elif repair_mode and arg == "--all":
+            repair_all = True
+        elif repair_mode and arg == "--account":
+            repair_account = True
+        elif repair_mode and arg == "--dry-run":
+            repair_dry_run = True
+        elif repair_mode and arg == "--install-task":
+            repair_install_task = True
+        elif repair_mode and arg == "--uninstall-task":
+            repair_uninstall_task = True
         elif arg == "--json":
             do_json = True
         elif arg == "--api-help":
@@ -960,6 +1264,102 @@ def codex_main(args: list[str]) -> int:
         else:
             pass_through.append(arg)
         i += 1
+
+    if do_repair:
+        if do_help or do_add or do_list or do_remove or do_upgrade or do_vscode or do_desktop or do_json:
+            print(
+                "Error: --repair-images cannot be combined with another management command.",
+                file=sys.stderr,
+            )
+            return 1
+        if pass_through:
+            print(
+                f"Error: unexpected repair arguments: {' '.join(pass_through)}",
+                file=sys.stderr,
+            )
+            return 1
+        if repair_all and repair_account:
+            print(
+                "Error: --repair-images --all and --account are mutually exclusive.",
+                file=sys.stderr,
+            )
+            return 1
+        if repair_install_task and repair_uninstall_task:
+            print(
+                "Error: --install-task and --uninstall-task are mutually exclusive.",
+                file=sys.stderr,
+            )
+            return 1
+        if (repair_install_task or repair_uninstall_task) and not repair_account:
+            print(
+                "Error: a repair task can be configured only with explicit --account.",
+                file=sys.stderr,
+            )
+            return 1
+        if (repair_install_task or repair_uninstall_task) and repair_dry_run:
+            print(
+                "Error: --dry-run cannot be combined with task installation or removal.",
+                file=sys.stderr,
+            )
+            return 1
+        if repair_account and requested:
+            print(
+                "Error: --account repair cannot select an API profile.",
+                file=sys.stderr,
+            )
+            return 1
+        if repair_all and requested:
+            print(
+                "Error: --all repair cannot select an individual API profile.",
+                file=sys.stderr,
+            )
+            return 1
+        if repair_account:
+            # Deliberately branch before load_codex_profiles(): that routine
+            # can migrate API credentials and must never run for account repair.
+            if repair_install_task or repair_uninstall_task:
+                return configure_account_image_repair_task(
+                    install=repair_install_task,
+                )
+            account_home = (HOME / ".codex").resolve()
+            return finish_explicit_image_repair(
+                account_home,
+                label="account Codex",
+                dry_run=repair_dry_run,
+            )
+
+        profiles, invalid_profiles = load_codex_profiles_for_image_repair()
+        result = int(bool(invalid_profiles))
+        if repair_all:
+            selected_profiles = profiles
+        else:
+            selected = select_codex_image_repair_profile(profiles, requested)
+            if not selected:
+                return 1
+            selected_profiles = [selected]
+        for profile in selected_profiles:
+            home = codex_profile_home(profile)
+            if not is_safe_api_profile_home(profile):
+                print(
+                    f"Error: refusing to repair profile outside ~/.codex-api: {home}",
+                    file=sys.stderr,
+                )
+                result = 1
+                continue
+            result = max(
+                result,
+                finish_explicit_image_repair(
+                    home,
+                    label=f"API profile '{profile.get('name') or profile.get('id')}'",
+                    dry_run=repair_dry_run,
+                ),
+            )
+        return result
+
+    if repair_all or repair_account or repair_dry_run:
+        # Without --repair-images these remain ordinary Codex pass-through
+        # arguments, preserving the launcher contract.
+        pass
 
     if do_help:
         codex_help()
@@ -999,7 +1399,7 @@ def codex_main(args: list[str]) -> int:
     if do_list:
         profiles = load_codex_profiles()
         if do_json:
-            show_codex_profiles_json(profiles)
+            return 0 if show_codex_profiles_json(profiles) else 1
         else:
             show_codex_profiles(profiles)
         return 0
@@ -1015,11 +1415,18 @@ def codex_main(args: list[str]) -> int:
     if not selected:
         return 1
     home = codex_profile_home(selected)
+    if not is_safe_api_profile_home(selected):
+        print(
+            "Error: refusing to run a Codex profile outside ~/.codex-api.",
+            file=sys.stderr,
+        )
+        return 1
     if not (home / "config.toml").exists():
         write_codex_config(
             home,
             selected.get("baseUrl", DEFAULT_CODEX_BASE_URL),
             selected.get("model") or DEFAULT_CODEX_MODEL,
+            selected.get("reasoningEffort") or DEFAULT_CODEX_REASONING_EFFORT,
         )
     try:
         api_key = get_codex_secret(selected)
