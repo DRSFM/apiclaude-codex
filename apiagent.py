@@ -1209,6 +1209,7 @@ def codex_help() -> None:
                                    Opt in to account repair at Windows logon
   apicodex --repair-images --account --uninstall-task
                                    Remove the opt-in Windows logon task
+  apicodex share --help            Manage portable local conversation snapshots
   apicodex --up                    Update the Codex CLI
   apicodex --api-help              Show this help
 
@@ -1216,7 +1217,32 @@ Any remaining arguments are passed to codex."""
     )
 
 
+def codex_share_main(args: list[str]) -> int:
+    """Route only the explicit share namespace to the conversation-pool CLI."""
+
+    from codex_share_cli import ShareContext, default_local_state_root, main
+
+    def load_profiles_read_only() -> list[dict[str, Any]]:
+        profiles, invalid = load_codex_profiles_for_image_repair()
+        if invalid:
+            print(
+                f"Warning: ignored {invalid} unsafe or invalid API Profile(s).",
+                file=sys.stderr,
+            )
+        return profiles
+
+    context = ShareContext(
+        account_home=(HOME / ".codex").resolve(),
+        api_root=CODEX_HOME.resolve(),
+        local_state_root=default_local_state_root(),
+        load_api_profiles=load_profiles_read_only,
+    )
+    return main(args, context)
+
+
 def codex_main(args: list[str]) -> int:
+    if args and args[0] == "share":
+        return codex_share_main(args[1:])
     pass_through: list[str] = []
     requested: str | None = None
     do_add = do_list = do_remove = do_help = do_upgrade = do_vscode = False

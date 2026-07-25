@@ -190,6 +190,89 @@ If a future Codex release changes that schema, unrecognized records are left
 untouched. After account repair, reopen the affected task if Desktop had
 already loaded its missing-image state.
 
+### Local Conversation Sharing Pool
+
+`apicodex share` provides a Git-like local pool for continuing selected Codex
+conversations in another account or API Profile. The default pool is
+`E:\CodexConversationPool`. It is not a `CODEX_HOME`: it contains only
+portable, content-addressed snapshots and version metadata.
+
+On Windows the pool requires both EFS and a protected ACL that grants access
+only to the current user, SYSTEM, and Administrators. Initialization stops if
+either control cannot be enabled or verified; there is no plaintext fallback.
+Check the operation first, then initialize it:
+
+```powershell
+apicodex share init --dry-run
+apicodex share init
+```
+
+Back up the current Windows user's EFS certificate and private key after
+initialization. Use `--pool E:\AnotherSecurePool` on any command to override
+the configured location.
+
+Publish a completed conversation as the first `main` version:
+
+```powershell
+# Choose the Profile and conversation interactively.
+apicodex share publish antenna-notes
+
+# Or select them explicitly.
+apicodex share publish antenna-notes --api-profile relay --thread <THREAD_ID>
+apicodex share publish account-task --account --thread <THREAD_ID>
+```
+
+Clone it into a target Profile. The target app-server creates a new local
+thread ID, loads that Profile's current configuration, and names the task with
+`[shared]` by default. Before forking, ApiCodex builds a temporary target
+runtime copy whose `model`, provider, and working directory come from the
+target Profile; those settings are audited again in the generated rollout so
+portable placeholders cannot be sent to the upstream API:
+
+```powershell
+apicodex share clone antenna-notes --api-profile another-profile
+apicodex share clone antenna-notes --commit <COMMIT_PREFIX> --account
+apicodex share clone antenna-notes --ref main --cwd D:\work\antenna
+```
+
+Mapped source and cloned tasks behave like independent working copies:
+
+```powershell
+apicodex share status --api-profile another-profile --thread <THREAD_ID>
+apicodex share push --api-profile another-profile --thread <THREAD_ID>
+
+# If main moved, a normal push is rejected. Preserve the work explicitly:
+apicodex share push --api-profile another-profile --thread <THREAD_ID> `
+  --new-branch experiment
+```
+
+Inspect the pool and local compatibility:
+
+```powershell
+apicodex share list
+apicodex share log antenna-notes
+apicodex share doctor --api-profile another-profile
+```
+
+`--json` is available for machine-readable output. Mutating commands support
+`--dry-run`; it validates and reports without changing pool refs, objects,
+threads, or mappings.
+
+Snapshots preserve visible user/assistant messages, tool calls and results,
+image references, and compaction summaries in their original order. They
+remove hidden reasoning, `encrypted_content`, credentials, token statistics,
+old permissions/sandbox/Profile settings, and injected Skill/plugin/AGENTS
+context. Unknown response-item types, active or half-written turns, source
+changes during capture, object hash failures, and non-fast-forward pushes are
+rejected instead of being silently degraded.
+
+Version 1 is local and manually synchronized. It does not provide in-place
+pull, automatic merge, background sync, repository copies, external tool-state
+copies, deletion/GC, or cross-machine transport. `thread/fork.path` is an
+experimental Codex capability; `share doctor` disables cloning safely if the
+installed Codex no longer exposes it. The implementation never falls back to
+editing Codex SQLite databases or target rollout JSONL directly.
+
 For an opt-in Dream Skin instance, set `APICODEX_DREAM_SKIN_SCRIPT` to the
 skin launcher's PowerShell path and `APICODEX_DREAM_SKIN_PORT` to a dedicated
 loopback port before running `apicodex --desktop --api-profile <profile>`.
