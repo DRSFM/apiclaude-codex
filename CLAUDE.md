@@ -52,7 +52,8 @@ apiclaude 功能对齐 apicodex（详见 AGENTS.md 后续记录）：
 
 1. 阶段一（已完成，2026-07-26）：每节点隔离/共用双模式，`apiclaude mode` 切换，
    新节点默认隔离、旧节点保持共用，切换不迁移数据。
-2. 阶段二：`list --json` 机器可读契约、`--vscode` 隔离启动、`--up` 更新、
-   节点归档、`lastUsedAt`。
+2. 阶段二（已完成，2026-07-26）：`list --json` 机器可读契约、`--vscode`
+   节点级 VS Code 用户目录与环境隔离、`--up` 官方更新、`lastUsedAt`，并将删除
+   流程收紧为隔离目录归档成功后才删除节点登记和凭据。
 - 不同步：`--desktop`（Claude Desktop 无 API 模式）、历史图片修复
   （Codex 特有损坏模式）；share 共享池 Claude 版暂缓。

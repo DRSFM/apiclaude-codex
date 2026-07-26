@@ -356,10 +356,33 @@ Other management commands:
 
 ```bash
 apiclaude list
+apiclaude list --json
 apiclaude current
 apiclaude remove NAME
+apiclaude --up
 apiclaude help
 ```
+
+`list --json` emits schema-versioned, non-sensitive node metadata, including
+the node mode, config directory, VS Code user-data directory, and
+`lastUsedAt`. It never includes tokens or credential-store identifiers.
+
+Open VS Code with a node-scoped user-data directory:
+
+```bash
+apiclaude --vscode
+apiclaude --vscode NAME
+```
+
+The selected node's API endpoint and token are passed only through the VS Code
+child-process environment. Isolated nodes also receive their
+`CLAUDE_CONFIG_DIR`; shared nodes continue to use `~/.claude`. If a VS Code
+process for that node is already running when its token changes, close all
+windows for the node and reopen it so the new child environment takes effect.
+
+`apiclaude --up` delegates to the official `claude update` command without
+loading a node token or config directory. The `vscode` and `update` subcommands
+are aliases for `--vscode` and `--up`.
 
 Run Claude Code with the current node without selecting again:
 

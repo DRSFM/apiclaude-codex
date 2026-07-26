@@ -5,6 +5,20 @@
 
 ## 协作修改记录
 
+### 2026-07-26：ApiClaude 功能对齐（阶段二）
+
+- 修改简介：接通 `apiclaude list --json` 非敏感元数据契约、`--vscode [NAME]`
+  节点级 VS Code 用户目录与环境隔离、`--up` 官方更新命令及对应子命令别名；
+  CLI/VS Code 启动会持久化 `lastUsedAt`，普通列表显示最近使用时间。
+- 修改原因：完成 Fable 5 预留的 ApiClaude 阶段二骨架，使启动器与外部工具可以
+  安全发现节点，并让 Claude 节点具备与 ApiCodex 对应的 VS Code 和更新入口。
+- 安全说明：JSON 不读取或输出 token/凭据标识；VS Code 凭据仅经子进程环境传递，
+  且清除父进程遗留的 Claude/API 环境；删除隔离节点改为归档成功后才删除登记与
+  DPAPI 凭据，危险路径或归档失败会保留原状态。
+- 验证情况：新增 7 项测试覆盖 JSON 无凭据泄漏与危险路径、CLI 路由、隔离/共用
+  VS Code 环境、`lastUsedAt`、删除危险路径及归档失败保留状态；`python -m py_compile
+  apiagent.py` 通过，完整 `python -m pytest tests/ -q` 共 94 项通过。
+
 ### 2026-07-26：ApiClaude 节点隔离/共用双模式（阶段一）
 
 - 修改简介：Claude 节点新增 `isolation` 字段与 `apiclaude mode NAME isolated|shared`

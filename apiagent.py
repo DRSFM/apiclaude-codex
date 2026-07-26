@@ -66,6 +66,12 @@ CODEX_DESKTOP_ENV_REMOVE = CODEX_PARENT_CONTEXT_ENV + (
     "OPENAI_ORG_ID",
     "OPENAI_PROJECT_ID",
 )
+CLAUDE_PROFILE_ENV = (
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "CLAUDE_CONFIG_DIR",
+)
 
 
 def now_iso() -> str:
@@ -1566,7 +1572,7 @@ def claude_node_slug(name: str, node: dict[str, Any]) -> str:
     if isinstance(raw, str) and raw:
         tail = Path(raw).name
         if tail:
-            return tail
+            return slugify(tail)
     return slugify(name)
 
 
@@ -1659,6 +1665,7 @@ def show_claude_nodes(config: dict[str, Any]) -> None:
             print(f"    Mode: isolated ({claude_node_home(name, node)})")
         else:
             print(f"    Mode: shared ({HOME / '.claude'})")
+        print(f"    Last used: {node.get('lastUsedAt') or '-'}")
         try:
             token = get_claude_secret(name, node)
         except (KeyError, SecureStoreError):
@@ -1698,6 +1705,7 @@ def add_claude_node(config: dict[str, Any]) -> int:
         "base_url": base_url,
         "credential_id": credential_id,
         "isolation": mode,
+        "lastUsedAt": existing.get("lastUsedAt") if existing else None,
     }
     if existing and existing.get("home"):
         node["home"] = existing["home"]
@@ -1724,27 +1732,42 @@ def remove_claude_node(config: dict[str, Any], name: str | None) -> int:
         return 0
     node = nodes[name]
     credential_id = node.get("credential_id") or claude_credential_id(name)
+    archived_path: Path | None = None
+    if claude_node_isolation(node) == "isolated":
+        if not is_safe_claude_node_home(name, node):
+            print(
+                f"Error: refusing unsafe isolated config dir of '{name}'.",
+                file=sys.stderr,
+            )
+            return 1
+        home = claude_node_home(name, node)
+        if home.exists():
+            CLAUDE_ARCHIVE_ROOT.mkdir(parents=True, exist_ok=True)
+            archive_path = (
+                CLAUDE_ARCHIVE_ROOT
+                / f"{slugify(name)}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+            )
+            archive_base = archive_path
+            suffix = 2
+            while archive_path.exists():
+                archive_path = Path(f"{archive_base}-{suffix}")
+                suffix += 1
+            try:
+                shutil.move(str(home), str(archive_path))
+            except OSError as exc:
+                print(
+                    f"Error: failed to archive Claude node '{name}': {exc}",
+                    file=sys.stderr,
+                )
+                return 1
+            archived_path = archive_path
     del nodes[name]
     if config.get("current") == name:
         config["current"] = None
     save_claude_config(config)
     SECRET_STORE.clear(credential_id)
-    if claude_node_isolation(node) == "isolated":
-        if not is_safe_claude_node_home(name, node):
-            print(
-                f"Warning: left unsafe isolated config dir of '{name}' untouched.",
-                file=sys.stderr,
-            )
-        else:
-            home = claude_node_home(name, node)
-            if home.exists():
-                CLAUDE_ARCHIVE_ROOT.mkdir(parents=True, exist_ok=True)
-                archive_path = (
-                    CLAUDE_ARCHIVE_ROOT
-                    / f"{slugify(name)}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
-                )
-                shutil.move(str(home), str(archive_path))
-                print(f"Archived node config dir to {archive_path}")
+    if archived_path is not None:
+        print(f"Archived node config dir to {archived_path}")
     print(f"Removed Claude node '{name}'.")
     return 0
 
@@ -1788,9 +1811,69 @@ def run_claude_node(config: dict[str, Any], name: str, claude_args: list[str]) -
     else:
         mode_label = f"shared: {HOME / '.claude'}"
     config["current"] = name
+    node["lastUsedAt"] = now_iso()
     save_claude_config(config)
     print(f"Using Claude node '{name}' ({env['ANTHROPIC_BASE_URL']}, {mode_label})")
-    return run_command("claude", claude_args, env=env)
+    return run_command(
+        "claude",
+        claude_args,
+        env=env,
+        env_remove=CLAUDE_PROFILE_ENV,
+    )
+
+
+def launch_claude_vscode(config: dict[str, Any], name: str) -> int:
+    node = (config.get("nodes") or {}).get(name)
+    if not node:
+        print(f"Error: Claude node '{name}' was not found.", file=sys.stderr)
+        return 1
+    try:
+        token = get_claude_secret(name, node)
+    except (KeyError, SecureStoreError):
+        print(f"Error: Claude node '{name}' has no saved token.", file=sys.stderr)
+        return 1
+
+    env = {
+        "ANTHROPIC_BASE_URL": clean_hidden_prefix(node.get("base_url", "")),
+        "ANTHROPIC_AUTH_TOKEN": clean_hidden_prefix(token),
+    }
+    if claude_node_isolation(node) == "isolated":
+        home = ensure_claude_node_home(config, name, node)
+        if home is None:
+            return 1
+        env["CLAUDE_CONFIG_DIR"] = str(home)
+
+    vscode_data = CLAUDE_VSCODE_DATA_ROOT / claude_node_slug(name, node)
+    vscode_data.mkdir(parents=True, exist_ok=True)
+    config["current"] = name
+    node["lastUsedAt"] = now_iso()
+    save_claude_config(config)
+    print(
+        f"Opening VS Code with Claude node '{name}' "
+        f"({env['ANTHROPIC_BASE_URL']}, {claude_node_isolation(node)})"
+    )
+    return run_command(
+        "code",
+        [
+            "--new-window",
+            "--user-data-dir",
+            str(vscode_data),
+            str(Path.cwd()),
+        ],
+        env=env,
+        env_remove=CLAUDE_PROFILE_ENV,
+    )
+
+
+def upgrade_claude() -> int:
+    """Update Claude Code through its official CLI command."""
+
+    print("Updating Claude Code...")
+    return run_command(
+        "claude",
+        ["update"],
+        env_remove=CLAUDE_PROFILE_ENV,
+    )
 
 
 def set_claude_node_mode(config: dict[str, Any], name: str, requested: str | None) -> int:
@@ -1840,11 +1923,16 @@ def claude_help() -> None:
   apiclaude                       Select a node, then start Claude Code
   apiclaude add                   Add or update a Claude API node
   apiclaude list                  List saved Claude API nodes
+  apiclaude list --json           List non-sensitive node metadata as JSON
   apiclaude current               Show current node
   apiclaude mode NAME [MODE]      Show or switch a node between isolated/shared
                                   isolated: node-scoped CLAUDE_CONFIG_DIR
                                   shared:   default ~/.claude (legacy behavior)
   apiclaude remove NAME           Remove a Claude API node (archives isolated dir)
+  apiclaude --vscode [NAME]       Open VS Code with a node-scoped user environment
+  apiclaude vscode [NAME]         Alias for --vscode
+  apiclaude --up                  Update Claude Code
+  apiclaude update                Alias for --up
   apiclaude run [ARGS]            Run current node without selecting
   apiclaude help                  Show this help
 
@@ -1853,6 +1941,12 @@ Any other arguments are passed to Claude Code after selecting a node."""
 
 
 def claude_main(args: list[str]) -> int:
+    if args and args[0] in ("--up", "update"):
+        if len(args) != 1:
+            print("Error: the update command does not accept arguments.", file=sys.stderr)
+            return 1
+        return upgrade_claude()
+
     config = load_claude_config()
     if not args:
         selected = select_claude_node(config)
@@ -1861,8 +1955,22 @@ def claude_main(args: list[str]) -> int:
     if command == "add":
         return add_claude_node(config)
     if command == "list":
+        if args[1:] == ["--json"]:
+            return 0 if show_claude_nodes_json(config) else 1
+        if len(args) != 1:
+            print("Error: usage: apiclaude list [--json].", file=sys.stderr)
+            return 1
         show_claude_nodes(config)
         return 0
+    if command in ("--vscode", "vscode"):
+        if len(args) > 2:
+            print(
+                "Error: usage: apiclaude --vscode [NAME].",
+                file=sys.stderr,
+            )
+            return 1
+        selected = args[1] if len(args) == 2 else select_claude_node(config)
+        return launch_claude_vscode(config, selected) if selected else 1
     if command == "current":
         current = config.get("current")
         if not current:
