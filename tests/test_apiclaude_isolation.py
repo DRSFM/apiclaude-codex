@@ -359,7 +359,7 @@ class ApiClaudeIsolationTests(unittest.TestCase):
             patch.object(apiagent, "launch_claude_vscode", return_value=0) as vscode,
             redirect_stdout(io.StringIO()),
         ):
-            code = apiagent.claude_main(["--vscode", "relay"])
+            code = apiagent.claude_main(["vscode", "relay"])
 
         self.assertEqual(code, 0)
         vscode.assert_called_once_with(config, "relay")

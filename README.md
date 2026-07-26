@@ -307,10 +307,14 @@ Codex CLI. On Windows, PowerShell (`pwsh` or `powershell`) must be available.
 
 ## Claude Usage
 
+`apiclaude` accepts the same command style as `apicodex` — only the tool name
+differs. The original subcommands (`add`, `list`, `current`, `remove`, `run`,
+`vscode`, `update`, `help`) remain available as aliases.
+
 Add or update a Claude API node:
 
 ```bash
-apiclaude add
+apiclaude --api-add
 ```
 
 New nodes default to an isolated per-node config directory: Claude Code runs
@@ -344,6 +348,13 @@ Choose a node and start Claude Code:
 apiclaude
 ```
 
+Start a specific node without prompting, with any Claude Code arguments:
+
+```bash
+apiclaude --api-profile mysub2api
+apiclaude --api-profile mysub2api resume
+```
+
 Pass Claude Code arguments after `apiclaude`:
 
 ```bash
@@ -355,23 +366,23 @@ apiclaude -c
 Other management commands:
 
 ```bash
-apiclaude list
-apiclaude list --json
-apiclaude current
-apiclaude remove NAME
+apiclaude --api-list
+apiclaude --api-list --json
+apiclaude --api-remove
 apiclaude --up
-apiclaude help
+apiclaude --api-help
+apiclaude current
 ```
 
-`list --json` emits schema-versioned, non-sensitive node metadata, including
-the node mode, config directory, VS Code user-data directory, and
+`--api-list --json` emits schema-versioned, non-sensitive node metadata,
+including the node mode, config directory, VS Code user-data directory, and
 `lastUsedAt`. It never includes tokens or credential-store identifiers.
 
 Open VS Code with a node-scoped user-data directory:
 
 ```bash
 apiclaude --vscode
-apiclaude --vscode NAME
+apiclaude --vscode --api-profile mysub2api
 ```
 
 The selected node's API endpoint and token are passed only through the VS Code
@@ -381,8 +392,7 @@ process for that node is already running when its token changes, close all
 windows for the node and reopen it so the new child environment takes effect.
 
 `apiclaude --up` delegates to the official `claude update` command without
-loading a node token or config directory. The `vscode` and `update` subcommands
-are aliases for `--vscode` and `--up`.
+loading a node token or config directory.
 
 Run Claude Code with the current node without selecting again:
 

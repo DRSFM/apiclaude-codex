@@ -5,7 +5,19 @@
 
 ## 协作修改记录
 
-### 2026-07-26：ApiClaude 功能对齐（阶段二）
+### 2026-07-26：ApiClaude 命令风格对齐 ApiCodex
+
+- 修改简介：`apiclaude` 支持与 `apicodex` 完全一致的旗标命令（`--api-add/--setup`、
+  `--api-list [--json]`、`--api-profile <name>`、`--api-remove`、
+  `--vscode [--api-profile]`、`--up`、`--api-help`），解析逻辑镜像 `codex_main`；
+  `--api-profile` 带来免交互指定节点启动能力；`--api-remove` 无名字时进入
+  交互式列表选择；旧子命令全部保留为别名。
+- 修改原因：用户日常以 apicodex 的旗标习惯操作，要求两工具仅差 `claude`/`codex`
+  一词；同时补齐"指定节点直接启动"这一原本缺失的能力。
+- 验证情况：新增 11 项 CLI 路由测试（JSON 契约、--api-profile 直启与透传、
+  错误路径、别名路由、交互删除、裸参数透传）；调整 1 项旧测试适配 `--vscode`
+  新语义（位置参数改经 `vscode` 子命令）。全量 `python -m pytest tests/ -q`
+  105 项通过；真机 `--api-list`、`--api-profile ghost` 错误路径冒烟通过。
 
 - 修改简介：接通 `apiclaude list --json` 非敏感元数据契约、`--vscode [NAME]`
   节点级 VS Code 用户目录与环境隔离、`--up` 官方更新命令及对应子命令别名；

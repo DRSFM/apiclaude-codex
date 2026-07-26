@@ -1673,9 +1673,9 @@ def show_claude_nodes(config: dict[str, Any]) -> None:
         print(f"    Token: {mask_secret(token)}")
 
 
-def add_claude_node(config: dict[str, Any]) -> int:
+def add_claude_node(config: dict[str, Any], requested: str | None = None) -> int:
     print("Add or update a Claude API node")
-    name = input("Node name: ").strip()
+    name = (requested or input("Node name: ")).strip()
     if not name:
         print("Error: node name cannot be empty.", file=sys.stderr)
         return 1
@@ -1721,6 +1721,16 @@ def add_claude_node(config: dict[str, Any]) -> int:
 
 def remove_claude_node(config: dict[str, Any], name: str | None) -> int:
     nodes = config.get("nodes") or {}
+    if not nodes:
+        show_claude_nodes(config)
+        return 0
+    if not name:
+        show_claude_nodes(config)
+        choice = input("Remove which node number or name: ").strip()
+        if choice.isdigit() and 1 <= int(choice) <= len(nodes):
+            name = list(nodes.keys())[int(choice) - 1]
+        else:
+            name = choice
     if not name:
         print("Error: specify node name.", file=sys.stderr)
         return 1
@@ -1920,37 +1930,33 @@ def set_claude_node_mode(config: dict[str, Any], name: str, requested: str | Non
 def claude_help() -> None:
     print(
         """apiclaude commands
-  apiclaude                       Select a node, then start Claude Code
-  apiclaude add                   Add or update a Claude API node
-  apiclaude list                  List saved Claude API nodes
-  apiclaude list --json           List non-sensitive node metadata as JSON
-  apiclaude current               Show current node
-  apiclaude mode NAME [MODE]      Show or switch a node between isolated/shared
-                                  isolated: node-scoped CLAUDE_CONFIG_DIR
-                                  shared:   default ~/.claude (legacy behavior)
-  apiclaude remove NAME           Remove a Claude API node (archives isolated dir)
-  apiclaude --vscode [NAME]       Open VS Code with a node-scoped user environment
-  apiclaude vscode [NAME]         Alias for --vscode
-  apiclaude --up                  Update Claude Code
-  apiclaude update                Alias for --up
-  apiclaude run [ARGS]            Run current node without selecting
-  apiclaude help                  Show this help
+  apiclaude                        Select a saved API node, then start Claude Code
+  apiclaude --api-add              Add or update an API node
+  apiclaude --setup                Alias for --api-add
+  apiclaude --api-list             List saved API nodes
+  apiclaude --api-list --json      List non-sensitive node metadata as JSON
+  apiclaude --api-profile <name>   Start a specific API node
+  apiclaude --api-remove           Unregister/archive a saved API node
+  apiclaude --vscode               Choose a node and open VS Code here
+  apiclaude --vscode --api-profile <name>
+                                   Open VS Code with a specific node
+  apiclaude --up                   Update Claude Code
+  apiclaude --api-help             Show this help
+  apiclaude mode NAME [MODE]       Show or switch a node between isolated/shared
+                                   isolated: node-scoped CLAUDE_CONFIG_DIR
+                                   shared:   default ~/.claude (legacy behavior)
 
-Any other arguments are passed to Claude Code after selecting a node."""
+Legacy subcommands remain available: add, list [--json], current,
+remove [NAME], run [ARGS], vscode [NAME], update, help.
+
+Any remaining arguments are passed to Claude Code."""
     )
 
 
-def claude_main(args: list[str]) -> int:
-    if args and args[0] in ("--up", "update"):
-        if len(args) != 1:
-            print("Error: the update command does not accept arguments.", file=sys.stderr)
-            return 1
-        return upgrade_claude()
+def claude_legacy_main(args: list[str]) -> int:
+    """Dispatch the original subcommand style (add/list/current/...)."""
 
     config = load_claude_config()
-    if not args:
-        selected = select_claude_node(config)
-        return run_claude_node(config, selected, []) if selected else 1
     command = args[0]
     if command == "add":
         return add_claude_node(config)
@@ -1962,12 +1968,9 @@ def claude_main(args: list[str]) -> int:
             return 1
         show_claude_nodes(config)
         return 0
-    if command in ("--vscode", "vscode"):
+    if command == "vscode":
         if len(args) > 2:
-            print(
-                "Error: usage: apiclaude --vscode [NAME].",
-                file=sys.stderr,
-            )
+            print("Error: usage: apiclaude vscode [NAME].", file=sys.stderr)
             return 1
         selected = args[1] if len(args) == 2 else select_claude_node(config)
         return launch_claude_vscode(config, selected) if selected else 1
@@ -1999,18 +2002,82 @@ def claude_main(args: list[str]) -> int:
         return set_claude_node_mode(config, args[1], args[2] if len(args) > 2 else None)
     if command == "remove":
         return remove_claude_node(config, args[1] if len(args) > 1 else None)
-    if command in ("help", "-h", "--help"):
+    # command == "run"
+    current = config.get("current")
+    if not current:
+        print("No current Claude node. Use 'apiclaude add' or 'apiclaude'.", file=sys.stderr)
+        return 1
+    return run_claude_node(config, current, args[1:])
+
+
+def claude_main(args: list[str]) -> int:
+    if args and args[0] in ("--up", "update"):
+        if len(args) != 1:
+            print("Error: the update command does not accept arguments.", file=sys.stderr)
+            return 1
+        return upgrade_claude()
+    if args and args[0] in ("help", "-h", "--help", "--api-help"):
         claude_help()
         return 0
-    if command == "run":
-        current = config.get("current")
-        if not current:
-            print("No current Claude node. Use 'apiclaude add' or 'apiclaude'.", file=sys.stderr)
-            return 1
-        return run_claude_node(config, current, args[1:])
+    if args and args[0] in ("add", "list", "current", "mode", "remove", "run", "vscode"):
+        return claude_legacy_main(args)
 
+    # Codex-style flag parsing, mirroring codex_main.
+    pass_through: list[str] = []
+    requested: str | None = None
+    do_add = do_list = do_remove = do_vscode = do_json = False
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in ("--api-add", "--setup"):
+            do_add = True
+        elif arg == "--api-list":
+            do_list = True
+        elif arg == "--api-remove":
+            do_remove = True
+        elif arg == "--vscode":
+            do_vscode = True
+        elif arg == "--json":
+            do_json = True
+        elif arg == "--api-profile":
+            if i + 1 >= len(args):
+                print("Error: --api-profile requires a node name.", file=sys.stderr)
+                return 1
+            requested = args[i + 1]
+            i += 1
+        else:
+            pass_through.append(arg)
+        i += 1
+
+    if do_json and not do_list:
+        print("Error: --json is only supported with --api-list.", file=sys.stderr)
+        return 1
+
+    config = load_claude_config()
+    if do_vscode:
+        if pass_through:
+            print(
+                f"Error: unexpected VS Code arguments: {' '.join(pass_through)}",
+                file=sys.stderr,
+            )
+            return 1
+        selected = requested or select_claude_node(config)
+        return launch_claude_vscode(config, selected) if selected else 1
+    if do_list:
+        if do_json:
+            return 0 if show_claude_nodes_json(config) else 1
+        show_claude_nodes(config)
+        return 0
+    if do_remove:
+        return remove_claude_node(config, requested)
+    if do_add:
+        code = add_claude_node(config, requested)
+        if code != 0 or not pass_through:
+            return code
+    if requested:
+        return run_claude_node(config, requested, pass_through)
     selected = select_claude_node(config)
-    return run_claude_node(config, selected, args) if selected else 1
+    return run_claude_node(config, selected, pass_through) if selected else 1
 
 
 def apiagent_help() -> None:
