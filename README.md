@@ -313,6 +313,31 @@ Add or update a Claude API node:
 apiclaude add
 ```
 
+New nodes default to an isolated per-node config directory: Claude Code runs
+with `CLAUDE_CONFIG_DIR` pointing at `~/.apiclaude/nodes/<slug>`, so sessions,
+project history, and settings do not mix between nodes or with the normal
+account state in `~/.claude`. Nodes saved by older versions keep the legacy
+shared behavior until switched.
+
+Show or switch a node's mode at any time:
+
+```bash
+apiclaude mode NAME            # show current mode
+apiclaude mode NAME isolated   # node-scoped CLAUDE_CONFIG_DIR
+apiclaude mode NAME shared     # default ~/.claude (legacy behavior)
+```
+
+Switching modes only changes which config directory is used on the next
+launch; nothing is moved or deleted. A node switched to isolated for the first
+time starts with a fresh directory (Claude Code will re-run onboarding and
+trust prompts there), while existing history stays in `~/.claude`. Switching
+back to shared leaves the isolated directory in place for later use. Removing
+a node archives its isolated directory under `~/.apiclaude/archived-nodes`.
+
+The isolated directory follows the node name, not the base URL or token, so
+editing a node's credentials — or changing the upstream behind a local proxy —
+never affects its local workspace.
+
 Choose a node and start Claude Code:
 
 ```bash

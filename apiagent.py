@@ -39,6 +39,9 @@ CODEX_ARCHIVE_ROOT = CODEX_HOME / "archived-profiles"
 CODEX_VSCODE_DATA_ROOT = HOME / ".apicodex-vscode"
 CODEX_DESKTOP_DATA_ROOT = HOME / ".apicodex-desktop"
 CLAUDE_CONFIG_PATH = HOME / ".apiclaude_config.json"
+CLAUDE_NODES_ROOT = HOME / ".apiclaude"
+CLAUDE_ARCHIVE_ROOT = CLAUDE_NODES_ROOT / "archived-nodes"
+CLAUDE_VSCODE_DATA_ROOT = HOME / ".apiclaude-vscode"
 SECRET_STORE = SecureStore(HOME / ".apiagent-secrets")
 DEFAULT_CODEX_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_CODEX_MODEL = "gpt-5.6-sol"
@@ -1516,6 +1519,111 @@ def claude_credential_id(name: str) -> str:
     return f"claude:{name}"
 
 
+def claude_node_isolation(node: dict[str, Any]) -> str:
+    return "isolated" if node.get("isolation") == "isolated" else "shared"
+
+
+def claude_node_home(name: str, node: dict[str, Any]) -> Path:
+    raw = node.get("home") or f"nodes/{slugify(name)}"
+    return CLAUDE_NODES_ROOT / raw
+
+
+def default_claude_node_home(config: dict[str, Any], name: str) -> str:
+    candidate = f"nodes/{slugify(name)}"
+    taken = {
+        other_node.get("home")
+        for other_name, other_node in (config.get("nodes") or {}).items()
+        if other_name != name
+    }
+    if candidate in taken:
+        digest = hashlib.sha256(name.encode("utf-8")).hexdigest()[:8]
+        candidate = f"{candidate}-{digest}"
+    return candidate
+
+
+def is_safe_claude_node_home(name: str, node: dict[str, Any]) -> bool:
+    """Reject node config dirs that could reach the account home or arbitrary state."""
+
+    raw = node.get("home") or f"nodes/{slugify(name)}"
+    if not isinstance(raw, str) or not raw:
+        return False
+    candidate = Path(raw)
+    if candidate.is_absolute() or ".." in candidate.parts:
+        return False
+    home = CLAUDE_NODES_ROOT / candidate
+    try:
+        resolved = home.resolve()
+        if resolved != home.absolute():
+            return False
+    except (OSError, RuntimeError, ValueError):
+        return False
+    account_home = (HOME / ".claude").resolve()
+    return resolved != account_home and resolved.is_relative_to(CLAUDE_NODES_ROOT.resolve())
+
+
+def claude_node_slug(name: str, node: dict[str, Any]) -> str:
+    raw = node.get("home")
+    if isinstance(raw, str) and raw:
+        tail = Path(raw).name
+        if tail:
+            return tail
+    return slugify(name)
+
+
+def claude_node_metadata(name: str, node: dict[str, Any]) -> dict[str, Any]:
+    isolation = claude_node_isolation(node)
+    if isolation == "isolated" and not is_safe_claude_node_home(name, node):
+        raise ValueError(
+            f"refusing to expose an unsafe Claude node home: {node.get('home')}"
+        )
+    if isolation == "isolated":
+        config_dir = str(claude_node_home(name, node).resolve())
+    else:
+        config_dir = str((HOME / ".claude").resolve())
+    return {
+        "name": name,
+        "baseUrl": str(node.get("base_url") or ""),
+        "isolation": isolation,
+        "configDir": config_dir,
+        "vscodeData": str((CLAUDE_VSCODE_DATA_ROOT / claude_node_slug(name, node)).resolve()),
+        "lastUsedAt": node.get("lastUsedAt"),
+    }
+
+
+def show_claude_nodes_json(config: dict[str, Any]) -> bool:
+    try:
+        metadata = [
+            claude_node_metadata(name, node)
+            for name, node in (config.get("nodes") or {}).items()
+        ]
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return False
+    payload = {
+        "schemaVersion": 1,
+        "current": config.get("current"),
+        "nodes": metadata,
+    }
+    print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+    return True
+
+
+def ensure_claude_node_home(
+    config: dict[str, Any], name: str, node: dict[str, Any]
+) -> Path | None:
+    if not node.get("home"):
+        node["home"] = default_claude_node_home(config, name)
+    if not is_safe_claude_node_home(name, node):
+        print(
+            f"Error: refusing unsafe isolated config dir for Claude node '{name}'.",
+            file=sys.stderr,
+        )
+        return None
+    home = claude_node_home(name, node)
+    home.mkdir(parents=True, exist_ok=True)
+    return home
+
+
 def migrate_claude_secrets(config: dict[str, Any], store: SecureStore) -> bool:
     changed = False
     for name, node in (config.get("nodes") or {}).items():
@@ -1547,6 +1655,10 @@ def show_claude_nodes(config: dict[str, Any]) -> None:
         marker = " [current]" if name == current else ""
         print(f"[{index}] {name}{marker}")
         print(f"    Base URL: {node.get('base_url')}")
+        if claude_node_isolation(node) == "isolated":
+            print(f"    Mode: isolated ({claude_node_home(name, node)})")
+        else:
+            print(f"    Mode: shared ({HOME / '.claude'})")
         try:
             token = get_claude_secret(name, node)
         except (KeyError, SecureStoreError):
@@ -1560,7 +1672,8 @@ def add_claude_node(config: dict[str, Any]) -> int:
     if not name:
         print("Error: node name cannot be empty.", file=sys.stderr)
         return 1
-    if name in (config.get("nodes") or {}) and input(f"Node '{name}' exists. Overwrite? (y/N): ").strip().lower() != "y":
+    existing = (config.get("nodes") or {}).get(name)
+    if existing is not None and input(f"Node '{name}' exists. Overwrite? (y/N): ").strip().lower() != "y":
         print("Cancelled.")
         return 0
     base_url = clean_hidden_prefix(input("ANTHROPIC_BASE_URL: "))
@@ -1568,16 +1681,33 @@ def add_claude_node(config: dict[str, Any]) -> int:
     if not base_url or not token:
         print("Error: base URL and token cannot be empty.", file=sys.stderr)
         return 1
+    default_mode = claude_node_isolation(existing) if existing else "isolated"
+    mode_choice = input(f"Config mode, isolated/shared [{default_mode}]: ").strip().lower()
+    if not mode_choice:
+        mode = default_mode
+    elif mode_choice in ("isolated", "i"):
+        mode = "isolated"
+    elif mode_choice in ("shared", "s"):
+        mode = "shared"
+    else:
+        print("Error: config mode must be 'isolated' or 'shared'.", file=sys.stderr)
+        return 1
     credential_id = claude_credential_id(name)
     SECRET_STORE.set(credential_id, token)
-    config.setdefault("nodes", {})[name] = {
+    node: dict[str, Any] = {
         "base_url": base_url,
         "credential_id": credential_id,
+        "isolation": mode,
     }
+    if existing and existing.get("home"):
+        node["home"] = existing["home"]
+    if mode == "isolated" and not node.get("home"):
+        node["home"] = default_claude_node_home(config, name)
+    config.setdefault("nodes", {})[name] = node
     if not config.get("current"):
         config["current"] = name
     save_claude_config(config)
-    print(f"Saved Claude node '{name}'.")
+    print(f"Saved Claude node '{name}' ({mode}).")
     return 0
 
 
@@ -1592,12 +1722,29 @@ def remove_claude_node(config: dict[str, Any], name: str | None) -> int:
     if input(f"Remove '{name}'? Type YES to confirm: ") != "YES":
         print("Cancelled.")
         return 0
-    credential_id = nodes[name].get("credential_id") or claude_credential_id(name)
+    node = nodes[name]
+    credential_id = node.get("credential_id") or claude_credential_id(name)
     del nodes[name]
     if config.get("current") == name:
         config["current"] = None
     save_claude_config(config)
     SECRET_STORE.clear(credential_id)
+    if claude_node_isolation(node) == "isolated":
+        if not is_safe_claude_node_home(name, node):
+            print(
+                f"Warning: left unsafe isolated config dir of '{name}' untouched.",
+                file=sys.stderr,
+            )
+        else:
+            home = claude_node_home(name, node)
+            if home.exists():
+                CLAUDE_ARCHIVE_ROOT.mkdir(parents=True, exist_ok=True)
+                archive_path = (
+                    CLAUDE_ARCHIVE_ROOT
+                    / f"{slugify(name)}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+                )
+                shutil.move(str(home), str(archive_path))
+                print(f"Archived node config dir to {archive_path}")
     print(f"Removed Claude node '{name}'.")
     return 0
 
@@ -1628,14 +1775,63 @@ def run_claude_node(config: dict[str, Any], name: str, claude_args: list[str]) -
     if not node:
         print(f"Error: Claude node '{name}' was not found.", file=sys.stderr)
         return 1
-    config["current"] = name
-    save_claude_config(config)
     env = {
         "ANTHROPIC_BASE_URL": clean_hidden_prefix(node.get("base_url", "")),
         "ANTHROPIC_AUTH_TOKEN": get_claude_secret(name, node),
     }
-    print(f"Using Claude node '{name}' ({env['ANTHROPIC_BASE_URL']})")
+    if claude_node_isolation(node) == "isolated":
+        home = ensure_claude_node_home(config, name, node)
+        if home is None:
+            return 1
+        env["CLAUDE_CONFIG_DIR"] = str(home)
+        mode_label = f"isolated: {home}"
+    else:
+        mode_label = f"shared: {HOME / '.claude'}"
+    config["current"] = name
+    save_claude_config(config)
+    print(f"Using Claude node '{name}' ({env['ANTHROPIC_BASE_URL']}, {mode_label})")
     return run_command("claude", claude_args, env=env)
+
+
+def set_claude_node_mode(config: dict[str, Any], name: str, requested: str | None) -> int:
+    node = (config.get("nodes") or {}).get(name)
+    if not node:
+        print(f"Error: Claude node '{name}' was not found.", file=sys.stderr)
+        return 1
+    current_mode = claude_node_isolation(node)
+    if requested is None:
+        if current_mode == "isolated":
+            print(f"Node '{name}' mode: isolated ({claude_node_home(name, node)})")
+        else:
+            print(f"Node '{name}' mode: shared ({HOME / '.claude'})")
+        return 0
+    value = requested.strip().lower()
+    if value not in ("isolated", "shared"):
+        print("Error: mode must be 'isolated' or 'shared'.", file=sys.stderr)
+        return 1
+    if value == current_mode:
+        print(f"Node '{name}' is already {value}.")
+        return 0
+    if value == "isolated":
+        home = ensure_claude_node_home(config, name, node)
+        if home is None:
+            return 1
+        node["isolation"] = "isolated"
+        save_claude_config(config)
+        print(f"Node '{name}' switched to isolated (CLAUDE_CONFIG_DIR={home}).")
+        print(
+            "Note: an empty isolated dir starts fresh (onboarding, trust prompts). "
+            f"History under {HOME / '.claude'} is not moved."
+        )
+    else:
+        node["isolation"] = "shared"
+        save_claude_config(config)
+        print(f"Node '{name}' switched to shared ({HOME / '.claude'}).")
+        print(
+            f"Note: isolated data is kept at {claude_node_home(name, node)} "
+            "for switching back."
+        )
+    return 0
 
 
 def claude_help() -> None:
@@ -1645,7 +1841,10 @@ def claude_help() -> None:
   apiclaude add                   Add or update a Claude API node
   apiclaude list                  List saved Claude API nodes
   apiclaude current               Show current node
-  apiclaude remove NAME           Remove a Claude API node
+  apiclaude mode NAME [MODE]      Show or switch a node between isolated/shared
+                                  isolated: node-scoped CLAUDE_CONFIG_DIR
+                                  shared:   default ~/.claude (legacy behavior)
+  apiclaude remove NAME           Remove a Claude API node (archives isolated dir)
   apiclaude run [ARGS]            Run current node without selecting
   apiclaude help                  Show this help
 
@@ -1675,12 +1874,21 @@ def claude_main(args: list[str]) -> int:
             return 1
         print(f"Current Claude node: {current}")
         print(f"ANTHROPIC_BASE_URL={node.get('base_url')}")
+        if claude_node_isolation(node) == "isolated":
+            print(f"CLAUDE_CONFIG_DIR={claude_node_home(current, node)} (isolated)")
+        else:
+            print(f"Config dir: {HOME / '.claude'} (shared)")
         try:
             token = get_claude_secret(current, node)
         except (KeyError, SecureStoreError):
             token = ""
         print(f"ANTHROPIC_AUTH_TOKEN={mask_secret(token)}")
         return 0
+    if command == "mode":
+        if len(args) < 2:
+            show_claude_nodes(config)
+            return 0
+        return set_claude_node_mode(config, args[1], args[2] if len(args) > 2 else None)
     if command == "remove":
         return remove_claude_node(config, args[1] if len(args) > 1 else None)
     if command in ("help", "-h", "--help"):
