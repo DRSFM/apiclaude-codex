@@ -18,6 +18,11 @@
 - 验证情况：新增 7 项测试覆盖 JSON 无凭据泄漏与危险路径、CLI 路由、隔离/共用
   VS Code 环境、`lastUsedAt`、删除危险路径及归档失败保留状态；`python -m py_compile
   apiagent.py` 通过，完整 `python -m pytest tests/ -q` 共 94 项通过。
+  2026-07-26 真机验收通过：5 个既有节点以共用模式正常列出且 JSON 契约无泄漏；
+  临时隔离节点完成 添加→选择启动（`CLAUDE_CONFIG_DIR` 正确注入与建目录、
+  `home`/`lastUsedAt` 持久化）→双向切换→删除归档→凭据清除 全链路，
+  真实节点与 `current` 未受影响。注意：`add` 的 token 输入经 `getpass`
+  读控制台而非 stdin，自动化调用需绕开（交互使用不受影响）。
 
 ### 2026-07-26：ApiClaude 节点隔离/共用双模式（阶段一）
 
