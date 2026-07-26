@@ -5,6 +5,82 @@
 
 ## 协作修改记录
 
+### 2026-07-27：GPT 桥节点限制 Claude API Skill 自动加载
+
+- 修改简介：GPT 桥节点启动前无损合并隔离 `settings.json`，在用户未显式配置时
+  将内置 `claude-api` Skill 设为 `user-invocable-only`；保留 `/claude-api`
+  手动入口、既有设置及显式 Skill 选择，普通 Claude 节点不受影响。
+- 修改原因：`gpt-5.6-sol` 在首轮模型身份问句中自动调用该 Skill，Claude Code
+  2.1.220 将约 86 万字符的整套 API 参考注入消息，使一次问答从约 26k 跳至
+  234.1k/200k；依赖不同模型自行判断是否调用不够稳定。
+- 验证情况：测试先复现缺失默认值，再验证写入并保留主题及其他 Skill 设置；
+  `python -m py_compile` 通过，全量测试 112 项通过、2 项按集成环境跳过。使用指定
+  问句完成真实 `muyuan / gpt-5.6-sol` 新会话验证，仅调用 WebSearch/WebFetch，
+  `Skill` 调用为 0，最终上下文约 25.1k。
+
+### 2026-07-27：CPA 桥 Windows 流式断流处理修复
+
+- 修改简介：将 `ConnectionAbortedError` 纳入桥接器已知客户端断流类型，在 CPA
+  认证转发、Anthropic 请求入口及 SSE 写流层统一静默收尾；真正的 HTTP、上游
+  连接与协议转换错误仍沿用原有报告路径。
+- 修改原因：CPA 关闭已完成或取消的本地流后，Windows 可能在转发器下一次
+  `wfile.write()` 抛出 `[WinError 10053]`；此前只处理 `BrokenPipeError` /
+  `ConnectionResetError`，导致正常断流向终端打印 traceback。
+- 验证情况：新增确定性测试模拟 CPA 在转发器写流时中止 socket，先复现未捕获
+  `ConnectionAbortedError`，修复后通过；桥接聚焦测试 8 项通过，
+  `python -m py_compile` 通过，全量测试 113 项通过、2 项按集成环境跳过。
+
+### 2026-07-27：Claude-Codex 桥切换为 CPA
+
+- 修改简介：新建或更新 `apiclaude bridge` 节点时改用 CLIProxyAPI v7.2.101
+  执行 Anthropic Messages → OpenAI Responses 转换，新增 `--cpa-exe` 与可选
+  `--proxy-url`；既有无 `gateway` 字段节点继续走 LiteLLM，保持向后兼容。
+- 修改原因：以更轻量且针对 Codex Responses 内建适配的 CPA 取代新节点的
+  LiteLLM 路径，同时复用现有 apicodex URL、模型和 DPAPI 凭据。
+- 安全说明：CPA 临时 YAML 只包含固定的非秘密本地占位值；真实上游 API Key
+  从 SecureStore 读入后仅保存在进程内存，由回环认证转发器注入，不写配置、
+  不进命令行或日志；CPA、转发器及临时目录均随 Claude 进程退出清理。
+- 验证情况：先以测试锁定 CPA 参数、节点元数据与配置无密钥，再用官方
+  v7.2.101 二进制和模拟 Responses 上游验证 `/v1/messages` 流式往返；聚焦测试
+  8 项通过、1 项按 LiteLLM 环境跳过，全量 `python -m pytest tests/ -q` 为
+  112 项通过、2 项按显式集成环境跳过。真实 `muyuan / gpt-5.6-sol` 使用指定
+  问句返回退出码 0；首轮发现并通过 `disable-image-generation: true` 修复上游
+  分组无图像权限的 403，文本与普通工具链路保留。当前版本已部署到 Windows
+  全局 npm PATH 目录；`apiclaude --api-profile codex-muyuan --version` 确认
+  `gateway=cpa`，旧安装已从 Git 对应 blob 恢复并保存在时间戳备份目录。
+
+### 2026-07-27：Claude-Codex 桥接日志告警修复
+
+- 修改简介：将桥接器最低 LiteLLM 版本收紧到 1.93.0，并在启动时拒绝已知有
+  Responses 日志缺陷的旧版本；本机仅升级 LiteLLM 本体，保留现有 Python
+  依赖版本。README 同步最低版本和故障说明。
+- 修改原因：LiteLLM 1.83.3 会在成功请求后错误序列化 Responses usage，
+  1.83.14 至 1.84.10 又会把完成事件错误校验为 AnthropicResponse，分别造成
+  Pydantic 警告和未回收的异步日志异常，污染 Claude Code 界面。
+- 验证情况：集成测试新增连续两轮工具流、目标 Pydantic 警告和 asyncio 后台
+  异常断言；LiteLLM 1.93.0 下单测 6 项、集成测试 1 项通过，全量
+  `python -m pytest tests/ -q` 为 111 项通过、1 项按环境变量跳过；真实
+  `codex-muyuan / gpt-5.6-sol` 多轮请求退出码 0，终端无警告或 traceback。
+
+### 2026-07-26：ApiClaude 引用 Codex Profile 的 GPT 桥接原型
+
+- 修改简介：新增 `apiclaude bridge CODEX_PROFILE [--name/--model]`，将现有
+  Codex API Profile 引用为隔离 Claude CLI 节点；节点运行期在 `127.0.0.1`
+  启动短时 Anthropic Messages → OpenAI Responses 流式桥，并注入主模型、
+  子代理模型及默认模型映射；VS Code 暂明确拒绝该实验节点。
+- 修改原因：在不复制 Profile 凭据、不混用 Claude 账号态的前提下，让同一套
+  GPT API 模型也能使用 Claude Code 的交互与工具外壳，便于并行体验两种客户端。
+- 安全说明：桥节点只保存 Codex Profile ID 和模型名；上游密钥运行时从 DPAPI
+  读取且仅留内存，本机桥使用每次启动随机令牌并只监听回环地址；实验性 beta、
+  自适应 thinking 与归因头默认关闭。2026-07-27 补充透明的 Codex 兼容客户端
+  标识，兼容会拒绝 LiteLLM 默认 User-Agent 的 Profile 网关，不冒充官方版本。
+- 验证情况：新增 5 项单元测试及 1 项可选协议集成测试，覆盖无凭据复制、CLI
+  路由、运行期环境隔离、VS Code 边界，以及工具调用的双向流式转换；集成测试
+  1 项通过，全量 `python -m pytest tests/ -q` 为 110 项通过、1 项按环境变量
+  跳过，`py_compile` 通过。真机建立 `codex-muyuan` 隔离节点并以
+  `claude --version` 完成无模型调用启动冒烟；2026-07-27 进一步以真实
+  `claude -p` 请求验证 `muyuan / gpt-5.6-sol` 返回 `OK`。
+
 ### 2026-07-26：ApiClaude 命令风格对齐 ApiCodex
 
 - 修改简介：`apiclaude` 支持与 `apicodex` 完全一致的旗标命令（`--api-add/--setup`、

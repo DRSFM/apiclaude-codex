@@ -29,6 +29,12 @@ from codex_history_images import (
     repair_codex_history_images,
 )
 from codex_desktop_windows import label_codex_desktop_window
+from claude_codex_bridge import (
+    BridgeEndpoint,
+    BridgeStartupError,
+    cpa_bridge,
+    litellm_bridge,
+)
 from secure_store import SecureStore, SecureStoreError
 
 
@@ -70,6 +76,14 @@ CLAUDE_PROFILE_ENV = (
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
     "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "CLAUDE_CODE_SUBAGENT_MODEL",
+    "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS",
+    "CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING",
+    "CLAUDE_CODE_ATTRIBUTION_HEADER",
     "CLAUDE_CONFIG_DIR",
 )
 
@@ -211,6 +225,17 @@ def extract_base_url_from_config(home: Path) -> str:
         return DEFAULT_CODEX_BASE_URL
     match = re.search(r'(?m)^\s*base_url\s*=\s*"([^"]+)"', config_path.read_text(encoding="utf-8-sig"))
     return match.group(1) if match else DEFAULT_CODEX_BASE_URL
+
+
+def extract_model_from_config(home: Path) -> str:
+    config_path = home / "config.toml"
+    if not config_path.exists():
+        return DEFAULT_CODEX_MODEL
+    match = re.search(
+        r'(?m)^\s*model\s*=\s*"([^"]+)"',
+        config_path.read_text(encoding="utf-8-sig"),
+    )
+    return match.group(1) if match else DEFAULT_CODEX_MODEL
 
 
 def codex_profile_home(profile: dict[str, Any]) -> Path:
@@ -1525,6 +1550,10 @@ def claude_credential_id(name: str) -> str:
     return f"claude:{name}"
 
 
+def is_claude_codex_bridge(node: dict[str, Any]) -> bool:
+    return node.get("type") == "codex_bridge"
+
+
 def claude_node_isolation(node: dict[str, Any]) -> str:
     return "isolated" if node.get("isolation") == "isolated" else "shared"
 
@@ -1588,7 +1617,10 @@ def claude_node_metadata(name: str, node: dict[str, Any]) -> dict[str, Any]:
         config_dir = str((HOME / ".claude").resolve())
     return {
         "name": name,
+        "type": str(node.get("type") or "anthropic"),
         "baseUrl": str(node.get("base_url") or ""),
+        "codexProfile": node.get("codex_profile"),
+        "model": node.get("model"),
         "isolation": isolation,
         "configDir": config_dir,
         "vscodeData": str((CLAUDE_VSCODE_DATA_ROOT / claude_node_slug(name, node)).resolve()),
@@ -1630,6 +1662,30 @@ def ensure_claude_node_home(
     return home
 
 
+def ensure_claude_codex_bridge_settings(home: Path) -> None:
+    settings_path = home / "settings.json"
+    if settings_path.exists():
+        settings = json.loads(settings_path.read_text(encoding="utf-8-sig"))
+        if not isinstance(settings, dict):
+            raise ValueError("settings.json must contain a JSON object")
+    else:
+        settings = {}
+
+    skill_overrides = settings.get("skillOverrides")
+    if skill_overrides is None:
+        skill_overrides = {}
+    elif not isinstance(skill_overrides, dict):
+        raise ValueError("settings.json skillOverrides must contain a JSON object")
+    if "claude-api" in skill_overrides:
+        return
+
+    settings["skillOverrides"] = {
+        **skill_overrides,
+        "claude-api": "user-invocable-only",
+    }
+    write_json(settings_path, settings)
+
+
 def migrate_claude_secrets(config: dict[str, Any], store: SecureStore) -> bool:
     changed = False
     for name, node in (config.get("nodes") or {}).items():
@@ -1660,17 +1716,26 @@ def show_claude_nodes(config: dict[str, Any]) -> None:
     for index, (name, node) in enumerate(nodes.items(), 1):
         marker = " [current]" if name == current else ""
         print(f"[{index}] {name}{marker}")
-        print(f"    Base URL: {node.get('base_url')}")
+        if is_claude_codex_bridge(node):
+            print(
+                f"    Codex bridge: {node.get('codex_profile')} "
+                f"(model={node.get('model')})"
+            )
+        else:
+            print(f"    Base URL: {node.get('base_url')}")
         if claude_node_isolation(node) == "isolated":
             print(f"    Mode: isolated ({claude_node_home(name, node)})")
         else:
             print(f"    Mode: shared ({HOME / '.claude'})")
         print(f"    Last used: {node.get('lastUsedAt') or '-'}")
-        try:
-            token = get_claude_secret(name, node)
-        except (KeyError, SecureStoreError):
-            token = ""
-        print(f"    Token: {mask_secret(token)}")
+        if is_claude_codex_bridge(node):
+            print("    Token: managed by the referenced Codex profile")
+        else:
+            try:
+                token = get_claude_secret(name, node)
+            except (KeyError, SecureStoreError):
+                token = ""
+            print(f"    Token: {mask_secret(token)}")
 
 
 def add_claude_node(config: dict[str, Any], requested: str | None = None) -> int:
@@ -1716,6 +1781,96 @@ def add_claude_node(config: dict[str, Any], requested: str | None = None) -> int
         config["current"] = name
     save_claude_config(config)
     print(f"Saved Claude node '{name}' ({mode}).")
+    return 0
+
+
+def add_claude_codex_bridge(
+    config: dict[str, Any],
+    codex_profile_name: str,
+    *,
+    node_name: str | None = None,
+    model: str | None = None,
+    cpa_executable: Path | None = None,
+    proxy_url: str | None = None,
+) -> int:
+    profiles = load_codex_profiles()
+    profile = find_profile(profiles, clean_hidden_prefix(codex_profile_name))
+    if not profile:
+        print(
+            f"Error: Codex profile '{codex_profile_name}' was not found.",
+            file=sys.stderr,
+        )
+        return 1
+    if not is_safe_api_profile_home(profile):
+        print(
+            "Error: refusing to bridge a Codex profile outside ~/.codex-api.",
+            file=sys.stderr,
+        )
+        return 1
+
+    name = clean_hidden_prefix(node_name or f"codex-{profile.get('name')}")
+    if not name:
+        print("Error: bridge node name cannot be empty.", file=sys.stderr)
+        return 1
+    existing = (config.get("nodes") or {}).get(name)
+    if existing and not is_claude_codex_bridge(existing):
+        print(
+            f"Error: Claude node '{name}' already exists and is not a Codex bridge.",
+            file=sys.stderr,
+        )
+        return 1
+
+    selected_model = clean_hidden_prefix(
+        model or extract_model_from_config(codex_profile_home(profile))
+    )
+    if not selected_model:
+        print("Error: bridge model cannot be empty.", file=sys.stderr)
+        return 1
+    if cpa_executable is None:
+        print(
+            "Error: --cpa-exe is required for a new CPA bridge node.",
+            file=sys.stderr,
+        )
+        return 1
+    resolved_cpa_executable = cpa_executable.expanduser().resolve()
+    if not resolved_cpa_executable.is_file():
+        print(
+            f"Error: CPA executable was not found: {resolved_cpa_executable}",
+            file=sys.stderr,
+        )
+        return 1
+
+    node: dict[str, Any] = {
+        "type": "codex_bridge",
+        "codex_profile": str(profile.get("id") or profile.get("name")),
+        "model": selected_model,
+        "gateway": "cpa",
+        "cpa_executable": str(resolved_cpa_executable),
+        "isolation": "isolated",
+        "lastUsedAt": existing.get("lastUsedAt") if existing else None,
+    }
+    cleaned_proxy_url = clean_hidden_prefix(proxy_url or "")
+    if cleaned_proxy_url:
+        node["proxy_url"] = cleaned_proxy_url
+    if existing and existing.get("home"):
+        node["home"] = existing["home"]
+    else:
+        node["home"] = default_claude_node_home(config, name)
+    if not is_safe_claude_node_home(name, node):
+        print(
+            f"Error: refusing unsafe isolated config dir for bridge node '{name}'.",
+            file=sys.stderr,
+        )
+        return 1
+
+    config.setdefault("nodes", {})[name] = node
+    if not config.get("current"):
+        config["current"] = name
+    save_claude_config(config)
+    print(
+        f"Saved isolated Claude bridge node '{name}' from Codex profile "
+        f"'{profile.get('name')}' (model={selected_model})."
+    )
     return 0
 
 
@@ -1775,7 +1930,8 @@ def remove_claude_node(config: dict[str, Any], name: str | None) -> int:
     if config.get("current") == name:
         config["current"] = None
     save_claude_config(config)
-    SECRET_STORE.clear(credential_id)
+    if not is_claude_codex_bridge(node):
+        SECRET_STORE.clear(credential_id)
     if archived_path is not None:
         print(f"Archived node config dir to {archived_path}")
     print(f"Removed Claude node '{name}'.")
@@ -1803,11 +1959,121 @@ def select_claude_node(config: dict[str, Any]) -> str | None:
     return None
 
 
+def run_claude_codex_bridge_node(
+    config: dict[str, Any],
+    name: str,
+    node: dict[str, Any],
+    claude_args: list[str],
+) -> int:
+    profiles = load_codex_profiles()
+    profile_name = str(node.get("codex_profile") or "")
+    profile = find_profile(profiles, profile_name)
+    if not profile:
+        print(
+            f"Error: bridge node '{name}' references missing Codex profile "
+            f"'{profile_name}'.",
+            file=sys.stderr,
+        )
+        return 1
+    if not is_safe_api_profile_home(profile):
+        print(
+            f"Error: bridge node '{name}' references an unsafe Codex profile.",
+            file=sys.stderr,
+        )
+        return 1
+    try:
+        api_key = clean_hidden_prefix(get_codex_secret(profile))
+    except (KeyError, SecureStoreError):
+        print(
+            f"Error: Codex profile '{profile.get('name')}' has no saved API key.",
+            file=sys.stderr,
+        )
+        return 1
+    model = clean_hidden_prefix(str(node.get("model") or ""))
+    if not model:
+        print(f"Error: bridge node '{name}' has no model.", file=sys.stderr)
+        return 1
+    home = ensure_claude_node_home(config, name, node)
+    if home is None:
+        return 1
+    try:
+        ensure_claude_codex_bridge_settings(home)
+    except (OSError, UnicodeError, ValueError) as exc:
+        print(
+            f"Error: failed to configure bridge node settings for '{name}': {exc}",
+            file=sys.stderr,
+        )
+        return 1
+
+    upstream_base_url = clean_hidden_prefix(
+        str(profile.get("baseUrl") or DEFAULT_CODEX_BASE_URL)
+    ).rstrip("/")
+    try:
+        gateway = str(node.get("gateway") or "litellm")
+        if gateway == "cpa":
+            cpa_executable = clean_hidden_prefix(
+                str(node.get("cpa_executable") or "")
+            )
+            if not cpa_executable:
+                print(
+                    f"Error: CPA bridge node '{name}' has no CPA executable.",
+                    file=sys.stderr,
+                )
+                return 1
+            bridge_context = cpa_bridge(
+                upstream_base_url=upstream_base_url,
+                upstream_api_key=api_key,
+                model=model,
+                cpa_executable=cpa_executable,
+                proxy_url=clean_hidden_prefix(str(node.get("proxy_url") or "")),
+            )
+        else:
+            bridge_context = litellm_bridge(
+                upstream_base_url=upstream_base_url,
+                upstream_api_key=api_key,
+                model=model,
+            )
+        with bridge_context as endpoint:
+            env = {
+                "ANTHROPIC_BASE_URL": endpoint.base_url,
+                "ANTHROPIC_AUTH_TOKEN": endpoint.token,
+                "ANTHROPIC_MODEL": model,
+                "ANTHROPIC_DEFAULT_OPUS_MODEL": model,
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": model,
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL": model,
+                "CLAUDE_CODE_SUBAGENT_MODEL": model,
+                "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
+                "CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING": "1",
+                "CLAUDE_CODE_ATTRIBUTION_HEADER": "0",
+                "CLAUDE_CONFIG_DIR": str(home),
+            }
+            config["current"] = name
+            node["lastUsedAt"] = now_iso()
+            save_claude_config(config)
+            print(
+                f"Using Claude bridge node '{name}' "
+                f"(gateway={gateway}, Codex profile={profile.get('name')}, "
+                f"model={model}, "
+                f"isolated: {home})"
+            )
+            return run_command(
+                "claude",
+                claude_args,
+                env=env,
+                env_remove=CLAUDE_PROFILE_ENV,
+            )
+    except BridgeStartupError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+
 def run_claude_node(config: dict[str, Any], name: str, claude_args: list[str]) -> int:
     node = config.get("nodes", {}).get(name)
     if not node:
         print(f"Error: Claude node '{name}' was not found.", file=sys.stderr)
         return 1
+    if is_claude_codex_bridge(node):
+        return run_claude_codex_bridge_node(config, name, node, claude_args)
     env = {
         "ANTHROPIC_BASE_URL": clean_hidden_prefix(node.get("base_url", "")),
         "ANTHROPIC_AUTH_TOKEN": get_claude_secret(name, node),
@@ -1836,6 +2102,13 @@ def launch_claude_vscode(config: dict[str, Any], name: str) -> int:
     node = (config.get("nodes") or {}).get(name)
     if not node:
         print(f"Error: Claude node '{name}' was not found.", file=sys.stderr)
+        return 1
+    if is_claude_codex_bridge(node):
+        print(
+            "Error: Codex bridge nodes are a CLI prototype; VS Code needs a "
+            "persistent gateway lifecycle and is not enabled yet.",
+            file=sys.stderr,
+        )
         return 1
     try:
         token = get_claude_secret(name, node)
@@ -1945,11 +2218,60 @@ def claude_help() -> None:
   apiclaude mode NAME [MODE]       Show or switch a node between isolated/shared
                                    isolated: node-scoped CLAUDE_CONFIG_DIR
                                    shared:   default ~/.claude (legacy behavior)
+  apiclaude bridge CODEX_PROFILE [--name NODE] [--model MODEL]
+                   --cpa-exe PATH [--proxy-url URL]
+                                   Create/update an isolated CLI prototype node
+                                   backed by an existing Codex API profile via CPA
 
 Legacy subcommands remain available: add, list [--json], current,
 remove [NAME], run [ARGS], vscode [NAME], update, help.
 
 Any remaining arguments are passed to Claude Code."""
+    )
+
+
+def claude_bridge_main(args: list[str]) -> int:
+    if not args or args[0] in ("-h", "--help"):
+        print(
+            "Usage: apiclaude bridge CODEX_PROFILE "
+            "[--name NODE] [--model MODEL] --cpa-exe PATH "
+            "[--proxy-url URL]"
+        )
+        return 0 if args else 1
+
+    codex_profile = args[0]
+    node_name: str | None = None
+    model: str | None = None
+    cpa_executable: Path | None = None
+    proxy_url: str | None = None
+    i = 1
+    while i < len(args):
+        option = args[i]
+        if option not in ("--name", "--model", "--cpa-exe", "--proxy-url"):
+            print(f"Error: unexpected bridge argument: {option}", file=sys.stderr)
+            return 1
+        if i + 1 >= len(args):
+            print(f"Error: {option} requires a value.", file=sys.stderr)
+            return 1
+        value = args[i + 1]
+        if option == "--name":
+            node_name = value
+        elif option == "--model":
+            model = value
+        elif option == "--cpa-exe":
+            cpa_executable = Path(value)
+        else:
+            proxy_url = value
+        i += 2
+
+    config = load_claude_config()
+    return add_claude_codex_bridge(
+        config,
+        codex_profile,
+        node_name=node_name,
+        model=model,
+        cpa_executable=cpa_executable,
+        proxy_url=proxy_url,
     )
 
 
@@ -1984,16 +2306,25 @@ def claude_legacy_main(args: list[str]) -> int:
             print(f"Current node '{current}' no longer exists.")
             return 1
         print(f"Current Claude node: {current}")
-        print(f"ANTHROPIC_BASE_URL={node.get('base_url')}")
+        if is_claude_codex_bridge(node):
+            print(
+                f"Codex bridge: profile={node.get('codex_profile')} "
+                f"model={node.get('model')}"
+            )
+        else:
+            print(f"ANTHROPIC_BASE_URL={node.get('base_url')}")
         if claude_node_isolation(node) == "isolated":
             print(f"CLAUDE_CONFIG_DIR={claude_node_home(current, node)} (isolated)")
         else:
             print(f"Config dir: {HOME / '.claude'} (shared)")
-        try:
-            token = get_claude_secret(current, node)
-        except (KeyError, SecureStoreError):
-            token = ""
-        print(f"ANTHROPIC_AUTH_TOKEN={mask_secret(token)}")
+        if is_claude_codex_bridge(node):
+            print("ANTHROPIC_AUTH_TOKEN=<ephemeral local bridge token>")
+        else:
+            try:
+                token = get_claude_secret(current, node)
+            except (KeyError, SecureStoreError):
+                token = ""
+            print(f"ANTHROPIC_AUTH_TOKEN={mask_secret(token)}")
         return 0
     if command == "mode":
         if len(args) < 2:
@@ -2019,6 +2350,8 @@ def claude_main(args: list[str]) -> int:
     if args and args[0] in ("help", "-h", "--help", "--api-help"):
         claude_help()
         return 0
+    if args and args[0] == "bridge":
+        return claude_bridge_main(args[1:])
     if args and args[0] in ("add", "list", "current", "mode", "remove", "run", "vscode"):
         return claude_legacy_main(args)
 

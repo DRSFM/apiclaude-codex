@@ -15,6 +15,8 @@ and credential references.
 - Python 3
 - Codex CLI available as `codex` for `apicodex`
 - Claude Code CLI available as `claude` for `apiclaude`
+- CLIProxyAPI (CPA) v7.2.101 or newer for new Codex-to-Claude bridge nodes
+- Optional: LiteLLM 1.93.0 or newer for legacy bridge nodes created before CPA
 
 Check:
 
@@ -341,6 +343,59 @@ a node archives its isolated directory under `~/.apiclaude/archived-nodes`.
 The isolated directory follows the node name, not the base URL or token, so
 editing a node's credentials — or changing the upstream behind a local proxy —
 never affects its local workspace.
+
+### Experimental Codex Profile bridge
+
+The CLI prototype can expose an existing `apicodex` API Profile to Claude Code
+through a short-lived local Anthropic Messages-compatible bridge:
+
+```bash
+apiclaude bridge muyuan \
+  --cpa-exe "F:/path/to/cli-proxy-api.exe" \
+  --proxy-url "http://127.0.0.1:7897"
+apiclaude --api-profile codex-muyuan
+```
+
+The first command creates an isolated Claude node that references the Codex
+Profile; it does not copy its API key. At launch, `apiclaude` reads the key from
+the existing DPAPI-backed credential store, starts CPA and a minimal in-memory
+authentication shim bound only to `127.0.0.1`, and keeps them alive for the
+Claude Code process. CPA performs the Anthropic Messages → OpenAI Responses
+translation. The shim injects the upstream key without placing it in CPA's
+temporary YAML configuration. The Profile's model is detected from its
+`config.toml`. The node name, model, CPA executable, and optional upstream proxy
+can be selected explicitly:
+
+```bash
+apiclaude bridge anyrouter --name gpt-shell --model gpt-5.6-sol \
+  --cpa-exe "F:/path/to/cli-proxy-api.exe"
+apiclaude --api-profile gpt-shell
+```
+
+New bridge nodes use CPA. Existing bridge nodes without a `gateway` field retain
+the previous LiteLLM path for compatibility; recreating them with
+`apiclaude bridge` switches them to CPA. The prototype supports Claude Code's
+streamed Messages and tool-use flow
+against an OpenAI-compatible Responses endpoint. It is currently CLI-only:
+`--vscode` is rejected because an editor session needs a separately managed,
+persistent bridge lifecycle. Protocol translation can still behave differently
+from a native Anthropic model, particularly for extended thinking and newly
+introduced beta features.
+
+On first launch, a bridge node adds a node-local
+`skillOverrides.claude-api = "user-invocable-only"` default when that skill has
+no explicit override. This prevents a non-Anthropic model from automatically
+loading Claude Code's large bundled Anthropic API reference for simple
+model-identification questions. `/claude-api` remains available for explicit
+use, existing settings and explicit skill choices are preserved, and regular
+Claude nodes are not changed.
+
+Some Codex Profile gateways reject generic HTTP clients even when the API key
+is valid. Bridge requests therefore use the transparent Codex-compatible
+identity `codex_cli_rs/apiclaude-bridge` with originator
+`apiclaude_codex_bridge`; they do not claim to be an official Codex build.
+Only use this mode with gateways whose terms allow compatible third-party
+clients.
 
 Choose a node and start Claude Code:
 
