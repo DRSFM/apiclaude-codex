@@ -13,3 +13,9 @@
 - 修改简介：新增 `apicodex share` 独立命令组、可移植会话清洗、EFS/专属 ACL 共享池、不可变版本对象、本地线程映射，以及通过目标 Codex app-server 创建独立线程的克隆流程。
 - 修改原因：需要让账号与不同 API Profile 在不共用线程 ID、不复制隐藏加密推理、也不修改源会话的前提下，手动发布和接续同一份可见对话上下文。
 - 验证情况：清洗、密文剔除、工具关联、compaction、篡改、路径、快进/分叉、dry-run、失败回滚及 CLI 均有测试；真实 EFS 池已建立，并保留跨 Profile 克隆用于 Desktop 验收。2026-07-26 修复了 `apicodex-portable` 模型占位符泄漏：池对象不再保存可被续聊误用的模型，克隆前按目标 Profile 临时物化 model/provider/cwd，并在登记映射前审计最终 rollout；旧会话和源会话均未修改或删除。
+
+### 2026-07-26：ApiCodex 与 Dream Skin 统一托盘整合
+
+- 修改简介：API Desktop 启动成功后按官方可执行文件和精确 `user-data-dir` 自动标记主窗口为 `ChatGPT (Profile名)`；Dream Skin WPF 启动器作为统一托盘与可视化控制面，保留原三栏皮肤功能。
+- 修改原因：本机并行运行账号与多个 API Profile 时，官方窗口和托盘名称相同，难以识别和安全管理。
+- 安全边界：不修改官方 Store 包、`app.asar`、签名、认证或会话；标题失败不阻断启动，托盘退出不关闭 ChatGPT，停止与聚焦只使用已验证实例归属。

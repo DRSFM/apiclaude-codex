@@ -281,6 +281,13 @@ data directory to the skin entry point; the key is not placed in its arguments.
 The Dream Skin path waits for its own startup verification, while the default
 Desktop path remains detached.
 
+After a successful API Desktop launch, ApiCodex labels the verified main window
+as `ChatGPT (Profile name)`. The account-backed Desktop remains `ChatGPT`.
+Labeling matches the official executable and exact isolated Desktop data path;
+failure only produces a warning and never blocks launch. The integrated Dream
+Skin WPF launcher provides the unified tray menu and retains all existing skin,
+profile, and instance controls.
+
 Run a specific profile:
 
 ```bash

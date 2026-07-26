@@ -28,6 +28,7 @@ from codex_history_images import (
     default_state_root,
     repair_codex_history_images,
 )
+from codex_desktop_windows import label_codex_desktop_window
 from secure_store import SecureStore, SecureStoreError
 
 
@@ -1066,6 +1067,22 @@ def launch_codex_desktop(
         "CODEX_HOME": str(home),
         "APICODEX_API_KEY": clean_hidden_prefix(api_key),
     }
+
+    def finish_launch(exit_code: int) -> int:
+        if exit_code != 0:
+            return exit_code
+        if not label_codex_desktop_window(
+            desktop_data,
+            str(selected.get("name") or selected.get("id") or profile_id),
+            desktop_exe,
+        ):
+            print(
+                f"Warning: Desktop started, but the window title for "
+                f"'{selected.get('name') or profile_id}' could not be labeled.",
+                file=sys.stderr,
+            )
+        return exit_code
+
     dream_skin_script_value = clean_hidden_prefix(
         os.environ.get("APICODEX_DREAM_SKIN_SCRIPT", "")
     )
@@ -1116,17 +1133,21 @@ def launch_codex_desktop(
             f"Dream Skin instance '{dream_skin_id}' will use loopback port "
             f"{dream_skin_port}."
         )
-        return run_command(
+        return finish_launch(
+            run_command(
+                command,
+                args,
+                env=launch_env,
+                env_remove=CODEX_DESKTOP_ENV_REMOVE,
+            )
+        )
+    return finish_launch(
+        start_detached_process(
             command,
             args,
             env=launch_env,
             env_remove=CODEX_DESKTOP_ENV_REMOVE,
         )
-    return start_detached_process(
-        command,
-        args,
-        env=launch_env,
-        env_remove=CODEX_DESKTOP_ENV_REMOVE,
     )
 
 
