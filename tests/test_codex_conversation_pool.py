@@ -90,6 +90,52 @@ def write_rollout(path: Path, rows: list[dict[str, object]], *, final_newline: b
 
 
 class SnapshotTests(unittest.TestCase):
+    def test_tool_search_call_and_output_are_preserved_as_a_pair(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.jsonl"
+            destination = root / "portable.jsonl"
+            rows = base_rows()
+            rows.extend(
+                [
+                    response(
+                        {
+                            "type": "tool_search_call",
+                            "id": "tool-search-call",
+                            "call_id": "call-tool-search",
+                            "status": "completed",
+                            "arguments": {"query": "available tools"},
+                        }
+                    ),
+                    response(
+                        {
+                            "type": "tool_search_output",
+                            "id": "tool-search-output",
+                            "call_id": "call-tool-search",
+                            "status": "completed",
+                            "tools": [{"type": "namespace", "name": "example"}],
+                        }
+                    ),
+                ]
+            )
+            write_rollout(source, rows)
+
+            sanitize_rollout(source, destination)
+
+            payloads = [
+                row["payload"]
+                for row in (
+                    json.loads(line)
+                    for line in destination.read_text(encoding="utf-8").splitlines()
+                )
+                if row["type"] == "response_item"
+            ]
+            self.assertEqual(
+                [payload["type"] for payload in payloads],
+                ["tool_search_call", "tool_search_output"],
+            )
+            self.assertTrue(all("id" not in payload for payload in payloads))
+
     def test_portable_snapshot_keeps_visible_history_tools_images_and_compaction(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -886,6 +932,17 @@ class StorageTests(unittest.TestCase):
                 ),
                 [],
             )
+
+    def test_default_pool_path_follows_current_user_home(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home = root / "home"
+            store = LocalMappingStore(root / "state")
+            with patch.object(pool_module.Path, "home", return_value=home):
+                self.assertEqual(
+                    store.get_pool_path(),
+                    (home / "CodexConversationPool").resolve(),
+                )
 
     def test_security_failure_never_creates_plaintext_pool_metadata(self) -> None:
         class FailingSecurity(FakeSecurity):

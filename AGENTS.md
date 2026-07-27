@@ -5,6 +5,29 @@
 
 ## 协作修改记录
 
+### 2026-07-27：共享会话兼容 Codex 延迟工具搜索记录
+
+- 修改简介：共享池清洗器新增成对识别并保留 `tool_search_call` /
+  `tool_search_output`，同时纳入调用与输出配对审计。
+- 修改原因：当前 Codex Desktop 会话包含延迟工具发现记录，旧允许列表将其视为
+  未知类型，导致安全发布在首个该记录处停止。
+- 安全说明：仅新增两个已实测的记录类型；未知类型、孤立输出、隐藏推理、
+  `encrypted_content` 与凭据清洗规则均保持不变。
+- 验证情况：新增配对保留与 ID 清洗回归测试，先复现失败后修复；`py_compile`
+  通过，全量测试 115 项通过、2 项按集成环境跳过。
+
+### 2026-07-27：ApiCodex 共享池默认路径去除固定盘符
+
+- 修改简介：移除 `E:\CodexConversationPool` 模块级硬编码；首次使用且尚无本地
+  配置时改为 `%USERPROFILE%\CodexConversationPool`，`--pool` 与已保存路径仍
+  保持优先。本机共享池已显式初始化到 `F:\CodexConversationPool`。
+- 修改原因：原默认值来自另一台电脑，跨机器照搬会误用不存在或不应使用的 E 盘。
+- 安全说明：误建的 E 盘共享池已移入回收站；F 盘池通过 EFS 与专属 ACL 验证，
+  本地配置已写入并读回为 F 盘路径。
+- 验证情况：新增默认路径跟随当前用户目录的回归测试；聚焦测试 23 项通过，
+  `python -m py_compile` 通过，全量测试 114 项通过、2 项按集成环境跳过；
+  `apicodex share doctor --api-profile muyuan` 确认池完整且克隆能力可用。
+
 ### 2026-07-27：GPT 桥节点限制 Claude API Skill 自动加载
 
 - 修改简介：GPT 桥节点启动前无损合并隔离 `settings.json`，在用户未显式配置时

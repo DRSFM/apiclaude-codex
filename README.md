@@ -195,9 +195,10 @@ already loaded its missing-image state.
 ### Local Conversation Sharing Pool
 
 `apicodex share` provides a Git-like local pool for continuing selected Codex
-conversations in another account or API Profile. The default pool is
-`E:\CodexConversationPool`. It is not a `CODEX_HOME`: it contains only
-portable, content-addressed snapshots and version metadata.
+conversations in another account or API Profile. On first use the default pool
+is `%USERPROFILE%\CodexConversationPool`; it is not tied to a particular drive.
+It is not a `CODEX_HOME`: it contains only portable, content-addressed
+snapshots and version metadata.
 
 On Windows the pool requires both EFS and a protected ACL that grants access
 only to the current user, SYSTEM, and Administrators. Initialization stops if

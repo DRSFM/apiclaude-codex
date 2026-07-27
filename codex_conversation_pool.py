@@ -21,7 +21,7 @@ from typing import Any, Iterable, Iterator, Protocol
 
 
 SCHEMA_VERSION = 1
-DEFAULT_POOL_PATH = Path(r"E:\CodexConversationPool")
+DEFAULT_POOL_DIRECTORY = "CodexConversationPool"
 OBJECT_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$")
 FILE_ATTRIBUTE_ENCRYPTED = 0x00004000
@@ -55,6 +55,8 @@ KNOWN_RESPONSE_TYPES = frozenset(
         "code_interpreter_call",
         "apply_patch_call",
         "apply_patch_call_output",
+        "tool_search_call",
+        "tool_search_output",
     }
 )
 DROP_RESPONSE_TYPES = frozenset({"reasoning", "agent_reasoning", "compaction"})
@@ -657,6 +659,7 @@ CALL_TYPES = {
     "computer_call": "computer_call_output",
     "shell_call": "shell_call_output",
     "apply_patch_call": "apply_patch_call_output",
+    "tool_search_call": "tool_search_output",
 }
 OUTPUT_TYPES = {output: call for call, output in CALL_TYPES.items()}
 
@@ -2013,7 +2016,7 @@ class LocalMappingStore:
 
     def get_pool_path(self) -> Path:
         if not self.config_path.is_file():
-            return DEFAULT_POOL_PATH
+            return (Path.home() / DEFAULT_POOL_DIRECTORY).resolve()
         try:
             payload = json.loads(self.config_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
