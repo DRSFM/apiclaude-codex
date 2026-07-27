@@ -5,6 +5,26 @@
 
 ## 协作修改记录
 
+### 2026-07-28：Claude Desktop 3P 接入 Codex Profile 原型
+
+- 修改简介：CPA 桥支持固定回环端口和稳定本地认证令牌；新增
+  `apiclaude --desktop --api-profile NODE [--desktop-port PORT]` 持久桥命令及
+  `desktop-token` 显式取令牌命令，并补充官方 Desktop 3P 配置说明。Desktop
+  专用桥对外使用目录可识别的 `claude-fable-5` 路由，CPA 内部强制映射到节点的
+  真实 GPT 模型；CLI 桥模型名不变，Desktop 显示名要求标明真实 GPT 上游。
+- 修改原因：Claude Desktop 已正式开放无需 Anthropic 账号登录的第三方推理网关，
+  可复用现有 Codex Profile，让同一 GPT 上游同时体验 Claude Code 与 Desktop 外壳。
+- 安全说明：本地网关令牌按节点随机生成并由 DPAPI 保存；上游 API Key 仍只在
+  内存认证转发器中注入，不进入 CPA YAML、命令行或日志，桥仅监听回环地址。
+- 验证情况：聚焦测试 23 项通过且测试前后真实配置哈希一致；CPA 集成 1 项通过、
+  1 项旧 LiteLLM 路径跳过；全量测试 119 项通过、2 项按环境跳过，`py_compile`
+  与 `git diff --check` 通过。使用指定问句经固定 `127.0.0.1:18765` 和真实
+  `muyuan / gpt-5.6-sol` 验证返回 HTTP 200；同时发现节点旧 CPA 构建不识别禁图
+  配置，已从干净 v7.2.101 tag 构建新版到 F 盘并在读回验证后切换节点引用；
+  新版 Windows MSIX `1.24012.9.0` 的受限 AppUserModelID 启动回退亦有测试覆盖。
+  针对 Desktop 拒绝非 Anthropic 目录路由的校验，新增 Fable 路由映射断言，并以
+  `/v1/models` 确认只广告该别名；指定问句经别名真实请求再次返回 HTTP 200。
+
 ### 2026-07-27：共享会话兼容 Codex 延迟工具搜索记录
 
 - 修改简介：共享池清洗器新增成对识别并保留 `tool_search_call` /

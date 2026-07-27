@@ -376,12 +376,61 @@ apiclaude --api-profile gpt-shell
 New bridge nodes use CPA. Existing bridge nodes without a `gateway` field retain
 the previous LiteLLM path for compatibility; recreating them with
 `apiclaude bridge` switches them to CPA. The prototype supports Claude Code's
-streamed Messages and tool-use flow
-against an OpenAI-compatible Responses endpoint. It is currently CLI-only:
-`--vscode` is rejected because an editor session needs a separately managed,
-persistent bridge lifecycle. Protocol translation can still behave differently
-from a native Anthropic model, particularly for extended thinking and newly
-introduced beta features.
+streamed Messages and tool-use flow against an OpenAI-compatible Responses
+endpoint. `--vscode` is rejected because an editor session needs a separately
+managed persistent bridge lifecycle. Protocol translation can still behave
+differently from a native Anthropic model, particularly for extended thinking
+and newly introduced beta features.
+
+### Experimental Claude Desktop 3P bridge
+
+Current Claude Desktop releases can use an officially supported third-party
+inference gateway without an Anthropic account login. A CPA-backed Codex bridge
+node can provide that gateway on a fixed loopback port:
+
+```bash
+apiclaude --desktop --api-profile codex-muyuan
+```
+
+Keep that terminal open while using Desktop. The command binds CPA to
+`127.0.0.1:18765`, launches either the current Windows MSIX app or a recognized
+legacy executable, and stops the bridge on Ctrl+C. Use `--desktop-port PORT` if
+that port is occupied.
+
+In Claude Desktop, enable Developer Mode from Help > Troubleshooting, then open
+Developer > Configure Third-Party Inference and apply these values locally:
+
+- Provider: Gateway
+- Base URL: `http://127.0.0.1:18765`
+- Credential kind: Static
+- Authentication scheme: Bearer
+- Model ID: `claude-fable-5`
+- Display name: the real bridge model, for example `GPT-5.6 Sol`
+- Tier alias: `fable`, with **Default for tier** enabled
+
+Get the local gateway token explicitly in a second terminal:
+
+```bash
+apiclaude desktop-token codex-muyuan
+```
+
+The token is random per bridge node and persisted with Windows DPAPI. It is
+only used to protect the loopback CPA endpoint; it is not the upstream API key.
+The upstream key remains in the existing Codex Profile credential store and is
+injected by the in-memory authentication shim. Neither key is written to CPA's
+temporary configuration. Use the current Windows MSIX Claude Desktop package;
+older EXE installations may not expose the complete third-party/Cowork flow.
+
+Claude Desktop validates Gateway model routes against its Anthropic model
+catalog. The Desktop bridge therefore advertises the recognized local route
+`claude-fable-5`; CPA force-maps that route to the bridge node's actual GPT
+model. The display name should identify the actual GPT model. This compatibility
+alias is Desktop-only and does not change the regular Claude Code bridge route.
+
+Desktop third-party inference is an official Claude Desktop feature, but using
+a non-Anthropic model through CPA remains an experimental protocol translation
+and is not supported by Anthropic. The fixed bridge serves one selected model
+and must remain running for the Desktop session.
 
 On first launch, a bridge node adds a node-local
 `skillOverrides.claude-api = "user-invocable-only"` default when that skill has

@@ -139,6 +139,29 @@ class ApiClaudeCodexStyleCliTests(unittest.TestCase):
 
         launch.assert_called_once_with(config, "relay")
 
+    def test_desktop_flag_routes_bridge_node_and_port(self) -> None:
+        config = _two_node_config()
+        with (
+            patch.object(apiagent, "load_claude_config", return_value=config),
+            patch.object(
+                apiagent,
+                "launch_claude_desktop_bridge",
+                return_value=0,
+            ) as launch,
+        ):
+            code = apiagent.claude_main(
+                [
+                    "--desktop",
+                    "--api-profile",
+                    "relay",
+                    "--desktop-port",
+                    "18765",
+                ]
+            )
+
+        self.assertEqual(code, 0)
+        launch.assert_called_once_with(config, "relay", port=18765)
+
     def test_interactive_remove_accepts_number_choice(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = SecureStore(Path(tmp))

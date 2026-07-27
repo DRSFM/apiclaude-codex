@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import socket
 import struct
 import tempfile
@@ -285,13 +286,115 @@ class ClaudeCodexBridgeTests(unittest.TestCase):
             auth_dir=Path("C:/temp/cpa-auth"),
             shim_base_url="http://127.0.0.1:45679",
             model="gpt-5.6-sol",
+            local_token="desktop-local-token",
+            route_model="claude-fable-5",
         )
 
         self.assertIn("codex-api-key:", config)
+        self.assertIn('  - "desktop-local-token"', config)
         self.assertIn('"gpt-5.6-sol"', config)
+        self.assertIn('alias: "claude-fable-5"', config)
         self.assertIn("disable-image-generation: true", config)
         self.assertNotIn("sk-upstream-secret", config)
         self.assertNotIn("upstream_api_key", config)
+
+    def test_desktop_bridge_token_is_stable_and_dpapi_backed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SecureStore(Path(tmp))
+            with patch.object(apiagent, "SECRET_STORE", store):
+                first = apiagent.get_or_create_claude_desktop_bridge_token(
+                    "gpt-shell"
+                )
+                second = apiagent.get_or_create_claude_desktop_bridge_token(
+                    "gpt-shell"
+                )
+
+            self.assertEqual(first, second)
+            self.assertGreaterEqual(len(first), 32)
+            self.assertNotIn(first.encode("utf-8"), next(Path(tmp).glob("*.bin")).read_bytes())
+
+    def test_desktop_bridge_runs_cpa_on_fixed_port_with_stable_token(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = SecureStore(root / "secrets")
+            store.set("codex:relay", "sk-upstream-secret")
+            store.set("claude-desktop-bridge:gpt-shell", "stable-local-token")
+            desktop_exe = root / "Claude.exe"
+            desktop_exe.write_bytes(b"test")
+            profile = {
+                "id": "relay",
+                "name": "relay",
+                "baseUrl": "https://openai-compatible.test/v1",
+                "home": "profiles/relay",
+                "credentialId": "codex:relay",
+            }
+            config = {
+                "nodes": {
+                    "gpt-shell": {
+                        "type": "codex_bridge",
+                        "codex_profile": "relay",
+                        "model": "gpt-test",
+                        "gateway": "cpa",
+                        "cpa_executable": str(root / "cli-proxy-api.exe"),
+                    }
+                },
+                "current": "gpt-shell",
+            }
+            bridge_calls = []
+
+            @contextmanager
+            def fake_cpa_bridge(**kwargs):
+                bridge_calls.append(kwargs)
+                yield apiagent.BridgeEndpoint(
+                    base_url="http://127.0.0.1:18765",
+                    token="stable-local-token",
+                )
+
+            with (
+                patch.object(apiagent, "SECRET_STORE", store),
+                patch.object(apiagent, "CODEX_HOME", root / ".codex-api"),
+                patch.object(apiagent, "load_codex_profiles", return_value=[profile]),
+                patch.object(apiagent, "cpa_bridge", fake_cpa_bridge),
+                patch.object(apiagent, "save_claude_config"),
+                patch.object(apiagent, "launch_claude_desktop_app", return_value=True) as launch,
+                patch.object(apiagent, "wait_for_claude_desktop_bridge") as wait,
+                redirect_stdout(io.StringIO()) as output,
+            ):
+                code = apiagent.launch_claude_desktop_bridge(
+                    config,
+                    "gpt-shell",
+                    port=18765,
+                )
+
+            self.assertEqual(code, 0)
+            self.assertEqual(bridge_calls[0]["listen_port"], 18765)
+            self.assertEqual(bridge_calls[0]["local_token"], "stable-local-token")
+            self.assertEqual(bridge_calls[0]["route_model"], "claude-fable-5")
+            self.assertEqual(bridge_calls[0]["upstream_api_key"], "sk-upstream-secret")
+            launch.assert_called_once_with()
+            wait.assert_called_once()
+            self.assertIn("http://127.0.0.1:18765", output.getvalue())
+            self.assertNotIn("stable-local-token", output.getvalue())
+
+    def test_desktop_app_launches_official_msix_when_exe_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            windows = Path(tmp)
+            explorer = windows / "explorer.exe"
+            explorer.write_bytes(b"test")
+            with (
+                patch.dict(os.environ, {"WINDIR": str(windows)}),
+                patch.object(apiagent, "find_claude_desktop_executable", return_value=None),
+                patch.object(apiagent.subprocess, "Popen") as popen,
+            ):
+                launched = apiagent.launch_claude_desktop_app()
+
+        self.assertTrue(launched)
+        popen.assert_called_once_with(
+            [
+                str(explorer),
+                "shell:AppsFolder\\Claude_pzs8sxrjxfjjc!Claude",
+            ]
+        )
 
     def test_bridge_node_rejects_vscode_until_gateway_lifecycle_is_persistent(self) -> None:
         config = {

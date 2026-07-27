@@ -15,9 +15,11 @@ import json
 import hashlib
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
+import threading
 from datetime import datetime, timezone
 from getpass import getpass
 from pathlib import Path
@@ -48,6 +50,9 @@ CLAUDE_CONFIG_PATH = HOME / ".apiclaude_config.json"
 CLAUDE_NODES_ROOT = HOME / ".apiclaude"
 CLAUDE_ARCHIVE_ROOT = CLAUDE_NODES_ROOT / "archived-nodes"
 CLAUDE_VSCODE_DATA_ROOT = HOME / ".apiclaude-vscode"
+CLAUDE_DESKTOP_BRIDGE_PORT = 18765
+CLAUDE_DESKTOP_MSIX_APP_ID = "Claude_pzs8sxrjxfjjc!Claude"
+CLAUDE_DESKTOP_GATEWAY_MODEL = "claude-fable-5"
 SECRET_STORE = SecureStore(HOME / ".apiagent-secrets")
 DEFAULT_CODEX_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_CODEX_MODEL = "gpt-5.6-sol"
@@ -1550,6 +1555,20 @@ def claude_credential_id(name: str) -> str:
     return f"claude:{name}"
 
 
+def claude_desktop_bridge_credential_id(name: str) -> str:
+    return f"claude-desktop-bridge:{name}"
+
+
+def get_or_create_claude_desktop_bridge_token(name: str) -> str:
+    credential_id = claude_desktop_bridge_credential_id(name)
+    try:
+        return clean_hidden_prefix(SECRET_STORE.get(credential_id))
+    except KeyError:
+        token = secrets.token_urlsafe(32)
+        SECRET_STORE.set(credential_id, token)
+        return token
+
+
 def is_claude_codex_bridge(node: dict[str, Any]) -> bool:
     return node.get("type") == "codex_bridge"
 
@@ -2067,6 +2086,154 @@ def run_claude_codex_bridge_node(
         return 1
 
 
+def find_claude_desktop_executable() -> Path | None:
+    if os.name != "nt":
+        return None
+    candidates = (
+        Path(os.environ.get("LOCALAPPDATA", ""))
+        / "AnthropicClaude"
+        / "Claude.exe",
+        Path(os.environ.get("LOCALAPPDATA", ""))
+        / "Programs"
+        / "Claude"
+        / "Claude.exe",
+        Path(os.environ.get("ProgramFiles", "")) / "Claude" / "Claude.exe",
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate.resolve()
+    return None
+
+
+def launch_claude_desktop_app() -> bool:
+    desktop_exe = find_claude_desktop_executable()
+    if desktop_exe is not None:
+        subprocess.Popen([str(desktop_exe)])
+        return True
+    if os.name != "nt":
+        return False
+    explorer = Path(os.environ.get("WINDIR", "C:/Windows")) / "explorer.exe"
+    if not explorer.is_file():
+        return False
+    subprocess.Popen(
+        [
+            str(explorer),
+            f"shell:AppsFolder\\{CLAUDE_DESKTOP_MSIX_APP_ID}",
+        ]
+    )
+    return True
+
+
+def wait_for_claude_desktop_bridge() -> None:
+    print("Claude Desktop bridge is running. Press Ctrl+C to stop it.")
+    stop = threading.Event()
+    try:
+        while not stop.wait(3600):
+            pass
+    except KeyboardInterrupt:
+        print("Stopping Claude Desktop bridge...")
+
+
+def launch_claude_desktop_bridge(
+    config: dict[str, Any],
+    name: str,
+    *,
+    port: int = CLAUDE_DESKTOP_BRIDGE_PORT,
+) -> int:
+    if os.name != "nt":
+        print("Error: Claude Desktop bridge currently requires Windows.", file=sys.stderr)
+        return 1
+    if not 1 <= port <= 65535:
+        print("Error: --desktop-port must be between 1 and 65535.", file=sys.stderr)
+        return 1
+    node = (config.get("nodes") or {}).get(name)
+    if not node:
+        print(f"Error: Claude node '{name}' was not found.", file=sys.stderr)
+        return 1
+    if not is_claude_codex_bridge(node) or node.get("gateway") != "cpa":
+        print(
+            "Error: --desktop currently requires a CPA-backed Codex bridge node.",
+            file=sys.stderr,
+        )
+        return 1
+
+    profile_name = clean_hidden_prefix(str(node.get("codex_profile") or ""))
+    profile = find_profile(load_codex_profiles(), profile_name)
+    if not profile or not is_safe_api_profile_home(profile):
+        print(
+            f"Error: bridge node '{name}' references a missing or unsafe Codex profile.",
+            file=sys.stderr,
+        )
+        return 1
+    try:
+        upstream_api_key = clean_hidden_prefix(get_codex_secret(profile))
+        local_token = get_or_create_claude_desktop_bridge_token(name)
+    except (KeyError, SecureStoreError) as exc:
+        print(f"Error: failed to load bridge credentials: {exc}", file=sys.stderr)
+        return 1
+
+    model = clean_hidden_prefix(str(node.get("model") or ""))
+    cpa_executable = clean_hidden_prefix(str(node.get("cpa_executable") or ""))
+    if not model or not cpa_executable:
+        print(f"Error: bridge node '{name}' is incomplete.", file=sys.stderr)
+        return 1
+    upstream_base_url = clean_hidden_prefix(
+        str(profile.get("baseUrl") or DEFAULT_CODEX_BASE_URL)
+    ).rstrip("/")
+
+    try:
+        with cpa_bridge(
+            upstream_base_url=upstream_base_url,
+            upstream_api_key=upstream_api_key,
+            model=model,
+            cpa_executable=cpa_executable,
+            proxy_url=clean_hidden_prefix(str(node.get("proxy_url") or "")),
+            listen_port=port,
+            local_token=local_token,
+            route_model=CLAUDE_DESKTOP_GATEWAY_MODEL,
+        ) as endpoint:
+            config["current"] = name
+            node["lastUsedAt"] = now_iso()
+            save_claude_config(config)
+            print(
+                f"Using Claude Desktop 3P bridge node '{name}' "
+                f"(Codex profile={profile.get('name')}, model={model})"
+            )
+            print(f"Gateway base URL: {endpoint.base_url}")
+            print(
+                f"Gateway model route: {CLAUDE_DESKTOP_GATEWAY_MODEL} "
+                f"(mapped to {model})"
+            )
+            print(
+                f"Gateway token: run `apiclaude desktop-token {name}` "
+                "in another terminal (stored with DPAPI)."
+            )
+            if not launch_claude_desktop_app():
+                print(
+                    "Claude Desktop was not found; keep this terminal open and "
+                    "start the app after installing the current MSIX package."
+                )
+            wait_for_claude_desktop_bridge()
+            return 0
+    except (BridgeStartupError, OSError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+
+def show_claude_desktop_bridge_token(config: dict[str, Any], name: str | None) -> int:
+    selected = name or config.get("current")
+    node = (config.get("nodes") or {}).get(selected) if selected else None
+    if not selected or not node or not is_claude_codex_bridge(node):
+        print("Error: select a Codex bridge node.", file=sys.stderr)
+        return 1
+    try:
+        print(get_or_create_claude_desktop_bridge_token(str(selected)))
+    except SecureStoreError as exc:
+        print(f"Error: failed to load desktop bridge token: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def run_claude_node(config: dict[str, Any], name: str, claude_args: list[str]) -> int:
     node = config.get("nodes", {}).get(name)
     if not node:
@@ -2213,6 +2380,9 @@ def claude_help() -> None:
   apiclaude --vscode               Choose a node and open VS Code here
   apiclaude --vscode --api-profile <name>
                                    Open VS Code with a specific node
+  apiclaude --desktop --api-profile <bridge-node>
+             [--desktop-port PORT] Start a persistent Claude Desktop 3P bridge
+  apiclaude desktop-token [NODE]   Print the DPAPI-backed local gateway token
   apiclaude --up                   Update Claude Code
   apiclaude --api-help             Show this help
   apiclaude mode NAME [MODE]       Show or switch a node between isolated/shared
@@ -2352,13 +2522,22 @@ def claude_main(args: list[str]) -> int:
         return 0
     if args and args[0] == "bridge":
         return claude_bridge_main(args[1:])
+    if args and args[0] == "desktop-token":
+        if len(args) > 2:
+            print("Error: usage: apiclaude desktop-token [NODE].", file=sys.stderr)
+            return 1
+        return show_claude_desktop_bridge_token(
+            load_claude_config(),
+            args[1] if len(args) == 2 else None,
+        )
     if args and args[0] in ("add", "list", "current", "mode", "remove", "run", "vscode"):
         return claude_legacy_main(args)
 
     # Codex-style flag parsing, mirroring codex_main.
     pass_through: list[str] = []
     requested: str | None = None
-    do_add = do_list = do_remove = do_vscode = do_json = False
+    do_add = do_list = do_remove = do_vscode = do_desktop = do_json = False
+    desktop_port = CLAUDE_DESKTOP_BRIDGE_PORT
     i = 0
     while i < len(args):
         arg = args[i]
@@ -2370,6 +2549,18 @@ def claude_main(args: list[str]) -> int:
             do_remove = True
         elif arg == "--vscode":
             do_vscode = True
+        elif arg == "--desktop":
+            do_desktop = True
+        elif arg == "--desktop-port":
+            if i + 1 >= len(args):
+                print("Error: --desktop-port requires a value.", file=sys.stderr)
+                return 1
+            try:
+                desktop_port = int(args[i + 1])
+            except ValueError:
+                print("Error: --desktop-port must be an integer.", file=sys.stderr)
+                return 1
+            i += 1
         elif arg == "--json":
             do_json = True
         elif arg == "--api-profile":
@@ -2387,6 +2578,20 @@ def claude_main(args: list[str]) -> int:
         return 1
 
     config = load_claude_config()
+    if do_desktop:
+        if do_vscode or do_add or do_list or do_remove or do_json or pass_through:
+            print(
+                "Error: --desktop cannot be combined with other actions or "
+                "Claude Code arguments.",
+                file=sys.stderr,
+            )
+            return 1
+        selected = requested or select_claude_node(config)
+        return (
+            launch_claude_desktop_bridge(config, selected, port=desktop_port)
+            if selected
+            else 1
+        )
     if do_vscode:
         if pass_through:
             print(

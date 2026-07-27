@@ -451,13 +451,17 @@ def _render_cpa_config(
     auth_dir: Path,
     shim_base_url: str,
     model: str,
+    local_token: str,
+    route_model: str | None = None,
 ) -> str:
+    advertised_model = route_model or model
     return "\n".join(
         (
             f"host: {_yaml_string(host)}",
             f"port: {port}",
             f"auth-dir: {_yaml_string(auth_dir)}",
-            "api-keys: []",
+            "api-keys:",
+            f"  - {_yaml_string(local_token)}",
             "debug: false",
             "logging-to-file: false",
             "request-log: false",
@@ -468,7 +472,7 @@ def _render_cpa_config(
             f"    base-url: {_yaml_string(shim_base_url)}",
             "    models:",
             f"      - name: {_yaml_string(model)}",
-            f"        alias: {_yaml_string(model)}",
+            f"        alias: {_yaml_string(advertised_model)}",
             "        force-mapping: true",
             "",
         )
@@ -495,6 +499,7 @@ def _wait_for_cpa(
     base_url: str,
     logs: deque[str],
     upstream_api_key: str,
+    local_token: str,
     timeout: float = 15,
 ) -> None:
     deadline = time.monotonic() + timeout
@@ -506,7 +511,11 @@ def _wait_for_cpa(
                 + (f"\n{detail}" if detail else "")
             )
         try:
-            request = urllib_request.Request(f"{base_url}/v1/models", method="GET")
+            request = urllib_request.Request(
+                f"{base_url}/v1/models",
+                headers={"Authorization": f"Bearer {local_token}"},
+                method="GET",
+            )
             with urllib_request.urlopen(request, timeout=1) as response:
                 if response.status == 200:
                     return
@@ -527,10 +536,18 @@ def cpa_bridge(
     model: str,
     cpa_executable: str | Path,
     proxy_url: str | None = None,
+    listen_port: int | None = None,
+    local_token: str | None = None,
+    route_model: str | None = None,
 ) -> Iterator[BridgeEndpoint]:
     executable = Path(cpa_executable).expanduser().resolve()
     if not executable.is_file():
         raise BridgeStartupError(f"CPA executable was not found: {executable}")
+    if listen_port is not None and not 1 <= listen_port <= 65535:
+        raise BridgeStartupError("CPA listen port must be between 1 and 65535")
+    bridge_token = local_token or secrets.token_urlsafe(32)
+    if not bridge_token:
+        raise BridgeStartupError("CPA local token cannot be empty")
 
     try:
         shim = _AuthShimServer(
@@ -555,7 +572,7 @@ def cpa_bridge(
             temp_dir = Path(temp)
             auth_dir = temp_dir / "auth"
             auth_dir.mkdir()
-            cpa_port = _reserve_loopback_port()
+            cpa_port = listen_port or _reserve_loopback_port()
             cpa_base_url = f"http://127.0.0.1:{cpa_port}"
             shim_base_url = f"http://127.0.0.1:{shim.server_port}"
             config_path = temp_dir / "config.yaml"
@@ -566,6 +583,8 @@ def cpa_bridge(
                     auth_dir=auth_dir,
                     shim_base_url=shim_base_url,
                     model=model,
+                    local_token=bridge_token,
+                    route_model=route_model,
                 ),
                 encoding="utf-8",
             )
@@ -609,10 +628,11 @@ def cpa_bridge(
                 base_url=cpa_base_url,
                 logs=logs,
                 upstream_api_key=upstream_api_key,
+                local_token=bridge_token,
             )
             yield BridgeEndpoint(
                 base_url=cpa_base_url,
-                token=secrets.token_urlsafe(32),
+                token=bridge_token,
             )
     finally:
         if process is not None and process.poll() is None:
