@@ -19,11 +19,12 @@ import secrets
 import shutil
 import subprocess
 import sys
-import threading
+import time
 from datetime import datetime, timezone
 from getpass import getpass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from codex_history_images import (
     RepairReport,
@@ -36,6 +37,30 @@ from claude_codex_bridge import (
     BridgeStartupError,
     cpa_bridge,
     litellm_bridge,
+)
+from claude_desktop_windows import (
+    CLAUDE_DESKTOP_ROUTE_MODEL,
+    ClaudeDesktopAlreadyRunning,
+    ClaudeDesktopError,
+    clear_desktop_stop_request,
+    clear_runtime_state,
+    clear_startup_error,
+    close_claude_desktop_process,
+    desktop_instance_lock,
+    ensure_private_desktop_directory,
+    find_claude_desktop_executable,
+    launch_claude_desktop_process,
+    monitor_claude_desktop_process,
+    prepare_claude_desktop_profile,
+    process_is_running,
+    read_runtime_state,
+    request_desktop_stop,
+    runtime_is_active,
+    wait_for_worker_start,
+    wait_for_claude_desktop_start,
+    worker_log_path,
+    write_runtime_state,
+    write_startup_error,
 )
 from secure_store import SecureStore, SecureStoreError
 
@@ -50,9 +75,8 @@ CLAUDE_CONFIG_PATH = HOME / ".apiclaude_config.json"
 CLAUDE_NODES_ROOT = HOME / ".apiclaude"
 CLAUDE_ARCHIVE_ROOT = CLAUDE_NODES_ROOT / "archived-nodes"
 CLAUDE_VSCODE_DATA_ROOT = HOME / ".apiclaude-vscode"
-CLAUDE_DESKTOP_BRIDGE_PORT = 18765
-CLAUDE_DESKTOP_MSIX_APP_ID = "Claude_pzs8sxrjxfjjc!Claude"
-CLAUDE_DESKTOP_GATEWAY_MODEL = "claude-fable-5"
+CLAUDE_DESKTOP_DATA_ROOT = HOME / ".apiclaude-desktop" / "nodes"
+CLAUDE_DESKTOP_GATEWAY_MODEL = CLAUDE_DESKTOP_ROUTE_MODEL
 SECRET_STORE = SecureStore(HOME / ".apiagent-secrets")
 DEFAULT_CODEX_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_CODEX_MODEL = "gpt-5.6-sol"
@@ -2086,77 +2110,32 @@ def run_claude_codex_bridge_node(
         return 1
 
 
-def find_claude_desktop_executable() -> Path | None:
-    if os.name != "nt":
-        return None
-    candidates = (
-        Path(os.environ.get("LOCALAPPDATA", ""))
-        / "AnthropicClaude"
-        / "Claude.exe",
-        Path(os.environ.get("LOCALAPPDATA", ""))
-        / "Programs"
-        / "Claude"
-        / "Claude.exe",
-        Path(os.environ.get("ProgramFiles", "")) / "Claude" / "Claude.exe",
-    )
-    for candidate in candidates:
-        if candidate.is_file():
-            return candidate.resolve()
-    return None
-
-
-def launch_claude_desktop_app() -> bool:
-    desktop_exe = find_claude_desktop_executable()
-    if desktop_exe is not None:
-        subprocess.Popen([str(desktop_exe)])
-        return True
-    if os.name != "nt":
-        return False
-    explorer = Path(os.environ.get("WINDIR", "C:/Windows")) / "explorer.exe"
-    if not explorer.is_file():
-        return False
-    subprocess.Popen(
-        [
-            str(explorer),
-            f"shell:AppsFolder\\{CLAUDE_DESKTOP_MSIX_APP_ID}",
-        ]
-    )
-    return True
-
-
-def wait_for_claude_desktop_bridge() -> None:
-    print("Claude Desktop bridge is running. Press Ctrl+C to stop it.")
-    stop = threading.Event()
+def claude_desktop_profile_home(name: str, node: dict[str, Any]) -> Path | None:
+    candidate = CLAUDE_DESKTOP_DATA_ROOT / claude_node_slug(name, node)
     try:
-        while not stop.wait(3600):
-            pass
-    except KeyboardInterrupt:
-        print("Stopping Claude Desktop bridge...")
+        resolved = candidate.resolve()
+        root = CLAUDE_DESKTOP_DATA_ROOT.resolve()
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if resolved != candidate.absolute() or not resolved.is_relative_to(root):
+        return None
+    return candidate
 
 
-def launch_claude_desktop_bridge(
+def resolve_claude_desktop_bridge(
     config: dict[str, Any],
     name: str,
-    *,
-    port: int = CLAUDE_DESKTOP_BRIDGE_PORT,
-) -> int:
-    if os.name != "nt":
-        print("Error: Claude Desktop bridge currently requires Windows.", file=sys.stderr)
-        return 1
-    if not 1 <= port <= 65535:
-        print("Error: --desktop-port must be between 1 and 65535.", file=sys.stderr)
-        return 1
+) -> tuple[dict[str, Any], dict[str, Any], str, str, str] | None:
     node = (config.get("nodes") or {}).get(name)
     if not node:
         print(f"Error: Claude node '{name}' was not found.", file=sys.stderr)
-        return 1
+        return None
     if not is_claude_codex_bridge(node) or node.get("gateway") != "cpa":
         print(
             "Error: --desktop currently requires a CPA-backed Codex bridge node.",
             file=sys.stderr,
         )
-        return 1
-
+        return None
     profile_name = clean_hidden_prefix(str(node.get("codex_profile") or ""))
     profile = find_profile(load_codex_profiles(), profile_name)
     if not profile or not is_safe_api_profile_home(profile):
@@ -2164,60 +2143,328 @@ def launch_claude_desktop_bridge(
             f"Error: bridge node '{name}' references a missing or unsafe Codex profile.",
             file=sys.stderr,
         )
-        return 1
-    try:
-        upstream_api_key = clean_hidden_prefix(get_codex_secret(profile))
-        local_token = get_or_create_claude_desktop_bridge_token(name)
-    except (KeyError, SecureStoreError) as exc:
-        print(f"Error: failed to load bridge credentials: {exc}", file=sys.stderr)
-        return 1
-
+        return None
     model = clean_hidden_prefix(str(node.get("model") or ""))
     cpa_executable = clean_hidden_prefix(str(node.get("cpa_executable") or ""))
     if not model or not cpa_executable:
         print(f"Error: bridge node '{name}' is incomplete.", file=sys.stderr)
-        return 1
+        return None
     upstream_base_url = clean_hidden_prefix(
         str(profile.get("baseUrl") or DEFAULT_CODEX_BASE_URL)
     ).rstrip("/")
+    return node, profile, model, cpa_executable, upstream_base_url
 
+
+def _redact_desktop_worker_error(message: str, *secrets_to_hide: str) -> str:
+    safe = str(message)
+    for value in secrets_to_hide:
+        if value:
+            safe = safe.replace(value, "<redacted>")
+    return safe[:4000]
+
+
+def run_claude_desktop_worker(
+    config: dict[str, Any],
+    name: str,
+    *,
+    port: int | None = None,
+) -> int:
+    if os.name != "nt":
+        print("Error: Claude Desktop currently requires Windows.", file=sys.stderr)
+        return 1
+    profile_dir: Path | None = None
+    upstream_api_key = ""
+    local_token = ""
+    desktop_process: subprocess.Popen[bytes] | None = None
     try:
-        with cpa_bridge(
-            upstream_base_url=upstream_base_url,
-            upstream_api_key=upstream_api_key,
-            model=model,
-            cpa_executable=cpa_executable,
-            proxy_url=clean_hidden_prefix(str(node.get("proxy_url") or "")),
-            listen_port=port,
-            local_token=local_token,
-            route_model=CLAUDE_DESKTOP_GATEWAY_MODEL,
-        ) as endpoint:
-            config["current"] = name
-            node["lastUsedAt"] = now_iso()
-            save_claude_config(config)
-            print(
-                f"Using Claude Desktop 3P bridge node '{name}' "
-                f"(Codex profile={profile.get('name')}, model={model})"
+        resolved = resolve_claude_desktop_bridge(config, name)
+        if resolved is None:
+            return 1
+        node, profile, model, cpa_executable, upstream_base_url = resolved
+        profile_dir = claude_desktop_profile_home(name, node)
+        if profile_dir is None:
+            raise ClaudeDesktopError("refusing an unsafe Claude Desktop profile path")
+        ensure_private_desktop_directory(profile_dir)
+        executable = find_claude_desktop_executable()
+        if executable is None:
+            raise ClaudeDesktopError(
+                "a healthy Claude Desktop MSIX package was not found; reinstall "
+                "the official Windows app"
             )
-            print(f"Gateway base URL: {endpoint.base_url}")
-            print(
-                f"Gateway model route: {CLAUDE_DESKTOP_GATEWAY_MODEL} "
-                f"(mapped to {model})"
-            )
-            print(
-                f"Gateway token: run `apiclaude desktop-token {name}` "
-                "in another terminal (stored with DPAPI)."
-            )
-            if not launch_claude_desktop_app():
-                print(
-                    "Claude Desktop was not found; keep this terminal open and "
-                    "start the app after installing the current MSIX package."
+
+        with desktop_instance_lock(profile_dir):
+            clear_runtime_state(profile_dir)
+            clear_startup_error(profile_dir)
+            clear_desktop_stop_request(profile_dir)
+            try:
+                upstream_api_key = clean_hidden_prefix(get_codex_secret(profile))
+                local_token = get_or_create_claude_desktop_bridge_token(name)
+            except (KeyError, SecureStoreError) as exc:
+                raise ClaudeDesktopError(f"failed to load bridge credentials: {exc}") from exc
+
+            with cpa_bridge(
+                upstream_base_url=upstream_base_url,
+                upstream_api_key=upstream_api_key,
+                model=model,
+                cpa_executable=cpa_executable,
+                proxy_url=clean_hidden_prefix(str(node.get("proxy_url") or "")),
+                listen_port=port,
+                local_token=local_token,
+                route_model=CLAUDE_DESKTOP_GATEWAY_MODEL,
+            ) as endpoint:
+                prepare_claude_desktop_profile(
+                    profile_dir,
+                    node_name=name,
+                    gateway_base_url=endpoint.base_url,
+                    local_token=local_token,
+                    model=model,
+                    route_model=CLAUDE_DESKTOP_GATEWAY_MODEL,
                 )
-            wait_for_claude_desktop_bridge()
-            return 0
-    except (BridgeStartupError, OSError) as exc:
+                desktop_process = launch_claude_desktop_process(
+                    executable,
+                    profile_dir,
+                )
+                wait_for_claude_desktop_start(desktop_process)
+                endpoint_port = urlparse(endpoint.base_url).port
+                if endpoint_port is None:
+                    raise ClaudeDesktopError("CPA returned a gateway URL without a port")
+                write_runtime_state(
+                    profile_dir,
+                    {
+                        "schemaVersion": 1,
+                        "node": name,
+                        "model": model,
+                        "workerPid": os.getpid(),
+                        "desktopPid": desktop_process.pid,
+                        "port": endpoint_port,
+                        "baseUrl": endpoint.base_url,
+                        "userDataDir": str(profile_dir.resolve()),
+                        "startedAt": now_iso(),
+                    },
+                )
+                print(
+                    f"Claude Desktop worker ready for '{name}' "
+                    f"(model={model}, port={endpoint_port}, pid={desktop_process.pid}).",
+                    flush=True,
+                )
+                try:
+                    monitor_claude_desktop_process(desktop_process, profile_dir)
+                except KeyboardInterrupt:
+                    close_claude_desktop_process(desktop_process)
+                return 0
+    except (BridgeStartupError, ClaudeDesktopAlreadyRunning, ClaudeDesktopError, OSError) as exc:
+        message = _redact_desktop_worker_error(
+            str(exc),
+            upstream_api_key,
+            local_token,
+        )
+        if profile_dir is not None:
+            try:
+                write_startup_error(profile_dir, message)
+            except OSError:
+                pass
+        print(f"Error: {message}", file=sys.stderr, flush=True)
+        return 1
+    finally:
+        if desktop_process is not None and desktop_process.poll() is None:
+            close_claude_desktop_process(desktop_process)
+        if profile_dir is not None:
+            clear_runtime_state(profile_dir, worker_pid=os.getpid())
+            clear_desktop_stop_request(profile_dir)
+
+
+def _spawn_claude_desktop_worker(
+    profile_dir: Path,
+    name: str,
+    *,
+    port: int | None,
+) -> int:
+    clear_runtime_state(profile_dir)
+    clear_startup_error(profile_dir)
+    clear_desktop_stop_request(profile_dir)
+    log_path = worker_log_path(profile_dir)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "claude",
+        "--desktop-worker",
+        "--api-profile",
+        name,
+    ]
+    if port is not None:
+        command.extend(["--desktop-port", str(port)])
+    environment = os.environ.copy()
+    for key in (*CLAUDE_PROFILE_ENV, "OPENAI_API_KEY", "OPENAI_BASE_URL", "APICODEX_API_KEY"):
+        environment.pop(key, None)
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    creationflags |= getattr(subprocess, "DETACHED_PROCESS", 0)
+    creationflags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    try:
+        with log_path.open("w", encoding="utf-8") as log:
+            worker = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                env=environment,
+                close_fds=True,
+                creationflags=creationflags,
+            )
+    except OSError as exc:
+        print(f"Error: failed to start the Desktop worker: {exc}", file=sys.stderr)
+        return 1
+    state, error = wait_for_worker_start(profile_dir, worker)
+    if state is None:
+        print(f"Error: {error or 'Desktop worker failed to start'}", file=sys.stderr)
+        print(f"Worker log: {log_path}", file=sys.stderr)
+        return 1
+    print(
+        f"Opened isolated Claude Desktop node '{name}' "
+        f"(model={state.get('model')}, port={state.get('port')}, "
+        f"pid={state.get('desktopPid')})."
+    )
+    print(f"User data: {state.get('userDataDir')}")
+    return 0
+
+
+def launch_claude_desktop_bridge(
+    config: dict[str, Any],
+    name: str,
+    *,
+    port: int | None = None,
+    foreground: bool = False,
+) -> int:
+    if os.name != "nt":
+        print("Error: Claude Desktop currently requires Windows.", file=sys.stderr)
+        return 1
+    if port is not None and not 1 <= port <= 65535:
+        print("Error: --desktop-port must be between 1 and 65535.", file=sys.stderr)
+        return 1
+    resolved = resolve_claude_desktop_bridge(config, name)
+    if resolved is None:
+        return 1
+    node, _profile, _model, _cpa_executable, _upstream_base_url = resolved
+    profile_dir = claude_desktop_profile_home(name, node)
+    if profile_dir is None:
+        print("Error: refusing an unsafe Claude Desktop profile path.", file=sys.stderr)
+        return 1
+    state = read_runtime_state(profile_dir)
+    if runtime_is_active(state):
+        print(
+            f"Claude Desktop node '{name}' is already running "
+            f"(pid={state.get('desktopPid')}, port={state.get('port')})."
+        )
+        return 0
+    try:
+        ensure_private_desktop_directory(profile_dir)
+    except (ClaudeDesktopError, OSError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
+    if find_claude_desktop_executable() is None:
+        print(
+            "Error: a healthy Claude Desktop MSIX package was not found. "
+            "Install or repair the official Windows app first.",
+            file=sys.stderr,
+        )
+        return 1
+    config["current"] = name
+    node["lastUsedAt"] = now_iso()
+    save_claude_config(config)
+    if foreground:
+        print(
+            f"Starting Claude Desktop node '{name}' in foreground debug mode. "
+            "Closing its window will stop the bridge."
+        )
+        return run_claude_desktop_worker(config, name, port=port)
+    return _spawn_claude_desktop_worker(profile_dir, name, port=port)
+
+
+def show_claude_desktop_status(
+    config: dict[str, Any],
+    name: str | None = None,
+) -> int:
+    nodes = config.get("nodes") or {}
+    selected = [name] if name else [
+        node_name
+        for node_name, node in nodes.items()
+        if is_claude_codex_bridge(node) and node.get("gateway") == "cpa"
+    ]
+    if name and name not in nodes:
+        print(f"Error: Claude node '{name}' was not found.", file=sys.stderr)
+        return 1
+    if name:
+        requested_node = nodes.get(name) or {}
+        if (
+            not is_claude_codex_bridge(requested_node)
+            or requested_node.get("gateway") != "cpa"
+        ):
+            print(
+                f"Error: Claude node '{name}' is not a CPA Desktop bridge node.",
+                file=sys.stderr,
+            )
+            return 1
+    print("Claude Desktop instances")
+    print("NAME                 STATE     MODEL                 PID      PORT")
+    for node_name in selected:
+        node = nodes.get(node_name) or {}
+        profile_dir = claude_desktop_profile_home(node_name, node)
+        state = read_runtime_state(profile_dir) if profile_dir else None
+        if runtime_is_active(state):
+            status = "running"
+        elif state:
+            status = "stale"
+        else:
+            status = "stopped"
+        model = str((state or {}).get("model") or node.get("model") or "-")
+        pid = str((state or {}).get("desktopPid") or "-")
+        runtime_port = str((state or {}).get("port") or "-")
+        print(
+            f"{node_name[:20]:20} {status:9} {model[:21]:21} "
+            f"{pid:8} {runtime_port}"
+        )
+    return 0
+
+
+def stop_claude_desktop(
+    config: dict[str, Any],
+    name: str | None,
+    *,
+    timeout: float = 15.0,
+) -> int:
+    selected = name or config.get("current")
+    node = (config.get("nodes") or {}).get(selected) if selected else None
+    if not selected or not node:
+        print("Error: select a Claude Desktop bridge node.", file=sys.stderr)
+        return 1
+    if not is_claude_codex_bridge(node) or node.get("gateway") != "cpa":
+        print(
+            f"Error: Claude node '{selected}' is not a CPA Desktop bridge node.",
+            file=sys.stderr,
+        )
+        return 1
+    profile_dir = claude_desktop_profile_home(str(selected), node)
+    if profile_dir is None:
+        print("Error: refusing an unsafe Claude Desktop profile path.", file=sys.stderr)
+        return 1
+    state = read_runtime_state(profile_dir)
+    if not runtime_is_active(state):
+        print(f"Claude Desktop node '{selected}' is not running.")
+        return 0
+    worker_pid = int(state.get("workerPid") or 0)
+    request_desktop_stop(profile_dir)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not process_is_running(worker_pid) or not read_runtime_state(profile_dir):
+            print(f"Stopped Claude Desktop node '{selected}'.")
+            return 0
+        time.sleep(0.1)
+    print(
+        f"Error: Claude Desktop node '{selected}' did not stop within "
+        f"{timeout:.0f} seconds.",
+        file=sys.stderr,
+    )
+    return 1
 
 
 def show_claude_desktop_bridge_token(config: dict[str, Any], name: str | None) -> int:
@@ -2380,8 +2627,14 @@ def claude_help() -> None:
   apiclaude --vscode               Choose a node and open VS Code here
   apiclaude --vscode --api-profile <name>
                                    Open VS Code with a specific node
-  apiclaude --desktop --api-profile <bridge-node>
-             [--desktop-port PORT] Start a persistent Claude Desktop 3P bridge
+  apiclaude --desktop [--api-profile <bridge-node>]
+             [--desktop-port PORT] Open an isolated Claude Desktop instance
+  apiclaude --desktop-foreground [--api-profile <bridge-node>]
+             [--desktop-port PORT] Run the Desktop bridge visibly for debugging
+  apiclaude --desktop-status [--api-profile <bridge-node>]
+                                   Show isolated Desktop instance status
+  apiclaude --desktop-stop [--api-profile <bridge-node>]
+                                   Stop one isolated Desktop instance
   apiclaude desktop-token [NODE]   Print the DPAPI-backed local gateway token
   apiclaude --up                   Update Claude Code
   apiclaude --api-help             Show this help
@@ -2443,6 +2696,35 @@ def claude_bridge_main(args: list[str]) -> int:
         cpa_executable=cpa_executable,
         proxy_url=proxy_url,
     )
+
+
+def claude_desktop_worker_main(args: list[str]) -> int:
+    requested: str | None = None
+    port: int | None = None
+    i = 0
+    while i < len(args):
+        option = args[i]
+        if option == "--api-profile" and i + 1 < len(args):
+            requested = args[i + 1]
+            i += 1
+        elif option == "--desktop-port" and i + 1 < len(args):
+            try:
+                port = int(args[i + 1])
+            except ValueError:
+                print("Error: --desktop-port must be an integer.", file=sys.stderr)
+                return 1
+            i += 1
+        else:
+            print(f"Error: unexpected Desktop worker argument: {option}", file=sys.stderr)
+            return 1
+        i += 1
+    if not requested:
+        print("Error: Desktop worker requires --api-profile.", file=sys.stderr)
+        return 1
+    if port is not None and not 1 <= port <= 65535:
+        print("Error: --desktop-port must be between 1 and 65535.", file=sys.stderr)
+        return 1
+    return run_claude_desktop_worker(load_claude_config(), requested, port=port)
 
 
 def claude_legacy_main(args: list[str]) -> int:
@@ -2512,6 +2794,8 @@ def claude_legacy_main(args: list[str]) -> int:
 
 
 def claude_main(args: list[str]) -> int:
+    if args and args[0] == "--desktop-worker":
+        return claude_desktop_worker_main(args[1:])
     if args and args[0] in ("--up", "update"):
         if len(args) != 1:
             print("Error: the update command does not accept arguments.", file=sys.stderr)
@@ -2537,7 +2821,8 @@ def claude_main(args: list[str]) -> int:
     pass_through: list[str] = []
     requested: str | None = None
     do_add = do_list = do_remove = do_vscode = do_desktop = do_json = False
-    desktop_port = CLAUDE_DESKTOP_BRIDGE_PORT
+    do_desktop_foreground = do_desktop_status = do_desktop_stop = False
+    desktop_port: int | None = None
     i = 0
     while i < len(args):
         arg = args[i]
@@ -2551,6 +2836,12 @@ def claude_main(args: list[str]) -> int:
             do_vscode = True
         elif arg == "--desktop":
             do_desktop = True
+        elif arg == "--desktop-foreground":
+            do_desktop_foreground = True
+        elif arg == "--desktop-status":
+            do_desktop_status = True
+        elif arg == "--desktop-stop":
+            do_desktop_stop = True
         elif arg == "--desktop-port":
             if i + 1 >= len(args):
                 print("Error: --desktop-port requires a value.", file=sys.stderr)
@@ -2577,21 +2868,59 @@ def claude_main(args: list[str]) -> int:
         print("Error: --json is only supported with --api-list.", file=sys.stderr)
         return 1
 
+    desktop_actions = sum(
+        bool(value)
+        for value in (
+            do_desktop,
+            do_desktop_foreground,
+            do_desktop_status,
+            do_desktop_stop,
+        )
+    )
+    if desktop_actions > 1:
+        print("Error: choose only one Desktop action.", file=sys.stderr)
+        return 1
+    if desktop_port is not None and not (do_desktop or do_desktop_foreground):
+        print(
+            "Error: --desktop-port requires --desktop or --desktop-foreground.",
+            file=sys.stderr,
+        )
+        return 1
+
     config = load_claude_config()
-    if do_desktop:
+    if do_desktop or do_desktop_foreground:
         if do_vscode or do_add or do_list or do_remove or do_json or pass_through:
             print(
-                "Error: --desktop cannot be combined with other actions or "
+                "Error: a Desktop launch cannot be combined with other actions or "
                 "Claude Code arguments.",
                 file=sys.stderr,
             )
             return 1
         selected = requested or select_claude_node(config)
-        return (
-            launch_claude_desktop_bridge(config, selected, port=desktop_port)
-            if selected
-            else 1
+        if not selected:
+            return 1
+        if do_desktop_foreground:
+            return launch_claude_desktop_bridge(
+                config,
+                selected,
+                port=desktop_port,
+                foreground=True,
+            )
+        return launch_claude_desktop_bridge(
+            config,
+            selected,
+            port=desktop_port,
         )
+    if do_desktop_status:
+        if do_vscode or do_add or do_list or do_remove or do_json or pass_through:
+            print("Error: --desktop-status cannot be combined with other actions.", file=sys.stderr)
+            return 1
+        return show_claude_desktop_status(config, requested)
+    if do_desktop_stop:
+        if do_vscode or do_add or do_list or do_remove or do_json or pass_through:
+            print("Error: --desktop-stop cannot be combined with other actions.", file=sys.stderr)
+            return 1
+        return stop_claude_desktop(config, requested)
     if do_vscode:
         if pass_through:
             print(

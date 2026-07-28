@@ -162,6 +162,79 @@ class ApiClaudeCodexStyleCliTests(unittest.TestCase):
         self.assertEqual(code, 0)
         launch.assert_called_once_with(config, "relay", port=18765)
 
+    def test_desktop_foreground_routes_debug_lifecycle(self) -> None:
+        config = _two_node_config()
+        with (
+            patch.object(apiagent, "load_claude_config", return_value=config),
+            patch.object(
+                apiagent,
+                "launch_claude_desktop_bridge",
+                return_value=0,
+            ) as launch,
+        ):
+            code = apiagent.claude_main(
+                ["--desktop-foreground", "--api-profile", "relay"]
+            )
+
+        self.assertEqual(code, 0)
+        launch.assert_called_once_with(
+            config,
+            "relay",
+            port=None,
+            foreground=True,
+        )
+
+    def test_desktop_status_and_stop_route_selected_node(self) -> None:
+        config = _two_node_config()
+        with (
+            patch.object(apiagent, "load_claude_config", return_value=config),
+            patch.object(
+                apiagent,
+                "show_claude_desktop_status",
+                return_value=0,
+            ) as status,
+            patch.object(
+                apiagent,
+                "stop_claude_desktop",
+                return_value=0,
+            ) as stop,
+        ):
+            self.assertEqual(
+                apiagent.claude_main(
+                    ["--desktop-status", "--api-profile", "relay"]
+                ),
+                0,
+            )
+            self.assertEqual(
+                apiagent.claude_main(
+                    ["--desktop-stop", "--api-profile", "relay"]
+                ),
+                0,
+            )
+
+        status.assert_called_once_with(config, "relay")
+        stop.assert_called_once_with(config, "relay")
+
+    def test_desktop_actions_are_mutually_exclusive(self) -> None:
+        with (
+            patch.object(apiagent, "load_claude_config") as load,
+            redirect_stderr(io.StringIO()),
+        ):
+            code = apiagent.claude_main(["--desktop", "--desktop-status"])
+
+        self.assertEqual(code, 1)
+        load.assert_not_called()
+
+    def test_internal_desktop_worker_requires_profile(self) -> None:
+        with (
+            patch.object(apiagent, "load_claude_config") as load,
+            redirect_stderr(io.StringIO()),
+        ):
+            code = apiagent.claude_main(["--desktop-worker"])
+
+        self.assertEqual(code, 1)
+        load.assert_not_called()
+
     def test_interactive_remove_accepts_number_choice(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = SecureStore(Path(tmp))

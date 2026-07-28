@@ -5,6 +5,25 @@
 
 ## 协作修改记录
 
+### 2026-07-28：Claude Desktop 按节点隔离多实例与无感生命周期
+
+- 修改简介：`apiclaude --desktop [--api-profile NODE]` 改为隐藏 worker 管理，
+  每节点使用独立 `CLAUDE_USER_DATA_DIR`、动态回环端口、Desktop 配置和运行状态；
+  新增状态、停止、前台诊断命令。worker 等待真实主窗口后才就绪，并在关闭动作将
+  Claude 隐藏到托盘时识别主窗口持续消失，自动退出所属 Desktop 和 CPA 进程。
+- 修改原因：需要达到与 `apicodex --desktop` 一致的选择上游即打开隔离窗口体验，
+  支持多个 GPT Profile 并行使用，同时不保留桥接控制台或要求手工维护网关进程。
+- 安全说明：上游密钥仍只从 DPAPI 进入内存认证转发器；每节点本地令牌彼此独立，
+  Desktop 目录使用仅当前用户、SYSTEM 和管理员可访问的非继承 ACL。worker 命令行、
+  环境和日志不含上游凭据，端口只监听回环地址，运行状态不记录令牌。
+- 验证情况：官方 MSIX `1.24012.9.0` 包状态为 `Ok`；真实并行启动
+  `codex-muyuan / gpt-5.6-sol` 与 `codex-prism / gpt-5.5`，确认端口、PID、令牌、
+  用户数据和会话目录均分离，交叉令牌双向返回 401。使用指定问句时 prism 返回
+  HTTP 200，muyuan 由真实上游报告 default 组暂无可用通道（HTTP 503）；停止前者
+  不影响后者。修复 Claude 关闭到托盘后，模拟右上角关闭在 4.2 秒内清除窗口、
+  worker、CPA、监听端口和运行状态。聚焦测试 39 项、全量测试 138 项通过，2 项
+  按集成环境跳过，`py_compile` 与 `git diff --check` 通过。
+
 ### 2026-07-28：Claude Desktop 3P 接入 Codex Profile 原型
 
 - 修改简介：CPA 桥支持固定回环端口和稳定本地认证令牌；新增

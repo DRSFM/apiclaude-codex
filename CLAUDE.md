@@ -59,8 +59,10 @@ apiclaude 功能对齐 apicodex（详见 AGENTS.md 后续记录）：
    Codex API Profile 以引用方式映射为隔离 Claude CLI 节点；运行期启动本机短时
    CPA Anthropic Messages → OpenAI Responses 桥（旧节点保留 LiteLLM 兼容路径），
    暂不接入 VS Code。
-4. Desktop 3P 原型（进行中，2026-07-28）：官方已开放无需 Anthropic 账号登录的
-   Claude Desktop 第三方推理网关；CPA 桥节点可用固定回环端口和 DPAPI 本地令牌
-   接入 Desktop。该路径不复用 `CLAUDE_CONFIG_DIR`，且 GPT 协议转换仍属实验能力。
+4. Desktop 3P 多实例（已完成，2026-07-28）：官方已开放无需 Anthropic
+   账号登录的 Claude Desktop 第三方推理网关；CPA 桥节点按节点使用
+   `CLAUDE_USER_DATA_DIR`、动态回环端口、独立本地令牌和隐藏 worker，窗口
+   退出时自动回收对应桥。该路径不复用 `CLAUDE_CONFIG_DIR`，且 GPT
+   协议转换仍属实验能力。
 - 不同步：历史图片修复（Codex 特有损坏模式）；share 共享池 Claude 版暂缓，
   等出现真实跨节点续聊需求再立项。

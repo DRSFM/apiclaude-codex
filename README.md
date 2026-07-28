@@ -386,40 +386,57 @@ and newly introduced beta features.
 
 Current Claude Desktop releases can use an officially supported third-party
 inference gateway without an Anthropic account login. A CPA-backed Codex bridge
-node can provide that gateway on a fixed loopback port:
+node can open an isolated Claude Desktop window with that gateway:
 
 ```bash
+apiclaude --desktop
 apiclaude --desktop --api-profile codex-muyuan
 ```
 
-Keep that terminal open while using Desktop. The command binds CPA to
-`127.0.0.1:18765`, launches either the current Windows MSIX app or a recognized
-legacy executable, and stops the bridge on Ctrl+C. Use `--desktop-port PORT` if
-that port is occupied.
-
-In Claude Desktop, enable Developer Mode from Help > Troubleshooting, then open
-Developer > Configure Third-Party Inference and apply these values locally:
-
-- Provider: Gateway
-- Base URL: `http://127.0.0.1:18765`
-- Credential kind: Static
-- Authentication scheme: Bearer
-- Model ID: `claude-fable-5`
-- Display name: the real bridge model, for example `GPT-5.6 Sol`
-- Tier alias: `fable`, with **Default for tier** enabled
-
-Get the local gateway token explicitly in a second terminal:
+The normal command starts a hidden worker, assigns a free loopback port, writes
+the node-local 3P configuration, and returns after the CPA bridge and Claude
+main process are both ready. The bridge exits automatically when that Claude
+window closes. Claude normally hides to the tray on the window close action;
+the node worker detects that its main window stayed hidden, exits the owned
+Desktop process, and then removes the matching CPA bridge. No PowerShell or
+bridge console remains visible. Use a fixed port only for diagnostics:
 
 ```bash
-apiclaude desktop-token codex-muyuan
+apiclaude --desktop --api-profile codex-muyuan --desktop-port 18765
 ```
 
-The token is random per bridge node and persisted with Windows DPAPI. It is
-only used to protect the loopback CPA endpoint; it is not the upstream API key.
-The upstream key remains in the existing Codex Profile credential store and is
-injected by the in-memory authentication shim. Neither key is written to CPA's
-temporary configuration. Use the current Windows MSIX Claude Desktop package;
-older EXE installations may not expose the complete third-party/Cowork flow.
+Each bridge node uses its own
+`~/.apiclaude-desktop/nodes/<node-slug>` as `CLAUDE_USER_DATA_DIR`. Desktop
+configuration, Recents, projects, session databases, logs, Cowork files, local
+gateway token, and window state are therefore independent. Different nodes can
+run concurrently on different ports. Starting the same node again reports the
+existing PID and does not create a second process against the same data dir.
+
+Manage the workers without finding processes manually:
+
+```bash
+apiclaude --desktop-status
+apiclaude --desktop-status --api-profile codex-muyuan
+apiclaude --desktop-stop --api-profile codex-muyuan
+apiclaude --desktop-foreground --api-profile codex-muyuan
+```
+
+Foreground mode keeps lifecycle output in the terminal for troubleshooting.
+Normal worker logs are stored under the node's `.apiclaude-runtime` directory
+and contain no API keys. The current signed Windows MSIX package is required:
+the launcher invokes its main executable directly so
+`CLAUDE_USER_DATA_DIR` is applied before Electron's single-instance lock.
+Shell activation and legacy EXE fallback are deliberately not used because
+they cannot guarantee profile isolation.
+
+The upstream API key remains in the existing Codex Profile DPAPI store and is
+injected only by the in-memory authentication shim. It is never written to a
+command line, Desktop configuration, CPA YAML, or log. The random per-node
+loopback token is not an upstream credential: Desktop's static Gateway mode
+requires it in the node-local config, and CPA needs it in its short-lived YAML.
+The whole node directory is protected by a non-inherited ACL for the current
+user, Windows SYSTEM, and administrators. The DPAPI copy remains available for
+regeneration and manual diagnostics through `apiclaude desktop-token NODE`.
 
 Claude Desktop validates Gateway model routes against its Anthropic model
 catalog. The Desktop bridge therefore advertises the recognized local route
@@ -429,8 +446,8 @@ alias is Desktop-only and does not change the regular Claude Code bridge route.
 
 Desktop third-party inference is an official Claude Desktop feature, but using
 a non-Anthropic model through CPA remains an experimental protocol translation
-and is not supported by Anthropic. The fixed bridge serves one selected model
-and must remain running for the Desktop session.
+and is not supported by Anthropic. Each worker serves one selected model for
+the lifetime of its corresponding Desktop process.
 
 On first launch, a bridge node adds a node-local
 `skillOverrides.claude-api = "user-invocable-only"` default when that skill has
