@@ -6,6 +6,7 @@ FastAPI backend for API node management web interface.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import shutil
 import subprocess
@@ -23,14 +24,27 @@ from pydantic import BaseModel
 # Add parent directory to path to import apiagent
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 import apiagent
+from codex_app_server import AppServerError
+from codex_conversation_pool import (
+    ConversationPool,
+    ConversationPoolError,
+    LocalMappingStore,
+)
+from codex_share_cli import (
+    ShareContext,
+    copy_share_thread,
+    default_local_state_root,
+    list_share_targets,
+    list_share_threads,
+)
 
 app = FastAPI(title="API Node Manager", version="1.0.0")
 
 # CORS middleware for development
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=["http://127.0.0.1:5000", "http://localhost:5000"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -68,6 +82,14 @@ class CodexStartRequest(BaseModel):
     folder: str
 
 
+class ShareCopyRequest(BaseModel):
+    source_target_id: str
+    source_thread_id: str
+    target_target_id: str
+    cwd: str | None = None
+    title: str | None = None
+
+
 executor = ThreadPoolExecutor(max_workers=2)
 
 
@@ -80,6 +102,94 @@ async def root():
 async def list_codex_profiles():
     profiles = apiagent.load_codex_profiles()
     return {"profiles": profiles}
+
+
+def _share_context() -> ShareContext:
+    def load_profiles_read_only() -> list[dict[str, Any]]:
+        profiles, _ = apiagent.load_codex_profiles_for_image_repair()
+        return profiles
+
+    return ShareContext(
+        account_home=(apiagent.HOME / ".codex").resolve(),
+        api_root=apiagent.CODEX_HOME.resolve(),
+        local_state_root=default_local_state_root(),
+        load_api_profiles=load_profiles_read_only,
+    )
+
+
+async def _run_share_operation(function, *args, **kwargs):
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        executor,
+        lambda: function(*args, **kwargs),
+    )
+
+
+@app.get("/api/share/targets")
+async def list_conversation_targets():
+    try:
+        targets = await _run_share_operation(
+            list_share_targets,
+            _share_context(),
+        )
+        return {"targets": targets}
+    except (ConversationPoolError, AppServerError, OSError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/share/threads")
+async def list_conversation_threads(target_id: str):
+    try:
+        threads = await _run_share_operation(
+            list_share_threads,
+            _share_context(),
+            target_id,
+        )
+        return {"targetId": target_id, "threads": threads}
+    except (ConversationPoolError, AppServerError, OSError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/share/history")
+async def list_conversation_history():
+    try:
+        state = LocalMappingStore(default_local_state_root())
+        pool = ConversationPool(state.get_pool_path())
+        history = await _run_share_operation(pool.list_lineages)
+        history.sort(key=lambda item: str(item.get("createdAt") or ""), reverse=True)
+        return {
+            "ready": True,
+            "pool": str(pool.root),
+            "conversations": history,
+        }
+    except (ConversationPoolError, AppServerError, OSError, ValueError) as exc:
+        return {
+            "ready": False,
+            "pool": str(LocalMappingStore(default_local_state_root()).get_pool_path()),
+            "conversations": [],
+            "error": str(exc),
+        }
+
+
+@app.post("/api/share/copy")
+async def copy_conversation(request: ShareCopyRequest):
+    if request.source_target_id == request.target_target_id:
+        raise HTTPException(
+            status_code=400,
+            detail="来源和目标不能相同",
+        )
+    try:
+        return await _run_share_operation(
+            copy_share_thread,
+            _share_context(),
+            source_target_id=request.source_target_id,
+            target_target_id=request.target_target_id,
+            thread_id=request.source_thread_id,
+            cwd=Path(request.cwd).resolve() if request.cwd else None,
+            title=request.title,
+        )
+    except (ConversationPoolError, AppServerError, OSError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/api/codex/profiles")

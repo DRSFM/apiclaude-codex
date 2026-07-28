@@ -9,6 +9,7 @@ import os
 import re
 import sys
 import tempfile
+import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Sequence
@@ -337,6 +338,171 @@ def _new_app_server(
         target.home,
         codex_command=context.codex_command,
     )
+
+
+def _target_by_id(context: ShareContext, target_id: str) -> ShareTarget:
+    requested = str(target_id or "").strip().lower()
+    for target in _targets(context, include_profiles=True):
+        if target.id.lower() == requested:
+            if not target.home.is_dir():
+                raise ConversationPoolError(
+                    f"{target.label} CODEX_HOME does not exist: {target.home}"
+                )
+            return target
+    raise ConversationPoolError(f"Codex target {target_id!r} was not found")
+
+
+def list_share_targets(context: ShareContext) -> list[dict[str, Any]]:
+    """Return non-sensitive account/Profile choices for a migration UI."""
+
+    targets: list[dict[str, Any]] = []
+    for target in _targets(context, include_profiles=True):
+        kind = "account" if target.id == "account" else "api"
+        name = (
+            "Account Codex"
+            if kind == "account"
+            else target.label.removeprefix("API Profile: ")
+        )
+        targets.append(
+            {
+                "id": target.id,
+                "name": name,
+                "label": target.label,
+                "kind": kind,
+                "modelProvider": target.model_provider,
+                "model": target.model,
+                "available": target.home.is_dir(),
+            }
+        )
+    return targets
+
+
+def list_share_threads(
+    context: ShareContext,
+    target_id: str,
+    *,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    """List safe local thread metadata without exposing rollout paths."""
+
+    target = _target_by_id(context, target_id)
+    with _new_app_server(context, target) as client:
+        threads = client.list_threads(limit=max(1, min(limit, 200)))
+    result: list[dict[str, Any]] = []
+    for thread in threads:
+        try:
+            _validate_rollout_path(target, thread.get("path"))
+        except ConversationPoolError:
+            continue
+        status = _thread_status_type(thread) or "idle"
+        result.append(
+            {
+                "id": str(thread.get("id") or ""),
+                "title": _thread_title(thread),
+                "preview": str(thread.get("preview") or ""),
+                "status": status,
+                "available": status not in {"active", "systemError"},
+                "cwd": str(thread.get("cwd") or ""),
+                "createdAt": thread.get("createdAt"),
+                "updatedAt": thread.get("updatedAt"),
+            }
+        )
+    return result
+
+
+def copy_share_thread(
+    context: ShareContext,
+    *,
+    source_target_id: str,
+    target_target_id: str,
+    thread_id: str,
+    lineage_name: str | None = None,
+    cwd: Path | None = None,
+    title: str | None = None,
+    message: str = "Copy conversation between Codex targets",
+) -> dict[str, Any]:
+    """Publish one idle thread and clone it into another Codex target."""
+
+    source = _target_by_id(context, source_target_id)
+    target = _target_by_id(context, target_target_id)
+    if source.id == target.id or source.home == target.home:
+        raise ConversationPoolError("source and target Codex profiles must be different")
+
+    state = LocalMappingStore(context.local_state_root)
+    pool = ConversationPool(
+        state.get_pool_path(),
+        security=context.pool_security,
+    )
+    pool.verify_initialized()
+    shared_name = lineage_name or (
+        f"transfer-{str(thread_id)[:8]}-{uuid.uuid4().hex[:8]}"
+    )
+
+    with _new_app_server(context, source) as client:
+        thread, snapshot, temporary = _sanitize_thread(
+            client,
+            source,
+            thread_id,
+        )
+        try:
+            source_title = _thread_title(thread)
+            commit = pool.publish(
+                shared_name,
+                snapshot,
+                title=source_title,
+                source_target=source.id,
+                message=message,
+            )
+            state.register(
+                pool_id=pool.pool_id(),
+                target_id=source.id,
+                target_home=source.home,
+                thread_id=str(thread["id"]),
+                lineage_id=commit.lineage_id,
+                lineage_name=commit.lineage_name,
+                ref_name="main",
+                base_commit=commit.id,
+                rollout_path=_validate_rollout_path(
+                    source,
+                    thread.get("path"),
+                ),
+            )
+        finally:
+            temporary.cleanup()
+
+    target_cwd = Path(cwd).resolve() if cwd else Path(commit.cwd).resolve()
+    target_title = title or f"[shared] {source_title}"
+    clone = _clone_commit(
+        commit=commit,
+        pool=pool,
+        state=state,
+        target=target,
+        cwd=target_cwd,
+        title=target_title,
+        context=context,
+    )
+    public_clone = {
+        key: clone[key]
+        for key in ("threadId", "title", "cwd", "modelProvider", "model")
+        if key in clone
+    }
+    return {
+        "ok": True,
+        "operation": "copy",
+        "sharedName": commit.lineage_name,
+        "commit": _commit_payload(commit),
+        "source": {
+            "targetId": source.id,
+            "targetLabel": source.label,
+            "threadId": str(thread["id"]),
+            "title": source_title,
+        },
+        "target": {
+            "targetId": target.id,
+            "targetLabel": target.label,
+            **public_clone,
+        },
+    }
 
 
 def _sanitize_thread(

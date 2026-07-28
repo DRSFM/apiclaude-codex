@@ -5,3 +5,7 @@
 __pycache__/
 *.pyc
 .DS_Store
+/debug.log
+
+# Context management data (session-local, not committed)
+.ctx/

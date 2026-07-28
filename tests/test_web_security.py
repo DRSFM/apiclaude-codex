@@ -12,6 +12,57 @@ from web.backend import app as web_app
 
 
 class WebSecurityTests(unittest.TestCase):
+    def test_share_api_lists_targets_and_copies_without_credentials(self) -> None:
+        targets = [
+            {
+                "id": "account",
+                "label": "账号态 Codex",
+                "kind": "account",
+                "model": "gpt-test",
+                "available": True,
+            },
+            {
+                "id": "api:relay",
+                "label": "relay",
+                "kind": "api",
+                "model": "gpt-relay",
+                "available": True,
+            },
+        ]
+        with patch.object(web_app, "list_share_targets", return_value=targets):
+            response = asyncio.run(web_app.list_conversation_targets())
+        self.assertEqual(response["targets"], targets)
+        self.assertNotIn("api_key", str(response).lower())
+        self.assertNotIn("credential", str(response).lower())
+
+        request = web_app.ShareCopyRequest(
+            source_target_id="account",
+            source_thread_id="thread-source",
+            target_target_id="api:relay",
+        )
+        copied = {
+            "ok": True,
+            "source": {"targetId": "account", "threadId": "thread-source"},
+            "target": {"targetId": "api:relay", "threadId": "thread-target"},
+        }
+        with patch.object(web_app, "copy_share_thread", return_value=copied):
+            response = asyncio.run(web_app.copy_conversation(request))
+        self.assertEqual(response["target"]["threadId"], "thread-target")
+        self.assertNotIn("api_key", str(response).lower())
+        self.assertNotIn("credential", str(response).lower())
+
+    def test_share_frontend_contains_real_migration_controls(self) -> None:
+        frontend = (
+            Path(web_app.__file__).parent.parent
+            / "frontend"
+            / "index.html"
+        ).read_text(encoding="utf-8")
+        self.assertIn('id="migration-view"', frontend)
+        self.assertIn('id="migrationSourceTarget"', frontend)
+        self.assertIn('id="migrationThreadList"', frontend)
+        self.assertIn('id="migrationTargetList"', frontend)
+        self.assertIn('id="startMigrationBtn"', frontend)
+
     def test_codex_create_response_and_profile_file_exclude_api_key(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

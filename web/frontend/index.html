@@ -25,7 +25,7 @@
                 <span class="connection-badge"><span class="dot-sm green"></span> 已连接</span>
                 <button class="btn-switch" id="quickSwitchBtn">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
-                    一键切换
+                    <span id="quickSwitchLabel">一键切换</span>
                 </button>
             </div>
         </div>
@@ -41,6 +41,9 @@
                     <a class="nav-item" data-view="codex">
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg>
                         <span>Codex 配置</span>
+                    </a>
+                    <a class="nav-item nav-text-only" data-view="migration">
+                        <span>会话迁移</span>
                     </a>
                     <a class="nav-item" data-view="settings">
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
@@ -219,6 +222,147 @@
                     <div class="table-footer">
                         <span id="codexFooterCount">共 0 个配置</span>
                     </div>
+                </div>
+
+                <!-- Conversation Migration View -->
+                <div id="migration-view" class="view">
+                    <div class="migration-page-head">
+                        <div>
+                            <p class="migration-eyebrow">CODEX CONVERSATION TRANSFER</p>
+                            <h1>会话迁移面板</h1>
+                            <p>在账号态与任意 ApiCodex Profile 之间创建安全、独立的会话副本。</p>
+                        </div>
+                        <div class="migration-head-actions">
+                            <span class="migration-pool-state" id="migrationPoolState">正在检查共享池</span>
+                            <button class="migration-btn secondary" type="button" onclick="loadMigrationData()">刷新状态</button>
+                            <button class="migration-btn primary" type="button" onclick="startMigration()" id="startMigrationBtn" disabled>开始迁移</button>
+                        </div>
+                    </div>
+
+                    <section class="migration-workspace" aria-label="Codex 会话迁移配置">
+                        <article class="migration-card migration-source-card">
+                            <div class="migration-card-head">
+                                <div>
+                                    <span class="migration-step">01</span>
+                                    <h2>选择来源会话</h2>
+                                </div>
+                                <span class="migration-count" id="migrationThreadCount">0 个会话</span>
+                            </div>
+
+                            <label class="migration-field-label" for="migrationSourceTarget">来源账号或 Profile</label>
+                            <select class="migration-select" id="migrationSourceTarget" aria-label="来源账号或 Profile"></select>
+
+                            <label class="migration-search" for="migrationThreadSearch">
+                                <span>搜索</span>
+                                <input id="migrationThreadSearch" type="search" placeholder="按标题、目录或会话 ID 搜索">
+                            </label>
+
+                            <div class="migration-thread-list" id="migrationThreadList" role="radiogroup" aria-label="来源会话">
+                                <div class="migration-empty">请选择来源以加载会话</div>
+                            </div>
+                        </article>
+
+                        <article class="migration-card migration-policy-card">
+                            <div class="migration-card-head">
+                                <div>
+                                    <span class="migration-step">02</span>
+                                    <h2>迁移策略</h2>
+                                </div>
+                            </div>
+                            <p class="migration-card-copy">安全策略由共享池固定执行，避免不同模型或界面产生不一致结果。</p>
+
+                            <div class="migration-policy-list">
+                                <label class="migration-policy-item">
+                                    <input type="checkbox" checked disabled>
+                                    <span>
+                                        <strong>保留可见上下文</strong>
+                                        <small>用户、助手、工具结果与图片引用</small>
+                                    </span>
+                                </label>
+                                <label class="migration-policy-item">
+                                    <input type="checkbox" checked disabled>
+                                    <span>
+                                        <strong>清除私密运行态</strong>
+                                        <small>隐藏推理、加密内容、凭据与用量</small>
+                                    </span>
+                                </label>
+                                <label class="migration-policy-item">
+                                    <input type="checkbox" checked disabled>
+                                    <span>
+                                        <strong>创建独立线程</strong>
+                                        <small>源会话保持原状，可分别继续工作</small>
+                                    </span>
+                                </label>
+                                <label class="migration-policy-item">
+                                    <input type="checkbox" checked disabled>
+                                    <span>
+                                        <strong>使用目标配置</strong>
+                                        <small>模型、Provider 与隔离目录来自目标</small>
+                                    </span>
+                                </label>
+                            </div>
+                        </article>
+
+                        <article class="migration-card migration-target-card">
+                            <div class="migration-card-head">
+                                <div>
+                                    <span class="migration-step">03</span>
+                                    <h2>选择迁移目标</h2>
+                                </div>
+                            </div>
+                            <p class="migration-card-copy">目标会自动排除当前来源，账号态和已添加的 Profile 均可选择。</p>
+                            <div class="migration-target-list" id="migrationTargetList" role="radiogroup" aria-label="迁移目标">
+                                <div class="migration-empty">正在加载可用目标</div>
+                            </div>
+                        </article>
+
+                        <aside class="migration-card migration-summary-card" aria-live="polite">
+                            <div class="migration-card-head">
+                                <div>
+                                    <span class="migration-step">04</span>
+                                    <h2>任务确认</h2>
+                                </div>
+                            </div>
+                            <dl class="migration-summary">
+                                <div><dt>来源</dt><dd id="migrationSummarySource">尚未选择</dd></div>
+                                <div><dt>会话</dt><dd id="migrationSummaryThread">尚未选择</dd></div>
+                                <div><dt>目标</dt><dd id="migrationSummaryTarget">尚未选择</dd></div>
+                                <div><dt>目标模型</dt><dd id="migrationSummaryModel">跟随目标配置</dd></div>
+                            </dl>
+                            <div class="migration-result" id="migrationResult">
+                                <span class="migration-result-label">准备状态</span>
+                                <strong>请选择来源会话和迁移目标</strong>
+                                <p>迁移后将在目标中生成新的线程 ID。</p>
+                            </div>
+                            <button class="migration-btn primary wide" type="button" onclick="startMigration()" id="startMigrationBtnInline" disabled>创建会话副本</button>
+                        </aside>
+                    </section>
+
+                    <section class="migration-history-card">
+                        <div class="migration-history-head">
+                            <div>
+                                <h2>迁移记录</h2>
+                                <p>来自本机 EFS 共享池的真实版本记录。</p>
+                            </div>
+                            <span id="migrationHistoryCount">0 条记录</span>
+                        </div>
+                        <div class="migration-history-table-wrap">
+                            <table class="migration-history-table">
+                                <thead>
+                                    <tr>
+                                        <th>会话</th>
+                                        <th>共享名称</th>
+                                        <th>工作目录</th>
+                                        <th>最新版本</th>
+                                        <th>创建时间</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="migrationHistoryBody">
+                                    <tr><td colspan="5" class="migration-history-empty">暂无迁移记录</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </section>
                 </div>
             </main>
 

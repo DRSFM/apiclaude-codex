@@ -7,6 +7,7 @@ Web 版 API 节点管理界面，用于管理 Claude Code 和 Codex CLI 的 API 
 - **节点管理** — 增删改查 Claude 节点和 Codex 配置
 - **可视化界面** — macOS 风格的毛玻璃 UI，统计卡片、表格视图、详情面板
 - **一键启动** — 点击启动按钮，选择工作目录，配置启动参数，在新终端窗口中打开 CLI
+- **会话迁移** — 在账号态和任意已添加的 ApiCodex Profile 之间创建安全、独立的会话副本
 - **Token 脱敏** — API Token 在界面中自动脱敏显示（sk-xxx***xxx）
 - **启动配置** — Claude 支持新对话/Resume、权限模式选择（默认/完全访问/沙盒）
 
@@ -65,6 +66,19 @@ chmod +x start.sh
 
 点击「切换」按钮，只更新 current 标记，不启动终端。下次在命令行运行 `apiclaude` 或 `apicodex` 会使用切换后的节点。
 
+### 迁移 Codex 会话
+
+1. 打开左侧「会话迁移」
+2. 选择来源账号或 ApiCodex Profile
+3. 从真实会话列表中选择一个空闲会话
+4. 选择另一个账号态或 ApiCodex Profile 作为目标
+5. 确认摘要后点击「创建会话副本」
+
+迁移复用本机 EFS 会话共享池：保留可见上下文，清除隐藏推理、加密内容、
+凭据与用量，并按目标 Profile 的模型、Provider 和工作目录创建新的线程 ID。
+源会话不会被修改。目标列表来自当前 `apicodex --api-list` 对应的全部配置，
+并自动排除当前来源。
+
 ### 终端检测
 
 - 优先使用 **Windows Terminal** (wt)
@@ -113,6 +127,25 @@ Token 只通过子进程环境传递，不会出现在 Windows Terminal 或 `cmd
 启动 Codex 到新终端
 ```json
 {"folder": "C:\\project"}
+```
+
+### GET `/api/share/targets`
+列出账号态和全部 ApiCodex Profile 的非敏感迁移元数据。
+
+### GET `/api/share/threads?target_id=...`
+通过目标 Codex app-server 列出可迁移会话，不返回 rollout 文件路径。
+
+### GET `/api/share/history`
+读取本机 EFS 共享池中的版本记录。
+
+### POST `/api/share/copy`
+创建安全会话副本。
+```json
+{
+  "source_target_id": "account",
+  "source_thread_id": "019f...",
+  "target_target_id": "api:muyuan"
+}
 ```
 
 ## 架构说明

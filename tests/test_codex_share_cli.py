@@ -14,7 +14,13 @@ import apiagent
 import codex_share_cli
 from codex_app_server import AppServerCapability, AppServerError
 from codex_conversation_pool import ConversationPool
-from codex_share_cli import ShareContext, main
+from codex_share_cli import (
+    ShareContext,
+    copy_share_thread,
+    list_share_targets,
+    list_share_threads,
+    main,
+)
 from tests.test_codex_conversation_pool import (
     FakeSecurity,
     base_rows,
@@ -284,6 +290,7 @@ class ShareCliTests(unittest.TestCase):
             )
             self.assertEqual(code, 0, stderr)
             self.assertEqual(status["items"][0]["status"], "clean")
+
             self.assertTrue(
                 Path(status["items"][0]["snapshotHash"]).__str__()
             )
@@ -404,6 +411,62 @@ class ShareCliTests(unittest.TestCase):
                 (context.local_state_root / "mappings.sqlite3").is_file()
             )
             self.assertTrue(profile_home.is_dir())
+
+    def test_service_lists_all_targets_and_copies_between_distinct_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            context, _, _, thread_id = self.make_context(root)
+            pool_root = root / "pool"
+            code, _, stderr = run_cli(
+                ["init", "--pool", str(pool_root), "--json"],
+                context,
+            )
+            self.assertEqual(code, 0, stderr)
+
+            targets = list_share_targets(context)
+            self.assertEqual(
+                [target["id"] for target in targets],
+                ["account", "api:relay"],
+            )
+            threads = list_share_threads(context, "api:relay")
+            self.assertEqual(len(threads), 1)
+            self.assertEqual(threads[0]["id"], thread_id)
+            self.assertNotIn("path", threads[0])
+
+            capability = AppServerCapability(True, "codex-cli test", "supported")
+            with patch.object(
+                codex_share_cli,
+                "detect_fork_path_capability",
+                return_value=capability,
+            ):
+                result = copy_share_thread(
+                    context,
+                    source_target_id="api:relay",
+                    target_target_id="account",
+                    thread_id=thread_id,
+                    lineage_name="service-copy",
+                    cwd=root,
+                )
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["source"]["targetId"], "api:relay")
+            self.assertEqual(result["target"]["targetId"], "account")
+            self.assertNotEqual(result["source"]["threadId"], result["target"]["threadId"])
+            self.assertNotIn("rollout", str(result).lower())
+            self.assertNotIn("mapping", str(result).lower())
+
+            with self.assertRaisesRegex(
+                codex_share_cli.ConversationPoolError,
+                "must be different",
+            ):
+                copy_share_thread(
+                    context,
+                    source_target_id="api:relay",
+                    target_target_id="api:relay",
+                    thread_id=thread_id,
+                    lineage_name="invalid-copy",
+                    cwd=root,
+                )
 
     def test_publish_dry_run_does_not_create_lineage_or_mapping(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

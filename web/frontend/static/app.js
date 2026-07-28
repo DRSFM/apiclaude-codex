@@ -1,7 +1,7 @@
 const API = {
     async get(url) {
         const r = await fetch(url);
-        if (!r.ok) throw new Error(`${r.status}`);
+        if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error(e.detail || r.status); }
         return r.json();
     },
     async post(url, data) {
@@ -20,6 +20,25 @@ let currentView = 'claude';
 let claudeData = { nodes: {}, current: null };
 let codexData = { profiles: [] };
 let selectedNode = null;
+let migrationData = {
+    targets: [],
+    threads: [],
+    history: [],
+    poolReady: false,
+    sourceTargetId: null,
+    targetTargetId: null,
+    selectedThreadId: null,
+    loading: false,
+};
+
+function escapeHtml(value) {
+    return String(value ?? '')
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#039;');
+}
 
 function guessProvider(url) {
     if (!url) return { name: 'API', cls: 'other' };
@@ -148,6 +167,284 @@ function render(filter = '') {
     const pct = total ? Math.round((claudeCount + codexCount) / Math.max(total, 1) * 100) : 0;
     document.getElementById('activeBar').style.width = pct + '%';
     document.getElementById('activeNodesLabel').textContent = `活跃: ${total}`;
+}
+
+// ─── Conversation Migration ───
+
+function migrationTargetName(target) {
+    if (!target) return '尚未选择';
+    return target.kind === 'account' ? '账号态 Codex' : target.name;
+}
+
+function migrationThreadStatus(status) {
+    if (status === 'active') return '生成中';
+    if (status === 'systemError') return '系统错误';
+    return '空闲';
+}
+
+function migrationStatusClass(status) {
+    if (status === 'active') return 'active';
+    if (status === 'systemError') return 'error';
+    return '';
+}
+
+function renderMigrationSourceOptions() {
+    const select = document.getElementById('migrationSourceTarget');
+    select.innerHTML = migrationData.targets.map(target => `
+        <option value="${escapeHtml(target.id)}" ${target.id === migrationData.sourceTargetId ? 'selected' : ''} ${target.available ? '' : 'disabled'}>
+            ${escapeHtml(migrationTargetName(target))}${target.model ? ` · ${escapeHtml(target.model)}` : ''}
+        </option>
+    `).join('');
+}
+
+function renderMigrationThreads() {
+    const list = document.getElementById('migrationThreadList');
+    const filter = document.getElementById('migrationThreadSearch').value.trim().toLowerCase();
+    const threads = migrationData.threads.filter(thread => {
+        if (!filter) return true;
+        return [thread.title, thread.preview, thread.cwd, thread.id]
+            .some(value => String(value || '').toLowerCase().includes(filter));
+    });
+    document.getElementById('migrationThreadCount').textContent = `${threads.length} 个会话`;
+    if (!threads.length) {
+        list.innerHTML = `<div class="migration-empty">${migrationData.loading ? '正在读取本地会话' : '没有符合条件的本地会话'}</div>`;
+        return;
+    }
+    list.innerHTML = threads.map((thread, index) => `
+        <button
+            type="button"
+            class="migration-thread-option ${thread.id === migrationData.selectedThreadId ? 'selected' : ''}"
+            data-thread-index="${index}"
+            aria-pressed="${thread.id === migrationData.selectedThreadId}"
+            ${thread.available ? '' : 'disabled'}
+        >
+            <span class="migration-option-row">
+                <span class="migration-option-title">${escapeHtml(thread.title || thread.id)}</span>
+                <span class="migration-option-status ${migrationStatusClass(thread.status)}">${migrationThreadStatus(thread.status)}</span>
+            </span>
+            <span class="migration-option-preview">${escapeHtml(thread.preview || '无预览内容')}</span>
+            <span class="migration-option-meta">${escapeHtml(thread.cwd || '未记录工作目录')} · ${escapeHtml(String(thread.id).slice(0, 12))}</span>
+        </button>
+    `).join('');
+    list.querySelectorAll('.migration-thread-option').forEach(button => {
+        button.addEventListener('click', () => {
+            const thread = threads[Number(button.dataset.threadIndex)];
+            migrationData.selectedThreadId = thread.id;
+            renderMigrationThreads();
+            updateMigrationSummary();
+        });
+    });
+}
+
+function renderMigrationTargets() {
+    const list = document.getElementById('migrationTargetList');
+    const targets = migrationData.targets.filter(
+        target => target.id !== migrationData.sourceTargetId
+    );
+    if (!targets.length) {
+        list.innerHTML = '<div class="migration-empty">没有其他可用目标</div>';
+        return;
+    }
+    list.innerHTML = targets.map((target, index) => `
+        <button
+            type="button"
+            class="migration-target-option ${target.id === migrationData.targetTargetId ? 'selected' : ''}"
+            data-target-index="${index}"
+            aria-pressed="${target.id === migrationData.targetTargetId}"
+            ${target.available ? '' : 'disabled'}
+        >
+            <span class="migration-option-row">
+                <span class="migration-option-title">${escapeHtml(migrationTargetName(target))}</span>
+                <span class="migration-option-status ${target.available ? '' : 'error'}">${target.available ? '可用' : '目录缺失'}</span>
+            </span>
+            <span class="migration-option-preview">${escapeHtml(target.model || '跟随目标默认模型')}</span>
+            <span class="migration-option-meta">${escapeHtml(target.modelProvider || 'Codex provider')}</span>
+        </button>
+    `).join('');
+    list.querySelectorAll('.migration-target-option').forEach(button => {
+        button.addEventListener('click', () => {
+            const target = targets[Number(button.dataset.targetIndex)];
+            migrationData.targetTargetId = target.id;
+            renderMigrationTargets();
+            updateMigrationSummary();
+        });
+    });
+}
+
+function renderMigrationHistory() {
+    const tbody = document.getElementById('migrationHistoryBody');
+    const history = migrationData.history || [];
+    document.getElementById('migrationHistoryCount').textContent = `${history.length} 条记录`;
+    if (!history.length) {
+        tbody.innerHTML = '<tr><td colspan="5" class="migration-history-empty">暂无迁移记录</td></tr>';
+        return;
+    }
+    tbody.innerHTML = history.slice(0, 12).map(item => {
+        const main = item.refs?.main || Object.values(item.refs || {})[0] || {};
+        const createdAt = item.createdAt ? new Date(item.createdAt).toLocaleString('zh-CN') : '-';
+        return `
+            <tr>
+                <td title="${escapeHtml(item.title || '')}">${escapeHtml(item.title || '未命名会话')}</td>
+                <td>${escapeHtml(item.name || '-')}</td>
+                <td title="${escapeHtml(item.cwd || '')}">${escapeHtml(shortUrl(item.cwd || '-'))}</td>
+                <td>${escapeHtml(String(main.commit || '-').slice(0, 12))}</td>
+                <td>${escapeHtml(createdAt)}</td>
+            </tr>
+        `;
+    }).join('');
+}
+
+function updateMigrationSummary() {
+    const source = migrationData.targets.find(target => target.id === migrationData.sourceTargetId);
+    const target = migrationData.targets.find(target => target.id === migrationData.targetTargetId);
+    const thread = migrationData.threads.find(item => item.id === migrationData.selectedThreadId);
+
+    document.getElementById('migrationSummarySource').textContent = migrationTargetName(source);
+    document.getElementById('migrationSummaryThread').textContent = thread?.title || '尚未选择';
+    document.getElementById('migrationSummaryTarget').textContent = migrationTargetName(target);
+    document.getElementById('migrationSummaryModel').textContent = target?.model || '跟随目标配置';
+
+    const ready = Boolean(
+        migrationData.poolReady
+        && thread?.available
+        && target?.available
+        && source
+        && source.id !== target.id
+        && !migrationData.loading
+    );
+    document.getElementById('startMigrationBtn').disabled = !ready;
+    document.getElementById('startMigrationBtnInline').disabled = !ready;
+
+    const result = document.getElementById('migrationResult');
+    const hasPersistentResult = ['success', 'error', 'loading']
+        .some(state => result.classList.contains(state));
+    if (!hasPersistentResult) {
+        showMigrationResult(
+            '',
+            ready ? '准备就绪' : '请选择来源会话和迁移目标',
+            ready
+                ? '确认后将清洗可见历史，并在目标中创建新的独立线程。'
+                : '迁移后将在目标中生成新的线程 ID。'
+        );
+    }
+}
+
+async function loadMigrationThreads() {
+    if (!migrationData.sourceTargetId) return;
+    migrationData.loading = true;
+    migrationData.selectedThreadId = null;
+    renderMigrationThreads();
+    updateMigrationSummary();
+    try {
+        const response = await API.get(`/api/share/threads?target_id=${encodeURIComponent(migrationData.sourceTargetId)}`);
+        migrationData.threads = response.threads || [];
+    } catch (e) {
+        migrationData.threads = [];
+        showMigrationResult('error', '无法读取来源会话', e.message);
+    } finally {
+        migrationData.loading = false;
+        renderMigrationThreads();
+        updateMigrationSummary();
+    }
+}
+
+async function loadMigrationData() {
+    migrationData.loading = true;
+    setStatus('正在读取迁移配置...');
+    updateMigrationSummary();
+    try {
+        const [targetResponse, historyResponse] = await Promise.all([
+            API.get('/api/share/targets'),
+            API.get('/api/share/history'),
+        ]);
+        migrationData.targets = targetResponse.targets || [];
+        migrationData.history = historyResponse.conversations || [];
+        migrationData.poolReady = Boolean(historyResponse.ready);
+        const availableTargets = migrationData.targets.filter(target => target.available);
+        if (!availableTargets.some(target => target.id === migrationData.sourceTargetId)) {
+            migrationData.sourceTargetId =
+                availableTargets.find(target => target.id === 'account')?.id
+                || availableTargets[0]?.id
+                || null;
+        }
+        if (
+            !availableTargets.some(
+                target => target.id === migrationData.targetTargetId
+                    && target.id !== migrationData.sourceTargetId
+            )
+        ) {
+            migrationData.targetTargetId =
+                availableTargets.find(target => target.id !== migrationData.sourceTargetId)?.id
+                || null;
+        }
+        const poolState = document.getElementById('migrationPoolState');
+        poolState.textContent = historyResponse.ready
+            ? `安全池已就绪 · ${historyResponse.pool}`
+            : '共享池尚未初始化';
+        poolState.classList.toggle('error', !historyResponse.ready);
+        if (!historyResponse.ready && historyResponse.error) {
+            showMigrationResult('error', '共享池不可用', historyResponse.error);
+        }
+        renderMigrationSourceOptions();
+        renderMigrationTargets();
+        renderMigrationHistory();
+        await loadMigrationThreads();
+        setStatus('迁移配置已刷新');
+    } catch (e) {
+        migrationData.poolReady = false;
+        showMigrationResult('error', '迁移面板加载失败', e.message);
+        setStatus('迁移面板加载失败');
+    } finally {
+        migrationData.loading = false;
+        updateMigrationSummary();
+    }
+}
+
+function showMigrationResult(type, title, detail) {
+    const result = document.getElementById('migrationResult');
+    result.classList.remove('success', 'error', 'loading');
+    if (type) result.classList.add(type);
+    result.innerHTML = `
+        <span class="migration-result-label">${type === 'success' ? '迁移完成' : type === 'error' ? '需要处理' : '准备状态'}</span>
+        <strong>${escapeHtml(title)}</strong>
+        <p>${escapeHtml(detail)}</p>
+    `;
+}
+
+async function startMigration() {
+    const source = migrationData.targets.find(target => target.id === migrationData.sourceTargetId);
+    const target = migrationData.targets.find(target => target.id === migrationData.targetTargetId);
+    const thread = migrationData.threads.find(item => item.id === migrationData.selectedThreadId);
+    if (!source || !target || !thread || migrationData.loading) return;
+
+    migrationData.loading = true;
+    updateMigrationSummary();
+    showMigrationResult('loading', '正在创建安全副本', '正在清洗可见历史、发布版本并在目标中创建独立线程。');
+    setStatus('会话迁移进行中...');
+    try {
+        const response = await API.post('/api/share/copy', {
+            source_target_id: source.id,
+            source_thread_id: thread.id,
+            target_target_id: target.id,
+        });
+        showMigrationResult(
+            'success',
+            `已迁移到 ${migrationTargetName(target)}`,
+            `新线程 ${response.target.threadId} · 共享版本 ${String(response.commit?.id || '').slice(0, 12)}`
+        );
+        toast('会话副本创建成功');
+        const historyResponse = await API.get('/api/share/history');
+        migrationData.history = historyResponse.conversations || [];
+        renderMigrationHistory();
+        setStatus('会话迁移完成');
+    } catch (e) {
+        showMigrationResult('error', '迁移未完成', e.message);
+        toast(e.message, 'error');
+        setStatus('会话迁移失败');
+    } finally {
+        migrationData.loading = false;
+        updateMigrationSummary();
+    }
 }
 
 // ─── Detail Panel ───
@@ -387,11 +684,37 @@ document.querySelectorAll('.nav-item').forEach(item => {
         item.classList.add('active');
         document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
         document.getElementById(view + '-view').classList.add('active');
+        document.body.classList.toggle('migration-mode', view === 'migration');
+        document.getElementById('searchInput').placeholder =
+            view === 'migration' ? '搜索来源会话' : '搜索模型 / API 节点';
+        document.getElementById('quickSwitchLabel').textContent =
+            view === 'migration' ? '开始迁移' : '一键切换';
+        if (view === 'migration' && !migrationData.targets.length) {
+            loadMigrationData();
+        }
     });
 });
 
 // Search
-document.getElementById('searchInput').addEventListener('input', e => render(e.target.value));
+document.getElementById('searchInput').addEventListener('input', e => {
+    if (currentView === 'migration') {
+        document.getElementById('migrationThreadSearch').value = e.target.value;
+        renderMigrationThreads();
+    } else {
+        render(e.target.value);
+    }
+});
+document.getElementById('migrationThreadSearch').addEventListener('input', renderMigrationThreads);
+document.getElementById('migrationSourceTarget').addEventListener('change', async event => {
+    migrationData.sourceTargetId = event.target.value;
+    if (migrationData.targetTargetId === migrationData.sourceTargetId) {
+        migrationData.targetTargetId = migrationData.targets.find(
+            target => target.available && target.id !== migrationData.sourceTargetId
+        )?.id || null;
+    }
+    renderMigrationTargets();
+    await loadMigrationThreads();
+});
 
 // Add buttons
 document.getElementById('addClaudeBtn').addEventListener('click', () => openModal('claude'));
@@ -399,7 +722,8 @@ document.getElementById('addCodexBtn').addEventListener('click', () => openModal
 
 // Quick switch
 document.getElementById('quickSwitchBtn').addEventListener('click', () => {
-    if (currentView === 'claude') openModal('claude');
+    if (currentView === 'migration') startMigration();
+    else if (currentView === 'claude') openModal('claude');
     else openModal('codex');
 });
 
