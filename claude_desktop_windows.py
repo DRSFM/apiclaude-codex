@@ -7,18 +7,25 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Sequence
 from urllib.parse import urlparse
 
 
 CLAUDE_DESKTOP_ROUTE_MODEL = "claude-fable-5"
+_ANTHROPIC_FAMILY_TIERS = ("haiku", "sonnet", "opus", "fable", "mythos")
 _CONFIG_NAMESPACE = uuid.UUID("7fb2e18b-0cf0-45ca-aeda-83d9db4248c2")
 _RUNTIME_DIR_NAME = ".apiclaude-runtime"
+_CLAUDE_CODE_CONFIG_DIR_NAME = "claude-code-config"
+_GATEWAY_MCP_SERVER_NAME = "apiclaude-web"
+_WEB_SEARCH_BASE_URL_ENV = "APICLAUDE_WEB_SEARCH_BASE_URL"
+_WEB_SEARCH_TOKEN_ENV = "APICLAUDE_WEB_SEARCH_TOKEN"
+_WEB_SEARCH_MODEL_ENV = "APICLAUDE_WEB_SEARCH_MODEL"
 _SENSITIVE_ENV = (
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
@@ -27,6 +34,9 @@ _SENSITIVE_ENV = (
     "OPENAI_API_KEY",
     "OPENAI_BASE_URL",
     "APICODEX_API_KEY",
+    _WEB_SEARCH_BASE_URL_ENV,
+    _WEB_SEARCH_TOKEN_ENV,
+    _WEB_SEARCH_MODEL_ENV,
 )
 
 
@@ -36,6 +46,49 @@ class ClaudeDesktopError(RuntimeError):
 
 class ClaudeDesktopAlreadyRunning(ClaudeDesktopError):
     pass
+
+
+def _anthropic_family_tier(model: str) -> str | None:
+    lowered = model.lower()
+    for tier in _ANTHROPIC_FAMILY_TIERS:
+        if f"-{tier}-" in lowered or lowered == tier:
+            return tier
+    return None
+
+
+def _desktop_inference_models(
+    *,
+    model: str,
+    route_model: str,
+    extra_models: Sequence[str] | None,
+) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = [
+        {
+            "name": route_model,
+            "labelOverride": model,
+            "anthropicFamilyTier": "fable",
+            "isFamilyDefault": True,
+        }
+    ]
+    seen_names = {route_model}
+    default_tiers = {"fable"}
+    for value in extra_models or ():
+        name = str(value).strip()
+        if not name or name in seen_names:
+            continue
+        entry: dict[str, Any] = {
+            "name": name,
+            "labelOverride": name,
+        }
+        tier = _anthropic_family_tier(name)
+        if tier:
+            entry["anthropicFamilyTier"] = tier
+            if tier not in default_tiers:
+                entry["isFamilyDefault"] = True
+                default_tiers.add(tier)
+        entries.append(entry)
+        seen_names.add(name)
+    return entries
 
 
 _PRIVATE_ACL_SCRIPT = r"""
@@ -222,6 +275,31 @@ def ensure_private_desktop_directory(path: Path) -> None:
         raise ClaudeDesktopError("Desktop profile ACL verification failed")
 
 
+def prepare_claude_gateway_mcp_config(config_dir: Path) -> None:
+    """Merge the bundled gateway web MCP into an isolated Claude config."""
+
+    config_dir = config_dir.expanduser().resolve()
+    config_dir.mkdir(parents=True, exist_ok=True)
+    user_config_path = config_dir / ".claude.json"
+    user_config = _read_json_object(user_config_path)
+    mcp_servers = user_config.get("mcpServers")
+    if not isinstance(mcp_servers, dict):
+        mcp_servers = {}
+    gateway_mcp_path = Path(__file__).with_name("claude_gateway_mcp.py").resolve()
+    if not gateway_mcp_path.is_file():
+        raise ClaudeDesktopError(
+            f"bundled gateway MCP server was not found: {gateway_mcp_path}"
+        )
+    mcp_servers[_GATEWAY_MCP_SERVER_NAME] = {
+        "type": "stdio",
+        "command": str(Path(sys.executable).resolve()),
+        "args": [str(gateway_mcp_path)],
+        "env": {"PYTHONUTF8": "1"},
+    }
+    user_config["mcpServers"] = mcp_servers
+    _atomic_write_json(user_config_path, user_config)
+
+
 def prepare_claude_desktop_profile(
     profile_dir: Path,
     *,
@@ -230,6 +308,7 @@ def prepare_claude_desktop_profile(
     local_token: str,
     model: str,
     route_model: str = CLAUDE_DESKTOP_ROUTE_MODEL,
+    extra_models: Sequence[str] | None = None,
 ) -> None:
     """Write the node-local Claude Desktop 3P gateway configuration."""
 
@@ -256,6 +335,9 @@ def prepare_claude_desktop_profile(
     desktop_config["coworkUserFilesPath"] = str(cowork_dir)
     _atomic_write_json(desktop_config_path, desktop_config)
 
+    claude_code_config_dir = profile_dir / _CLAUDE_CODE_CONFIG_DIR_NAME
+    prepare_claude_gateway_mcp_config(claude_code_config_dir)
+
     config_id = str(
         uuid.uuid5(_CONFIG_NAMESPACE, f"apiclaude-desktop:{node_name}")
     )
@@ -267,14 +349,11 @@ def prepare_claude_desktop_profile(
             "inferenceGatewayBaseUrl": gateway_base_url.rstrip("/"),
             "inferenceGatewayApiKey": local_token,
             "modelDiscoveryEnabled": False,
-            "inferenceModels": [
-                {
-                    "name": route_model,
-                    "labelOverride": model,
-                    "anthropicFamilyTier": "fable",
-                    "isFamilyDefault": True,
-                }
-            ],
+            "inferenceModels": _desktop_inference_models(
+                model=model,
+                route_model=route_model,
+                extra_models=extra_models,
+            ),
             "inferenceProvider": "gateway",
             "inferenceCredentialKind": "static",
         },
@@ -348,6 +427,10 @@ def find_claude_desktop_executable() -> Path | None:
 def launch_claude_desktop_process(
     executable: Path,
     profile_dir: Path,
+    *,
+    web_search_base_url: str | None = None,
+    web_search_token: str | None = None,
+    web_search_model: str | None = None,
 ) -> subprocess.Popen[bytes]:
     executable = executable.expanduser().resolve()
     profile_dir = profile_dir.expanduser().resolve()
@@ -359,6 +442,23 @@ def launch_claude_desktop_process(
     for key in _SENSITIVE_ENV:
         environment.pop(key, None)
     environment["CLAUDE_USER_DATA_DIR"] = str(profile_dir)
+    claude_code_config_dir = profile_dir / _CLAUDE_CODE_CONFIG_DIR_NAME
+    claude_code_config_dir.mkdir(parents=True, exist_ok=True)
+    environment["CLAUDE_CONFIG_DIR"] = str(claude_code_config_dir)
+    search_values = (web_search_base_url, web_search_token, web_search_model)
+    if any(search_values):
+        if not all(search_values):
+            raise ClaudeDesktopError("web search gateway configuration is incomplete")
+        parsed = urlparse(str(web_search_base_url))
+        if (
+            parsed.scheme != "http"
+            or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
+            or parsed.port is None
+        ):
+            raise ClaudeDesktopError("web search gateway must be an explicit loopback URL")
+        environment[_WEB_SEARCH_BASE_URL_ENV] = str(web_search_base_url).rstrip("/")
+        environment[_WEB_SEARCH_TOKEN_ENV] = str(web_search_token)
+        environment[_WEB_SEARCH_MODEL_ENV] = str(web_search_model)
     creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     try:
         return subprocess.Popen(

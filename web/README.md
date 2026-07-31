@@ -130,23 +130,31 @@ Token 只通过子进程环境传递，不会出现在 Windows Terminal 或 `cmd
 ```
 
 ### GET `/api/share/targets`
-列出账号态和全部 ApiCodex Profile 的非敏感迁移元数据。
+列出账号态、全部 ApiCodex Profile 和已配置 Claude Code 节点的非敏感迁移元数据。
+Claude 节点会标明共享/隔离目录，但不返回 token、凭据 ID 或 transcript 路径。
 
 ### GET `/api/share/threads?target_id=...`
-通过目标 Codex app-server 列出可迁移会话，不返回 rollout 文件路径。
+Codex 来源通过目标 app-server 列出会话；Claude Code 来源从所选节点的
+`CLAUDE_CONFIG_DIR/projects` 安全发现 transcript。两者都只返回标题、预览、
+状态、cwd 和会话 ID，不返回本地文件路径。
 
 ### GET `/api/share/history`
 读取本机 EFS 共享池中的版本记录。
 
 ### POST `/api/share/copy`
-创建安全会话副本。
+创建安全会话副本。来源和目标可为 Codex 账号态、ApiCodex Profile 或
+Claude Code 节点；目标始终生成新的独立会话 ID。
 ```json
 {
   "source_target_id": "account",
   "source_thread_id": "019f...",
-  "target_target_id": "api:muyuan"
+  "target_target_id": "claude:anyrouter"
 }
 ```
+
+Claude Code 目标的响应会额外返回 `sessionId` 和可直接使用的
+`resumeCommand`。跨运行时迁移保留可见用户/助手消息与用户图片，清除隐藏推理、
+运行时注入、凭据、用量和不兼容的原始工具协议记录；源会话不被修改。
 
 ## 架构说明
 

@@ -28,6 +28,14 @@ class WebSecurityTests(unittest.TestCase):
                 "model": "gpt-relay",
                 "available": True,
             },
+            {
+                "id": "claude:relay",
+                "label": "Claude Code: relay",
+                "kind": "claude",
+                "model": "claude-test",
+                "isolation": "isolated",
+                "available": True,
+            },
         ]
         with patch.object(web_app, "list_share_targets", return_value=targets):
             response = asyncio.run(web_app.list_conversation_targets())
@@ -62,6 +70,7 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn('id="migrationThreadList"', frontend)
         self.assertIn('id="migrationTargetList"', frontend)
         self.assertIn('id="startMigrationBtn"', frontend)
+        self.assertIn("CODEX ↔ CLAUDE CODE SESSION TRANSFER", frontend)
 
     def test_codex_create_response_and_profile_file_exclude_api_key(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

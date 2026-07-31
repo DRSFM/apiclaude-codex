@@ -468,6 +468,99 @@ class ShareCliTests(unittest.TestCase):
                     cwd=root,
                 )
 
+    def test_service_round_trips_between_codex_and_claude_code(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            context, _, _, thread_id = self.make_context(root)
+            context.claude_account_home = root / "claude-account"
+            context.claude_nodes_root = root / "apiclaude"
+            context.load_claude_nodes = lambda: {
+                "relay-claude": {
+                    "isolation": "isolated",
+                    "home": "nodes/relay-claude",
+                    "model": "claude-test",
+                }
+            }
+            pool_root = root / "pool"
+            code, _, stderr = run_cli(
+                ["init", "--pool", str(pool_root), "--json"],
+                context,
+            )
+            self.assertEqual(code, 0, stderr)
+
+            targets = list_share_targets(context)
+            self.assertEqual(
+                [target["id"] for target in targets],
+                ["account", "api:relay", "claude:relay-claude"],
+            )
+            claude_target = targets[-1]
+            self.assertEqual(claude_target["kind"], "claude")
+            self.assertEqual(claude_target["isolation"], "isolated")
+            self.assertNotIn("credential", str(claude_target).lower())
+
+            to_claude = copy_share_thread(
+                context,
+                source_target_id="api:relay",
+                target_target_id="claude:relay-claude",
+                thread_id=thread_id,
+                lineage_name="codex-to-claude",
+                cwd=root,
+            )
+            claude_id = to_claude["target"]["threadId"]
+            self.assertNotEqual(claude_id, thread_id)
+            self.assertEqual(
+                to_claude["target"]["sessionId"],
+                claude_id,
+            )
+            self.assertIn("--resume", to_claude["target"]["resumeCommand"])
+            self.assertNotIn("path", str(to_claude).lower())
+            self.assertNotIn("mapping", str(to_claude).lower())
+
+            claude_threads = list_share_threads(
+                context,
+                "claude:relay-claude",
+            )
+            self.assertEqual(
+                [thread["id"] for thread in claude_threads],
+                [claude_id],
+            )
+            self.assertEqual(claude_threads[0]["title"], "[shared] Source title")
+            self.assertEqual(claude_threads[0]["model"], "claude-test")
+
+            capability = AppServerCapability(
+                True,
+                "codex-cli test",
+                "supported",
+            )
+            with patch.object(
+                codex_share_cli,
+                "detect_fork_path_capability",
+                return_value=capability,
+            ):
+                back_to_codex = copy_share_thread(
+                    context,
+                    source_target_id="claude:relay-claude",
+                    target_target_id="account",
+                    thread_id=claude_id,
+                    lineage_name="claude-to-codex",
+                    cwd=root,
+                )
+
+            codex_id = back_to_codex["target"]["threadId"]
+            self.assertNotEqual(codex_id, claude_id)
+            self.assertEqual(
+                back_to_codex["source"]["threadId"],
+                claude_id,
+            )
+            account_threads = FakeAppServer.threads_by_home[
+                str(context.account_home.resolve())
+            ]
+            target_rollout = Path(str(account_threads[codex_id]["path"]))
+            target_text = target_rollout.read_text(encoding="utf-8")
+            self.assertIn("portable request", target_text)
+            self.assertIn("portable answer", target_text)
+            self.assertNotIn("encrypted_content", target_text)
+
     def test_publish_dry_run_does_not_create_lineage_or_mapping(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

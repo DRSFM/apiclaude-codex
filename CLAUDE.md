@@ -64,5 +64,9 @@ apiclaude 功能对齐 apicodex（详见 AGENTS.md 后续记录）：
    `CLAUDE_USER_DATA_DIR`、动态回环端口、独立本地令牌和隐藏 worker，窗口
    退出时自动回收对应桥。该路径不复用 `CLAUDE_CONFIG_DIR`，且 GPT
    协议转换仍属实验能力。
-- 不同步：历史图片修复（Codex 特有损坏模式）；share 共享池 Claude 版暂缓，
-  等出现真实跨节点续聊需求再立项。
+5. Codex ↔ Claude Code 会话迁移（已完成，2026-07-31）：Web 迁移面板将
+   Claude 节点纳入来源和目标；跨运行时只复制已清洗的可见问答与用户图片，
+   Codex 目标继续经 app-server 创建独立线程，Claude 目标生成带新 UUID、
+   父链和标题的独立 transcript，并通过目标节点的 `--resume` 继续。
+- 不同步：历史图片修复（Codex 特有损坏模式）；Claude Code 迁移目前是一次性
+  独立副本，不提供 Claude transcript 的 `push`、`pull` 或原地合并。

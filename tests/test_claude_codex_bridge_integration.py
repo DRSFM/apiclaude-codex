@@ -4,12 +4,16 @@ import io
 import json
 import logging
 import os
+import socket
+import struct
 import sys
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
 import warnings
+from contextlib import redirect_stderr
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -21,6 +25,26 @@ from claude_codex_bridge import cpa_bridge, litellm_bridge
     "set APICLAUDE_LITELLM_INTEGRATION=1 to run the LiteLLM integration test",
 )
 class ClaudeCodexBridgeIntegrationTests(unittest.TestCase):
+    def test_bridge_silences_a_client_connection_reset(self) -> None:
+        errors = io.StringIO()
+        with redirect_stderr(errors):
+            with litellm_bridge(
+                upstream_base_url="https://upstream.test/v1",
+                upstream_api_key="sk-test",
+                model="gpt-test",
+            ) as endpoint:
+                port = int(endpoint.base_url.rsplit(":", 1)[1])
+                client = socket.create_connection(("127.0.0.1", port), timeout=2)
+                client.setsockopt(
+                    socket.SOL_SOCKET,
+                    socket.SO_LINGER,
+                    struct.pack("hh", 1, 0),
+                )
+                client.close()
+                time.sleep(0.05)
+
+        self.assertNotIn("ConnectionResetError", errors.getvalue())
+
     def test_anthropic_tool_request_round_trips_through_responses_api(self) -> None:
         captured: dict[str, object] = {}
         serializer_warnings: list[str] = []
