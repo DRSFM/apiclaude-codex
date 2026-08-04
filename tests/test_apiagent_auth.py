@@ -4,7 +4,7 @@ import io
 import json
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -1024,6 +1024,388 @@ class ApiAgentAuthTests(unittest.TestCase):
             r'"C:\Program Files\Microsoft VS Code\bin\code.cmd" --version',
             command,
         )
+
+    def test_vision_setup_enables_only_requested_profiles_after_key_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            api_root = root / ".codex-api"
+            store = SecureStore(root / "secrets")
+            profiles = []
+            for name, base_url, model in (
+                ("deepseek", "https://api.deepseek.com/", "deepseek-v4-flash"),
+                ("prism", "https://ai.prism.uno/v1", "gpt-5.5"),
+                ("other", "https://other.test/v1", "gpt-test"),
+            ):
+                home = api_root / "profiles" / name
+                home.mkdir(parents=True)
+                apiagent.write_codex_config(home, base_url, model, "high")
+                profile = {
+                    "id": name,
+                    "name": name,
+                    "home": f"profiles/{name}",
+                    "baseUrl": base_url,
+                    "model": model,
+                    "credentialId": f"codex:{name}",
+                }
+                profiles.append(profile)
+            deepseek_catalog = {
+                "models": [
+                    {
+                        "slug": "deepseek-v4-flash",
+                        "input_modalities": ["text"],
+                    }
+                ]
+            }
+            (api_root / "profiles" / "deepseek" / "models.json").write_text(
+                json.dumps(deepseek_catalog), encoding="utf-8"
+            )
+            saved: list[list[dict[str, object]]] = []
+
+            with (
+                patch.object(apiagent, "CODEX_HOME", api_root),
+                patch.object(apiagent, "SECRET_STORE", store),
+                patch.object(apiagent, "load_codex_profiles", return_value=profiles),
+                patch.object(
+                    apiagent,
+                    "save_codex_profiles",
+                    side_effect=lambda value: saved.append(json.loads(json.dumps(value))),
+                ),
+                patch.object(apiagent, "getpass", return_value="gemini-secret"),
+                patch.object(apiagent, "validate_gemini_vision") as validate,
+                patch.object(
+                    apiagent,
+                    "choose_codex_vision_port",
+                    side_effect=[19101, 19102],
+                ),
+                patch.object(
+                    apiagent,
+                    "ensure_codex_vision_worker",
+                    return_value=True,
+                ) as ensure,
+                redirect_stdout(io.StringIO()) as output,
+            ):
+                code = apiagent.codex_vision_main(
+                    ["setup", "deepseek", "prism"]
+                )
+
+            self.assertEqual(code, 0)
+            validate.assert_called_once_with(
+                "gemini-secret", "gemini-3.5-flash-lite"
+            )
+            self.assertEqual(store.get("vision:gemini"), "gemini-secret")
+            self.assertEqual(len(saved), 1)
+            configured = {item["name"]: item for item in saved[0]}
+            self.assertTrue(configured["deepseek"]["vision"]["enabled"])
+            self.assertEqual(configured["deepseek"]["vision"]["proxyPort"], 19101)
+            self.assertEqual(configured["prism"]["vision"]["proxyPort"], 19102)
+            self.assertNotIn("vision", configured["other"])
+            self.assertNotIn("gemini-secret", json.dumps(saved))
+            self.assertNotIn("gemini-secret", output.getvalue())
+            self.assertEqual(ensure.call_count, 2)
+
+            deepseek_config = (
+                api_root / "profiles" / "deepseek" / "config.toml"
+            ).read_text(encoding="utf-8")
+            prism_config = (
+                api_root / "profiles" / "prism" / "config.toml"
+            ).read_text(encoding="utf-8")
+            other_config = (
+                api_root / "profiles" / "other" / "config.toml"
+            ).read_text(encoding="utf-8")
+            self.assertIn('base_url = "http://127.0.0.1:19101"', deepseek_config)
+            self.assertIn('base_url = "http://127.0.0.1:19102/v1"', prism_config)
+            self.assertIn("enable_request_compression = false", deepseek_config)
+            self.assertIn('base_url = "https://other.test/v1"', other_config)
+            catalog = json.loads(
+                (api_root / "profiles" / "deepseek" / "models.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(
+                catalog["models"][0]["input_modalities"], ["text", "image"]
+            )
+
+    def test_vision_setup_does_not_write_secret_or_profiles_when_validation_fails(self) -> None:
+        profile = {
+            "id": "deepseek",
+            "name": "deepseek",
+            "home": "profiles/deepseek",
+            "baseUrl": "https://api.deepseek.com/",
+        }
+        errors = io.StringIO()
+        with (
+            patch.object(apiagent, "load_codex_profiles", return_value=[profile]),
+            patch.object(apiagent, "getpass", return_value="invalid-key"),
+            patch.object(
+                apiagent,
+                "validate_gemini_vision",
+                side_effect=ValueError("Gemini rejected the key"),
+            ),
+            patch.object(apiagent, "SECRET_STORE") as store,
+            patch.object(apiagent, "save_codex_profiles") as save,
+            redirect_stderr(errors),
+        ):
+            code = apiagent.codex_vision_main(["setup", "deepseek"])
+
+        self.assertEqual(code, 1)
+        self.assertIn("Gemini rejected the key", errors.getvalue())
+        store.set.assert_not_called()
+        save.assert_not_called()
+        self.assertNotIn("vision", profile)
+
+    def test_vision_disable_restores_upstream_config_and_text_modalities(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            api_root = root / ".codex-api"
+            home = api_root / "profiles" / "deepseek"
+            home.mkdir(parents=True)
+            store = SecureStore(root / "secrets")
+            store.set("vision:gemini", "gemini-secret")
+            store.set("vision-control:deepseek", "control-secret")
+            profile = {
+                "id": "deepseek",
+                "name": "deepseek",
+                "home": "profiles/deepseek",
+                "baseUrl": "https://api.deepseek.com/",
+                "model": "deepseek-v4-flash",
+                "credentialId": "codex:deepseek",
+                "vision": {
+                    "enabled": True,
+                    "provider": "gemini",
+                    "model": "gemini-3.5-flash-lite",
+                    "credentialId": "vision:gemini",
+                    "controlCredentialId": "vision-control:deepseek",
+                    "proxyPort": 19101,
+                },
+            }
+            apiagent.write_codex_config(
+                home,
+                "http://127.0.0.1:19101",
+                "deepseek-v4-flash",
+                "high",
+            )
+            config_path = home / "config.toml"
+            config_path.write_text(
+                config_path.read_text(encoding="utf-8").replace(
+                    "[features]\n",
+                    "[features]\nenable_request_compression = false\n",
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            (home / "models.json").write_text(
+                json.dumps(
+                    {
+                        "models": [
+                            {
+                                "slug": "deepseek-v4-flash",
+                                "input_modalities": ["text", "image"],
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            saved: list[list[dict[str, object]]] = []
+
+            with (
+                patch.object(apiagent, "CODEX_HOME", api_root),
+                patch.object(apiagent, "SECRET_STORE", store),
+                patch.object(apiagent, "load_codex_profiles", return_value=[profile]),
+                patch.object(
+                    apiagent,
+                    "save_codex_profiles",
+                    side_effect=lambda value: saved.append(json.loads(json.dumps(value))),
+                ),
+                redirect_stdout(io.StringIO()),
+            ):
+                code = apiagent.codex_vision_main(["disable", "deepseek"])
+
+            self.assertEqual(code, 0)
+            self.assertNotIn("vision", profile)
+            config = (home / "config.toml").read_text(encoding="utf-8")
+            self.assertIn('base_url = "https://api.deepseek.com/"', config)
+            self.assertNotIn("enable_request_compression", config)
+            catalog = json.loads((home / "models.json").read_text(encoding="utf-8"))
+            self.assertEqual(catalog["models"][0]["input_modalities"], ["text"])
+            with self.assertRaises(KeyError):
+                store.get("vision-control:deepseek")
+            with self.assertRaises(KeyError):
+                store.get("vision:gemini")
+            self.assertEqual(len(saved), 1)
+
+    def test_vision_setup_rolls_back_new_credentials_when_profile_files_fail(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SecureStore(Path(tmp) / "secrets")
+            profile = {
+                "id": "deepseek",
+                "name": "deepseek",
+                "home": "profiles/deepseek",
+                "baseUrl": "https://api.deepseek.com/",
+            }
+            errors = io.StringIO()
+            with (
+                patch.object(apiagent, "SECRET_STORE", store),
+                patch.object(apiagent, "load_codex_profiles", return_value=[profile]),
+                patch.object(apiagent, "getpass", return_value="gemini-secret"),
+                patch.object(apiagent, "validate_gemini_vision"),
+                patch.object(apiagent, "choose_codex_vision_port", return_value=19101),
+                patch.object(
+                    apiagent,
+                    "configure_codex_vision_files",
+                    side_effect=OSError("config denied"),
+                ),
+                patch.object(apiagent, "save_codex_profiles") as save,
+                redirect_stderr(errors),
+            ):
+                code = apiagent.codex_vision_main(["setup", "deepseek"])
+
+            self.assertEqual(code, 1)
+            self.assertIn("config denied", errors.getvalue())
+            self.assertNotIn("vision", profile)
+            with self.assertRaises(KeyError):
+                store.get("vision:gemini")
+            with self.assertRaises(KeyError):
+                store.get("vision-control:deepseek")
+            save.assert_not_called()
+
+    def test_vision_setup_rolls_back_when_profile_registry_save_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            api_root = root / ".codex-api"
+            home = api_root / "profiles" / "deepseek"
+            home.mkdir(parents=True)
+            apiagent.write_codex_config(
+                home,
+                "https://api.deepseek.com/",
+                "deepseek-v4-flash",
+                "high",
+            )
+            original_config = (home / "config.toml").read_bytes()
+            store = SecureStore(root / "secrets")
+            profile = {
+                "id": "deepseek",
+                "name": "deepseek",
+                "home": "profiles/deepseek",
+                "baseUrl": "https://api.deepseek.com/",
+                "model": "deepseek-v4-flash",
+            }
+            with (
+                patch.object(apiagent, "CODEX_HOME", api_root),
+                patch.object(apiagent, "SECRET_STORE", store),
+                patch.object(apiagent, "load_codex_profiles", return_value=[profile]),
+                patch.object(apiagent, "getpass", return_value="gemini-secret"),
+                patch.object(apiagent, "validate_gemini_vision"),
+                patch.object(apiagent, "choose_codex_vision_port", return_value=19101),
+                patch.object(
+                    apiagent,
+                    "save_codex_profiles",
+                    side_effect=OSError("registry denied"),
+                ),
+                redirect_stderr(io.StringIO()) as errors,
+            ):
+                code = apiagent.codex_vision_main(["setup", "deepseek"])
+
+            self.assertEqual(code, 1)
+            self.assertIn("registry denied", errors.getvalue())
+            self.assertNotIn("vision", profile)
+            self.assertEqual((home / "config.toml").read_bytes(), original_config)
+            with self.assertRaises(KeyError):
+                store.get("vision:gemini")
+            with self.assertRaises(KeyError):
+                store.get("vision-control:deepseek")
+
+    def test_vision_command_routes_before_normal_codex_profile_loading(self) -> None:
+        with (
+            patch.object(apiagent, "codex_vision_main", return_value=0) as vision,
+            patch.object(
+                apiagent,
+                "load_codex_profiles",
+                side_effect=AssertionError("normal profile route used"),
+            ),
+        ):
+            code = apiagent.codex_main(["vision", "status"])
+
+        self.assertEqual(code, 0)
+        vision.assert_called_once_with(["status"])
+
+    def test_configured_vision_profile_starts_worker_before_codex(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            api_root = root / ".codex-api"
+            home = api_root / "profiles" / "deepseek"
+            home.mkdir(parents=True)
+            apiagent.write_codex_config(
+                home, "http://127.0.0.1:19101", "deepseek-v4-flash", "high"
+            )
+            profile = {
+                "id": "deepseek",
+                "name": "deepseek",
+                "home": "profiles/deepseek",
+                "baseUrl": "https://api.deepseek.com/",
+                "model": "deepseek-v4-flash",
+                "credentialId": "codex:deepseek",
+                "vision": {
+                    "enabled": True,
+                    "provider": "gemini",
+                    "model": "gemini-3.5-flash-lite",
+                    "credentialId": "vision:gemini",
+                    "controlCredentialId": "vision-control:deepseek",
+                    "proxyPort": 19101,
+                },
+            }
+
+            with (
+                patch.object(apiagent, "CODEX_HOME", api_root),
+                patch.object(apiagent, "load_codex_profiles", return_value=[profile]),
+                patch.object(apiagent, "get_codex_secret", return_value="upstream-key"),
+                patch.object(
+                    apiagent, "ensure_codex_vision_worker", return_value=True
+                ) as ensure,
+                patch.object(apiagent, "add_current_project_trust"),
+                patch.object(apiagent, "update_codex_last_used"),
+                patch.object(apiagent, "run_command", return_value=0) as run,
+            ):
+                code = apiagent.codex_main(
+                    ["--api-profile", "deepseek", "--version"]
+                )
+
+            self.assertEqual(code, 0)
+            ensure.assert_called_once_with(profile)
+            run.assert_called_once()
+
+    def test_vision_worker_spawn_command_contains_no_api_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SecureStore(Path(tmp) / "secrets")
+            store.set("vision-control:deepseek", "control-secret")
+            profile = {
+                "id": "deepseek",
+                "name": "deepseek",
+                "vision": {
+                    "enabled": True,
+                    "controlCredentialId": "vision-control:deepseek",
+                    "proxyPort": 19101,
+                },
+            }
+            with (
+                patch.object(apiagent, "SECRET_STORE", store),
+                patch.object(
+                    apiagent,
+                    "codex_vision_worker_is_healthy",
+                    side_effect=[False, True],
+                ),
+                patch.object(apiagent, "start_detached_process", return_value=0) as start,
+                patch.object(apiagent.time, "sleep"),
+            ):
+                healthy = apiagent.ensure_codex_vision_worker(profile)
+
+            self.assertTrue(healthy)
+            command_text = " ".join(
+                [str(start.call_args.args[0]), *start.call_args.args[1]]
+            )
+            self.assertIn("--vision-worker", command_text)
+            self.assertNotIn("control-secret", command_text)
+            self.assertNotIn("gemini", command_text.lower())
 
 
 if __name__ == "__main__":

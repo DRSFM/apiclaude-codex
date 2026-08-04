@@ -17,6 +17,7 @@ import os
 import re
 import secrets
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -34,6 +35,12 @@ from codex_history_images import (
     repair_codex_history_images,
 )
 from codex_desktop_windows import label_codex_desktop_window
+from codex_vision_proxy import (
+    VisionImage,
+    VisionProxyError,
+    request_gemini_vision,
+    vision_proxy,
+)
 from claude_codex_bridge import (
     BridgeEndpoint,
     BridgeStartupError,
@@ -83,11 +90,18 @@ SECRET_STORE = SecureStore(HOME / ".apiagent-secrets")
 DEFAULT_CODEX_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_CODEX_MODEL = "gpt-5.6-sol"
 DEFAULT_CODEX_REASONING_EFFORT = "high"
+DEFAULT_GEMINI_VISION_MODEL = "gemini-3.5-flash-lite"
+GEMINI_VISION_CREDENTIAL_ID = "vision:gemini"
 CODEX_API_AUTH_MARKER = "apicodex-managed-key-in-child-environment"
 CODEX_AUTH_STORE = "keyring"
 CODEX_INSTALL_SCRIPT = "$env:CODEX_NON_INTERACTIVE=1; irm https://chatgpt.com/codex/install.ps1 | iex"
 CODEX_ACCOUNT_IMAGE_REPAIR_TASK = "ApiCodex Account History Image Repair"
 HIDDEN_PREFIX_CHARS = "\ufeff\u200b\u200c\u200d\u2060\ufffd"
+VISION_TEST_IMAGE = (
+    "data:image/png;base64,"
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUB"
+    "AScY42YAAAAASUVORK5CYII="
+)
 CODEX_PARENT_CONTEXT_ENV = (
     "CODEX_INTERNAL_ORIGINATOR_OVERRIDE",
     "CODEX_PERMISSION_PROFILE",
@@ -691,6 +705,484 @@ def install_codex_model_catalog(home: Path, payload: dict[str, Any]) -> Path:
     return target
 
 
+def codex_vision_config(profile: dict[str, Any]) -> dict[str, Any] | None:
+    value = profile.get("vision")
+    if not isinstance(value, dict) or value.get("enabled") is not True:
+        return None
+    try:
+        port = int(value.get("proxyPort"))
+    except (TypeError, ValueError):
+        return None
+    if not 1024 <= port <= 65535:
+        return None
+    return value
+
+
+def codex_vision_control_credential_id(profile: dict[str, Any]) -> str:
+    profile_id = slugify(str(profile.get("id") or profile.get("name") or "profile"))
+    return f"vision-control:{profile_id}"
+
+
+def codex_vision_proxy_base_url(
+    profile: dict[str, Any],
+    *,
+    upstream_base_url: str | None = None,
+) -> str:
+    vision = codex_vision_config(profile)
+    if vision is None:
+        return str(upstream_base_url or profile.get("baseUrl") or DEFAULT_CODEX_BASE_URL)
+    base_url = str(
+        upstream_base_url or profile.get("baseUrl") or DEFAULT_CODEX_BASE_URL
+    )
+    parsed = urlparse(base_url)
+    path = parsed.path.rstrip("/")
+    return f"http://127.0.0.1:{int(vision['proxyPort'])}{path}"
+
+
+def choose_codex_vision_port(
+    profile_id: str,
+    profiles: list[dict[str, Any]],
+) -> int:
+    used = {
+        int(vision["proxyPort"])
+        for profile in profiles
+        if (vision := codex_vision_config(profile)) is not None
+        and str(profile.get("id")) != str(profile_id)
+    }
+    start = 19000 + int(
+        hashlib.sha256(str(profile_id).encode("utf-8")).hexdigest()[:8], 16
+    ) % 1000
+    for offset in range(1000):
+        port = 19000 + ((start - 19000 + offset) % 1000)
+        if port in used:
+            continue
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+            try:
+                listener.bind(("127.0.0.1", port))
+            except OSError:
+                continue
+        return port
+    raise ValueError("no free loopback port is available for the vision worker")
+
+
+def _replace_toml_key_in_section(
+    path: Path,
+    section: str,
+    key: str,
+    value: str | None,
+) -> None:
+    raw = path.read_text(encoding="utf-8-sig")
+    newline = "\r\n" if "\r\n" in raw else "\n"
+    lines = raw.splitlines(keepends=True)
+    header = f"[{section}]"
+    section_index: int | None = None
+    end_index = len(lines)
+    key_index: int | None = None
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            if section_index is not None:
+                end_index = index
+                break
+            if stripped == header:
+                section_index = index
+                continue
+        if section_index is not None and re.match(rf"^{re.escape(key)}\s*=", stripped):
+            key_index = index
+    if section_index is None:
+        if value is None:
+            return
+        suffix = "" if not raw or raw.endswith(("\n", "\r")) else newline
+        lines.append(f"{suffix}{header}{newline}{key} = {value}{newline}")
+    elif key_index is not None:
+        if value is None:
+            del lines[key_index]
+        else:
+            lines[key_index] = f"{key} = {value}{newline}"
+    elif value is not None:
+        lines.insert(end_index, f"{key} = {value}{newline}")
+    updated = "".join(lines)
+    if updated != raw:
+        path.write_text(updated, encoding="utf-8")
+
+
+def configure_codex_vision_files(
+    profile: dict[str, Any],
+    *,
+    enabled: bool,
+    upstream_base_url: str | None = None,
+) -> None:
+    home = codex_profile_home(profile)
+    config_path = home / "config.toml"
+    if not config_path.is_file():
+        write_codex_config(
+            home,
+            str(profile.get("baseUrl") or DEFAULT_CODEX_BASE_URL),
+            str(profile.get("model") or DEFAULT_CODEX_MODEL),
+            str(profile.get("reasoningEffort") or DEFAULT_CODEX_REASONING_EFFORT),
+        )
+    base_url = (
+        codex_vision_proxy_base_url(
+            profile,
+            upstream_base_url=upstream_base_url,
+        )
+        if enabled
+        else str(upstream_base_url or profile.get("baseUrl") or DEFAULT_CODEX_BASE_URL)
+    )
+    _replace_toml_key_in_section(
+        config_path,
+        "model_providers.apicodex",
+        "base_url",
+        toml_basic_string(base_url),
+    )
+    _replace_toml_key_in_section(
+        config_path,
+        "features",
+        "enable_request_compression",
+        "false" if enabled else None,
+    )
+
+    catalog_path = home / "models.json"
+    if catalog_path.is_file():
+        payload = read_json(catalog_path, {})
+        if not isinstance(payload, dict) or not isinstance(payload.get("models"), list):
+            raise ValueError(f"invalid model catalog: {catalog_path}")
+        changed = False
+        modalities = ["text", "image"] if enabled else ["text"]
+        for item in payload["models"]:
+            if isinstance(item, dict) and item.get("input_modalities") != modalities:
+                item["input_modalities"] = modalities
+                changed = True
+        if changed:
+            install_codex_model_catalog(home, payload)
+
+
+def validate_gemini_vision(api_key: str, model: str) -> None:
+    description = request_gemini_vision(
+        api_key=api_key,
+        model=model,
+        user_prompt="Return the single word OK if this one-pixel image is readable.",
+        images=[VisionImage("image/png", VISION_TEST_IMAGE)],
+    )
+    if not description.strip():
+        raise ValueError("Gemini vision validation returned an empty response")
+
+
+def codex_vision_worker_is_healthy(
+    profile: dict[str, Any],
+    control_token: str,
+) -> bool:
+    vision = codex_vision_config(profile)
+    if vision is None:
+        return False
+    parsed = urlparse(codex_vision_proxy_base_url(profile))
+    request = Request(
+        f"{parsed.scheme}://{parsed.netloc}/__apicodex_vision__/health",
+        headers={"X-ApiCodex-Vision-Control": control_token},
+    )
+    try:
+        with urlopen(request, timeout=1) as response:
+            raw = response.read(64 * 1024 + 1)
+        if len(raw) > 64 * 1024:
+            return False
+        payload = json.loads(raw.decode("utf-8-sig"))
+    except (HTTPError, URLError, OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    expected = str(profile.get("id") or profile.get("name") or "profile")
+    return payload.get("status") == "ok" and payload.get("profile") == expected
+
+
+def ensure_codex_vision_worker(profile: dict[str, Any]) -> bool:
+    vision = codex_vision_config(profile)
+    if vision is None:
+        return True
+    credential_id = str(
+        vision.get("controlCredentialId")
+        or codex_vision_control_credential_id(profile)
+    )
+    try:
+        control_token = clean_hidden_prefix(SECRET_STORE.get(credential_id))
+    except (KeyError, SecureStoreError):
+        print(
+            f"Error: profile '{profile.get('name')}' has no vision worker control token.",
+            file=sys.stderr,
+        )
+        return False
+    if codex_vision_worker_is_healthy(profile, control_token):
+        return True
+
+    profile_name = str(profile.get("id") or profile.get("name") or "")
+    if not profile_name:
+        return False
+    code = start_detached_process(
+        sys.executable,
+        [
+            str(Path(__file__).resolve()),
+            "codex",
+            "--vision-worker",
+            "--api-profile",
+            profile_name,
+        ],
+        env_remove=CODEX_DESKTOP_ENV_REMOVE
+        + ("APICODEX_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"),
+    )
+    if code != 0:
+        return False
+    for _ in range(40):
+        time.sleep(0.25)
+        if codex_vision_worker_is_healthy(profile, control_token):
+            return True
+    print(
+        f"Error: vision worker for '{profile.get('name')}' did not become ready.",
+        file=sys.stderr,
+    )
+    return False
+
+
+def run_codex_vision_worker(requested: str) -> int:
+    profiles = load_codex_profiles()
+    profile = find_profile(profiles, requested)
+    if not profile or not is_safe_api_profile_home(profile):
+        return 1
+    vision = codex_vision_config(profile)
+    if vision is None:
+        return 1
+    try:
+        upstream_key = get_codex_secret(profile)
+        gemini_key = clean_hidden_prefix(
+            SECRET_STORE.get(str(vision.get("credentialId") or GEMINI_VISION_CREDENTIAL_ID))
+        )
+        control_token = clean_hidden_prefix(
+            SECRET_STORE.get(
+                str(
+                    vision.get("controlCredentialId")
+                    or codex_vision_control_credential_id(profile)
+                )
+            )
+        )
+    except (KeyError, SecureStoreError):
+        return 1
+
+    profile_id = str(profile.get("id") or profile.get("name") or "profile")
+    try:
+        with vision_proxy(
+            upstream_base_url=str(profile.get("baseUrl") or DEFAULT_CODEX_BASE_URL),
+            upstream_api_key=upstream_key,
+            gemini_api_key=gemini_key,
+            gemini_model=str(vision.get("model") or DEFAULT_GEMINI_VISION_MODEL),
+            control_token=control_token,
+            profile_id=profile_id,
+            port=int(vision["proxyPort"]),
+        ):
+            while True:
+                time.sleep(5)
+                data = read_json(CODEX_PROFILES_PATH, {"profiles": []})
+                current = find_profile(data.get("profiles") or [], profile_id)
+                current_vision = codex_vision_config(current or {})
+                if (
+                    current_vision is None
+                    or int(current_vision["proxyPort"]) != int(vision["proxyPort"])
+                ):
+                    return 0
+    except (OSError, VisionProxyError):
+        return 1
+    except KeyboardInterrupt:
+        return 130
+
+
+def setup_codex_vision(profiles: list[dict[str, Any]], names: list[str]) -> int:
+    if not names:
+        print(
+            "Error: usage: apicodex vision setup PROFILE [PROFILE ...]",
+            file=sys.stderr,
+        )
+        return 1
+    selected: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for name in names:
+        profile = find_profile(profiles, name)
+        if not profile:
+            print(f"Error: Codex profile '{name}' was not found.", file=sys.stderr)
+            return 1
+        if not is_safe_api_profile_home(profile):
+            print(
+                f"Error: refusing to configure vision outside ~/.codex-api: {name}",
+                file=sys.stderr,
+            )
+            return 1
+        identity = str(profile.get("id") or profile.get("name"))
+        if identity not in seen:
+            selected.append(profile)
+            seen.add(identity)
+
+    api_key = clean_hidden_prefix(getpass("Gemini API key: "))
+    if not api_key:
+        print("Error: Gemini API key cannot be empty.", file=sys.stderr)
+        return 1
+    try:
+        validate_gemini_vision(api_key, DEFAULT_GEMINI_VISION_MODEL)
+    except (ValueError, VisionProxyError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    missing = object()
+    previous_visions = {
+        id(profile): json.loads(json.dumps(profile["vision"]))
+        if "vision" in profile
+        else missing
+        for profile in selected
+    }
+    file_snapshots: dict[Path, bytes | None] = {}
+    for profile in selected:
+        home = codex_profile_home(profile)
+        for path in (home / "config.toml", home / "models.json"):
+            file_snapshots[path] = path.read_bytes() if path.is_file() else None
+    try:
+        previous_gemini_key: str | None = SECRET_STORE.get(
+            GEMINI_VISION_CREDENTIAL_ID
+        )
+    except KeyError:
+        previous_gemini_key = None
+    except SecureStoreError as exc:
+        print(f"Error: failed to read the saved Gemini credential: {exc}", file=sys.stderr)
+        return 1
+
+    created_control_credentials: list[str] = []
+    try:
+        SECRET_STORE.set(GEMINI_VISION_CREDENTIAL_ID, api_key)
+        for profile in selected:
+            profile_id = str(profile.get("id") or profile.get("name") or "profile")
+            existing = codex_vision_config(profile)
+            port = (
+                int(existing["proxyPort"])
+                if existing is not None
+                else choose_codex_vision_port(profile_id, profiles)
+            )
+            control_credential_id = codex_vision_control_credential_id(profile)
+            try:
+                SECRET_STORE.get(control_credential_id)
+            except KeyError:
+                SECRET_STORE.set(control_credential_id, secrets.token_urlsafe(32))
+                created_control_credentials.append(control_credential_id)
+            profile["vision"] = {
+                "enabled": True,
+                "provider": "gemini",
+                "model": DEFAULT_GEMINI_VISION_MODEL,
+                "credentialId": GEMINI_VISION_CREDENTIAL_ID,
+                "controlCredentialId": control_credential_id,
+                "proxyPort": port,
+            }
+            configure_codex_vision_files(profile, enabled=True)
+        save_codex_profiles(profiles)
+    except (OSError, UnicodeError, ValueError, SecureStoreError) as exc:
+        for profile in selected:
+            previous = previous_visions[id(profile)]
+            if previous is missing:
+                profile.pop("vision", None)
+            else:
+                profile["vision"] = previous
+        for path, content in file_snapshots.items():
+            try:
+                if content is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(content)
+            except OSError as restore_exc:
+                print(
+                    f"Warning: failed to restore {path}: {restore_exc}",
+                    file=sys.stderr,
+                )
+        if previous_gemini_key is None:
+            SECRET_STORE.clear(GEMINI_VISION_CREDENTIAL_ID)
+        else:
+            SECRET_STORE.set(GEMINI_VISION_CREDENTIAL_ID, previous_gemini_key)
+        for credential_id in created_control_credentials:
+            SECRET_STORE.clear(credential_id)
+        print(f"Error: failed to configure vision fallback: {exc}", file=sys.stderr)
+        return 1
+
+    ready = True
+    for profile in selected:
+        profile_ready = ensure_codex_vision_worker(profile)
+        ready = profile_ready and ready
+        if profile_ready:
+            print(
+                f"Enabled Gemini vision fallback for '{profile.get('name')}' "
+                f"with {DEFAULT_GEMINI_VISION_MODEL}."
+            )
+    return 0 if ready else 1
+
+
+def disable_codex_vision(profiles: list[dict[str, Any]], names: list[str]) -> int:
+    if not names:
+        print(
+            "Error: usage: apicodex vision disable PROFILE [PROFILE ...]",
+            file=sys.stderr,
+        )
+        return 1
+    selected: list[dict[str, Any]] = []
+    for name in names:
+        profile = find_profile(profiles, name)
+        if not profile:
+            print(f"Error: Codex profile '{name}' was not found.", file=sys.stderr)
+            return 1
+        selected.append(profile)
+    for profile in selected:
+        vision = codex_vision_config(profile)
+        if vision is None:
+            continue
+        configure_codex_vision_files(profile, enabled=False)
+        credential_id = str(
+            vision.get("controlCredentialId")
+            or codex_vision_control_credential_id(profile)
+        )
+        SECRET_STORE.clear(credential_id)
+        profile.pop("vision", None)
+        print(f"Disabled vision fallback for '{profile.get('name')}'.")
+    save_codex_profiles(profiles)
+    if not any(codex_vision_config(profile) for profile in profiles):
+        SECRET_STORE.clear(GEMINI_VISION_CREDENTIAL_ID)
+    return 0
+
+
+def show_codex_vision_status(profiles: list[dict[str, Any]]) -> int:
+    configured = 0
+    for profile in profiles:
+        vision = codex_vision_config(profile)
+        if vision is None:
+            continue
+        configured += 1
+        print(
+            f"{profile.get('name')}: {vision.get('provider')} / "
+            f"{vision.get('model')} on 127.0.0.1:{vision.get('proxyPort')}"
+        )
+    if not configured:
+        print("No Codex API profiles have a vision fallback configured.")
+    return 0
+
+
+def codex_vision_main(args: list[str]) -> int:
+    if not args or args[0] in {"-h", "--help"}:
+        print(
+            "Usage:\n"
+            "  apicodex vision setup PROFILE [PROFILE ...]\n"
+            "  apicodex vision status\n"
+            "  apicodex vision disable PROFILE [PROFILE ...]"
+        )
+        return 0 if args else 1
+    command = args[0]
+    profiles = load_codex_profiles()
+    if command == "setup":
+        return setup_codex_vision(profiles, args[1:])
+    if command == "status" and len(args) == 1:
+        return show_codex_vision_status(profiles)
+    if command == "disable":
+        return disable_codex_vision(profiles, args[1:])
+    print(f"Error: unknown vision command: {command}", file=sys.stderr)
+    return 1
+
+
 def fetch_codex_provider_models(base_url: str, api_key: str) -> list[str]:
     parsed = urlparse(base_url)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
@@ -1164,10 +1656,16 @@ def add_codex_profile(
         install_codex_model_catalog(home, catalog_payload)
     write_codex_config(
         home,
-        provider_url,
+        codex_vision_proxy_base_url(profile, upstream_base_url=provider_url),
         selected_model,
         selected_reasoning_effort,
     )
+    if codex_vision_config(profile) is not None:
+        configure_codex_vision_files(
+            profile,
+            enabled=True,
+            upstream_base_url=provider_url,
+        )
 
     profile["name"] = profile_name
     profile["baseUrl"] = provider_url
@@ -1369,7 +1867,7 @@ def launch_codex_desktop(
     if not (home / "config.toml").exists():
         write_codex_config(
             home,
-            selected.get("baseUrl", DEFAULT_CODEX_BASE_URL),
+            codex_vision_proxy_base_url(selected),
             selected.get("model") or DEFAULT_CODEX_MODEL,
             selected.get("reasoningEffort") or DEFAULT_CODEX_REASONING_EFFORT,
         )
@@ -1386,6 +1884,9 @@ def launch_codex_desktop(
         SECRET_STORE.set(credential_id, clean_hidden_prefix(api_key))
         selected["credentialId"] = credential_id
         save_codex_profiles(profiles)
+
+    if not ensure_codex_vision_worker(selected):
+        return 1
 
     profile_id = slugify(str(selected.get("id") or selected.get("name") or "default"))
     dream_skin_id = dream_skin_instance_id(selected)
@@ -1503,7 +2004,7 @@ def launch_codex_vscode(
     if not (home / "config.toml").exists():
         write_codex_config(
             home,
-            selected.get("baseUrl", DEFAULT_CODEX_BASE_URL),
+            codex_vision_proxy_base_url(selected),
             selected.get("model") or DEFAULT_CODEX_MODEL,
             selected.get("reasoningEffort") or DEFAULT_CODEX_REASONING_EFFORT,
         )
@@ -1520,6 +2021,9 @@ def launch_codex_vscode(
         SECRET_STORE.set(credential_id, clean_hidden_prefix(api_key))
         selected["credentialId"] = credential_id
         save_codex_profiles(profiles)
+
+    if not ensure_codex_vision_worker(selected):
+        return 1
 
     profile_id = slugify(str(selected.get("id") or selected.get("name") or "default"))
     vscode_data = CODEX_VSCODE_DATA_ROOT / profile_id
@@ -1568,6 +2072,9 @@ def codex_help() -> None:
                                    Opt in to account repair at Windows logon
   apicodex --repair-images --account --uninstall-task
                                    Remove the opt-in Windows logon task
+  apicodex vision setup PROFILE... Configure Gemini vision fallback per Profile
+  apicodex vision status           Show configured vision fallbacks
+  apicodex vision disable PROFILE... Disable a Profile's vision fallback
   apicodex share --help            Manage portable local conversation snapshots
   apicodex --up                    Update the Codex CLI
   apicodex --api-help              Show this help
@@ -1600,6 +2107,12 @@ def codex_share_main(args: list[str]) -> int:
 
 
 def codex_main(args: list[str]) -> int:
+    if args and args[0] == "vision":
+        return codex_vision_main(args[1:])
+    if args and args[0] == "--vision-worker":
+        if len(args) != 3 or args[1] != "--api-profile":
+            return 1
+        return run_codex_vision_worker(args[2])
     if args and args[0] == "share":
         return codex_share_main(args[1:])
     pass_through: list[str] = []
@@ -1844,7 +2357,7 @@ def codex_main(args: list[str]) -> int:
     if not (home / "config.toml").exists():
         write_codex_config(
             home,
-            selected.get("baseUrl", DEFAULT_CODEX_BASE_URL),
+            codex_vision_proxy_base_url(selected),
             selected.get("model") or DEFAULT_CODEX_MODEL,
             selected.get("reasoningEffort") or DEFAULT_CODEX_REASONING_EFFORT,
         )
@@ -1860,6 +2373,9 @@ def codex_main(args: list[str]) -> int:
         SECRET_STORE.set(credential_id, clean_hidden_prefix(api_key))
         selected["credentialId"] = credential_id
         save_codex_profiles(profiles)
+
+    if not ensure_codex_vision_worker(selected):
+        return 1
 
     add_current_project_trust(home)
     update_codex_last_used(selected)
@@ -2361,6 +2877,10 @@ def run_claude_codex_bridge_node(
     upstream_base_url = clean_hidden_prefix(
         str(profile.get("baseUrl") or DEFAULT_CODEX_BASE_URL)
     ).rstrip("/")
+    if not ensure_codex_vision_worker(profile):
+        return 1
+    if codex_vision_config(profile) is not None:
+        upstream_base_url = codex_vision_proxy_base_url(profile).rstrip("/")
     try:
         gateway = str(node.get("gateway") or "litellm")
         if gateway == "cpa":
@@ -2511,6 +3031,13 @@ def run_claude_desktop_worker(
                 local_token = get_or_create_claude_desktop_bridge_token(name)
             except (KeyError, SecureStoreError) as exc:
                 raise ClaudeDesktopError(f"failed to load bridge credentials: {exc}") from exc
+
+            if not ensure_codex_vision_worker(profile):
+                raise ClaudeDesktopError(
+                    f"vision worker for '{profile.get('name')}' is unavailable"
+                )
+            if codex_vision_config(profile) is not None:
+                upstream_base_url = codex_vision_proxy_base_url(profile).rstrip("/")
 
             with cpa_bridge(
                 upstream_base_url=upstream_base_url,

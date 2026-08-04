@@ -160,6 +160,43 @@ desktop starts, it is synchronized through stdin into the official Codex
 Windows keyring for that isolated `CODEX_HOME`; no API key is placed on the
 command line or written to plaintext `auth.json`.
 
+### Experimental Per-Profile Vision Fallback
+
+A text-only model, or an upstream that blocks image input, can use Gemini as a
+visual perception helper without changing other profiles. Configure one or
+more existing profiles through the hidden API-key prompt:
+
+```powershell
+apicodex vision setup deepseek prism
+apicodex vision status
+apicodex vision disable deepseek prism
+```
+
+The initial adapter uses `gemini-3.5-flash-lite`. Setup validates the key with
+a small image before changing any profile. For each selected profile, a
+loopback-only Responses proxy starts automatically when ApiCodex launches the
+CLI, VS Code, Codex Desktop, or a Claude bridge that references that profile.
+Text-only requests pass through unchanged. When a request contains inline
+Base64 images, the proxy sends the images and current user prompt to Gemini,
+replaces the image items with Gemini's plain-text visual description, and then
+forwards the request to the profile's original upstream model.
+
+Only the selected profiles are modified. The Gemini key and each proxy control
+token are stored in the platform secure store; neither is placed in profile
+JSON, TOML, process arguments, or logs. The proxy listens only on `127.0.0.1`,
+requires the profile's existing bearer token before forwarding, and sends
+Gemini requests with `store: false`. Images sent through an enabled profile are
+therefore disclosed to Google for analysis, but prior conversation history is
+not added to that Gemini request. The original image is not forwarded to the
+text-only primary model.
+
+This experimental path currently handles inline PNG, JPEG, WebP, HEIC, and HEIF
+data URLs below Gemini's combined 20 MB request limit. Start the profile through
+`apicodex` after a reboot so its local worker is available. Disabling the
+fallback restores the original upstream URL and text-only model catalog entry;
+the shared Gemini credential is removed after the last enabled profile is
+disabled.
+
 ### Repair Missing Desktop History Images
 
 Codex session JSONL records can retain an attached image as an embedded data

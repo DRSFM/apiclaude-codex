@@ -5,6 +5,25 @@
 
 ## 协作修改记录
 
+### 2026-08-05：ApiCodex 按 Profile 配置 Gemini 视觉辅助
+
+- 修改简介：新增 `apicodex vision setup/status/disable`，允许为指定 Codex API
+  Profile 启用 `gemini-3.5-flash-lite` 视觉辅助；本地回环 Responses 代理只在请求
+  含图片时调用 Gemini，将视觉描述替换回原请求后交给 DeepSeek、Prism 等主模型，
+  纯文本请求保持透传。CLI、VS Code、Codex Desktop 与 Claude 桥启动路径均会按需
+  拉起对应 Profile 的隔离 worker。
+- 修改原因：DeepSeek 原生不接受多模态输入，Prism 当前上游关闭了多模态，需要在
+  不改变其他 Profile、也不把完整对话交给辅助模型的前提下补充视觉理解能力。
+- 安全说明：Gemini Key 与每 Profile 控制令牌只存入 DPAPI SecureStore，不进入
+  JSON/TOML、命令行或日志；代理仅监听 `127.0.0.1`，校验原上游 Bearer Token，
+  Gemini 请求设置 `store: false`，只提交当前用户提示和本轮内联图片。配置过程先做
+  真实图片验证，写文件或凭据失败时回滚。
+- 验证情况：单元测试覆盖 Gemini 请求契约、图片替换、纯文本透传、代理鉴权与路径、
+  按 Profile 启停、无密钥命令行及配置失败回滚；完整测试 157 项通过、2 项按集成
+  环境跳过，`py_compile` 与 `git diff --check` 通过。真实 Key 验证后，DeepSeek 图片
+  辅助链路返回 HTTP 200 / completed；Prism `gpt-5.5` 的纯文本与图片辅助链路均返回
+  HTTP 200 且无错误；两节点 worker 健康，代理 `/models` 鉴权请求均返回 HTTP 200。
+
 ### 2026-08-03：ApiCodex 动态模型目录默认项对齐
 
 - 修改简介：动态生成 `models.json` 时，将用户在 `--api-add` 中选择的模型稳定
