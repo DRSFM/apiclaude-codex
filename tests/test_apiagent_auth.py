@@ -465,6 +465,25 @@ class ApiAgentAuthTests(unittest.TestCase):
                 config,
             )
 
+    def test_codex_config_uses_profile_local_model_catalog_when_present(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            catalog = home / "models.json"
+            catalog.write_text('{"models": [{"slug": "vendor-model"}]}', encoding="utf-8")
+
+            apiagent.write_codex_config(
+                home,
+                "https://example.test/v1",
+                "vendor-model",
+                "high",
+            )
+
+            config = (home / "config.toml").read_text(encoding="utf-8")
+            self.assertIn(
+                f'model_catalog_json = "{catalog.resolve().as_posix()}"',
+                config,
+            )
+
     def test_api_add_preserves_profile_model_and_reasoning_effort(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -484,7 +503,13 @@ class ApiAgentAuthTests(unittest.TestCase):
                 patch.object(apiagent, "load_codex_profiles", return_value=[profile]),
                 patch.object(apiagent, "save_codex_profiles"),
                 patch.object(apiagent, "getpass", return_value="sk-test-secret"),
-                patch("builtins.input", side_effect=["", ""]),
+                patch.object(
+                    apiagent,
+                    "fetch_codex_provider_models",
+                    return_value=["gpt-5.6-sol"],
+                    create=True,
+                ),
+                patch("builtins.input", side_effect=["", "", ""]),
             ):
                 code = apiagent.add_codex_profile("muyuanpub")
 
@@ -494,6 +519,200 @@ class ApiAgentAuthTests(unittest.TestCase):
             ).read_text(encoding="utf-8")
             self.assertIn('model = "gpt-5.6-sol"', config)
             self.assertIn('model_reasoning_effort = "xhigh"', config)
+
+    def test_api_add_bare_command_fetches_models_and_guides_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            answers = iter(["vendor", "https://api.vendor.test/v1", "2"])
+            prompts: list[str] = []
+
+            def answer(prompt: str) -> str:
+                prompts.append(prompt)
+                return next(answers)
+
+            with (
+                patch.object(apiagent, "CODEX_HOME", root / ".codex-api"),
+                patch.object(apiagent, "SECRET_STORE"),
+                patch.object(apiagent, "load_codex_profiles", return_value=[]),
+                patch.object(apiagent, "save_codex_profiles") as save_profiles,
+                patch.object(apiagent, "getpass", return_value="sk-vendor-secret"),
+                patch.object(
+                    apiagent,
+                    "fetch_codex_provider_models",
+                    return_value=[
+                        "alpha-model",
+                        "DeepSeek-V4-Flash-0731",
+                        "black-forest-labs/FLUX.2-klein-4B",
+                    ],
+                    create=True,
+                ) as fetch_models,
+                patch("builtins.input", side_effect=answer),
+            ):
+                code = apiagent.codex_main(["--api-add"])
+
+            self.assertEqual(code, 0)
+            self.assertEqual(
+                prompts,
+                [
+                    "Profile name: ",
+                    "API base URL [https://api.openai.com/v1]: ",
+                    "Choose default model number or name: ",
+                ],
+            )
+            fetch_models.assert_called_once_with(
+                "https://api.vendor.test/v1",
+                "sk-vendor-secret",
+            )
+            profile = save_profiles.call_args.args[0][0]
+            self.assertEqual(profile["model"], "DeepSeek-V4-Flash-0731")
+            config = (root / ".codex-api" / "config.toml").read_text(encoding="utf-8")
+            self.assertIn('model = "DeepSeek-V4-Flash-0731"', config)
+            catalog = json.loads(
+                (root / ".codex-api" / "models.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                [item["slug"] for item in catalog["models"]],
+                ["DeepSeek-V4-Flash-0731", "alpha-model"],
+            )
+            self.assertEqual(
+                [item["priority"] for item in catalog["models"]],
+                [1, 2],
+            )
+            self.assertTrue(all(item["visibility"] == "list" for item in catalog["models"]))
+
+    def test_api_add_accepts_generic_provider_options_and_installs_catalog(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            catalog_source = root / "vendor-models.json"
+            catalog_source.write_text(
+                json.dumps({"models": [{"slug": "vendor-model", "display_name": "Vendor"}]}),
+                encoding="utf-8",
+            )
+
+            with (
+                patch.object(apiagent, "CODEX_HOME", root / ".codex-api"),
+                patch.object(apiagent, "SECRET_STORE") as store,
+                patch.object(apiagent, "load_codex_profiles", return_value=[]),
+                patch.object(apiagent, "save_codex_profiles") as save_profiles,
+                patch.object(apiagent, "getpass", return_value="sk-vendor-secret"),
+                patch("builtins.input", side_effect=AssertionError("prompted")),
+            ):
+                code = apiagent.add_codex_profile(
+                    name="vendor",
+                    base_url="https://api.vendor.test/responses",
+                    model="vendor-model",
+                    reasoning_effort="medium",
+                    model_catalog=catalog_source,
+                )
+
+            self.assertEqual(code, 0)
+            profile_home = root / ".codex-api"
+            installed_catalog = profile_home / "models.json"
+            self.assertEqual(
+                json.loads(installed_catalog.read_text(encoding="utf-8")),
+                json.loads(catalog_source.read_text(encoding="utf-8")),
+            )
+            config = (profile_home / "config.toml").read_text(encoding="utf-8")
+            self.assertIn('model = "vendor-model"', config)
+            self.assertIn('model_reasoning_effort = "medium"', config)
+            self.assertIn('base_url = "https://api.vendor.test/responses"', config)
+            self.assertIn(
+                f'model_catalog_json = "{installed_catalog.resolve().as_posix()}"',
+                config,
+            )
+            store.set.assert_called_once_with("codex:vendor", "sk-vendor-secret")
+            saved_profile = save_profiles.call_args.args[0][0]
+            self.assertEqual(saved_profile["model"], "vendor-model")
+            self.assertEqual(saved_profile["reasoningEffort"], "medium")
+            self.assertEqual(saved_profile["modelCatalog"], "models.json")
+
+    def test_api_add_rejects_catalog_without_selected_model_before_secret_write(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            catalog_source = root / "wrong-models.json"
+            catalog_source.write_text(
+                '{"models": [{"slug": "different-model"}]}',
+                encoding="utf-8",
+            )
+
+            with (
+                patch.object(apiagent, "CODEX_HOME", root / ".codex-api"),
+                patch.object(apiagent, "SECRET_STORE") as store,
+                patch.object(apiagent, "load_codex_profiles", return_value=[]),
+                patch.object(apiagent, "save_codex_profiles") as save_profiles,
+                patch.object(apiagent, "getpass", side_effect=AssertionError("read secret")),
+                patch("builtins.input", side_effect=AssertionError("prompted")),
+            ):
+                code = apiagent.add_codex_profile(
+                    name="vendor",
+                    base_url="https://api.vendor.test/v1",
+                    model="vendor-model",
+                    model_catalog=catalog_source,
+                )
+
+            self.assertEqual(code, 1)
+            store.set.assert_not_called()
+            save_profiles.assert_not_called()
+            self.assertFalse((root / ".codex-api" / "models.json").exists())
+
+    def test_api_add_cli_routes_provider_options_only_in_add_mode(self) -> None:
+        catalog = Path("C:/configs/vendor-models.json")
+        with patch.object(apiagent, "add_codex_profile", return_value=0) as add_profile:
+            code = apiagent.codex_main(
+                [
+                    "--api-add",
+                    "--name",
+                    "vendor",
+                    "--base-url",
+                    "https://api.vendor.test/v1",
+                    "--model",
+                    "vendor-model",
+                    "--reasoning-effort",
+                    "high",
+                    "--model-catalog",
+                    str(catalog),
+                ]
+            )
+
+        self.assertEqual(code, 0)
+        add_profile.assert_called_once_with(
+            None,
+            name="vendor",
+            base_url="https://api.vendor.test/v1",
+            model="vendor-model",
+            reasoning_effort="high",
+            model_catalog=catalog,
+        )
+
+    def test_codex_model_argument_remains_a_normal_pass_through_argument(self) -> None:
+        profile = {
+            "id": "relay",
+            "name": "relay",
+            "home": "profiles/relay",
+            "baseUrl": "https://example.test/v1",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / ".codex-api" / "profiles" / "relay"
+            home.mkdir(parents=True)
+            (home / "config.toml").write_text("model = \"saved-model\"\n", encoding="utf-8")
+            with (
+                patch.object(apiagent, "CODEX_HOME", root / ".codex-api"),
+                patch.object(apiagent, "load_codex_profiles", return_value=[profile]),
+                patch.object(apiagent, "get_codex_secret", return_value="sk-secret"),
+                patch.object(apiagent, "add_current_project_trust"),
+                patch.object(apiagent, "update_codex_last_used"),
+                patch.object(apiagent, "run_command", return_value=0) as run,
+            ):
+                code = apiagent.codex_main(
+                    ["--api-profile", "relay", "--model", "one-shot-model"]
+                )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            run.call_args.args[1],
+            ["--disable", "apps", "--disable", "plugins", "--model", "one-shot-model"],
+        )
 
     def test_api_add_rejects_unsafe_existing_home_before_secret_or_config_writes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

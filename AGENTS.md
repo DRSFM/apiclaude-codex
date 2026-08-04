@@ -5,6 +5,45 @@
 
 ## 协作修改记录
 
+### 2026-08-03：ApiCodex 动态模型目录默认项对齐
+
+- 修改简介：动态生成 `models.json` 时，将用户在 `--api-add` 中选择的模型稳定
+  排到目录首位并赋予 `priority = 1`，其余候选模型保持原发现顺序。
+- 修改原因：此前目录优先级直接沿用上游 `/models` 返回顺序，导致 `config.toml`
+  已选择 `DeepSeek-V4-Flash-0731`，但 Desktop 的后台标题任务仍使用目录默认
+  `DeepSeek-V3`，失败后产生多次重试。
+- 实例与验证：现有 `myxiaoji_sfm_qq` Profile 已同步为
+  `DeepSeek-V4-Flash-0731` 唯一 `isDefault = true`；回归测试覆盖选择第二个模型后
+  目录顺序和优先级同步更新。
+
+### 2026-08-03：ApiCodex 通用第三方模型添加命令
+
+- 修改简介：`apicodex --api-add` 改为引导式上游接入；输入 Profile 名称、
+  OpenAI-compatible base URL 与隐藏 API Key 后，通过认证的 `GET /models` 拉取
+  该令牌可用模型，过滤明显的非 Agent 模型并提供编号选择。候选模型会生成到隔离
+  Profile 的 `models.json`，通过 `model_catalog_json` 进入后续 Codex 模型选择栏。
+  原有显式参数与外部模型目录仍作为兼容路径保留。
+- 修改原因：此前 DeepSeek 作为第九个供应商通过一次性配置迁入隔离目录，通用
+  `--api-add` 仍要求用户预先知道模型 slug；对于 New API/Sub2API 聚合上游，应以
+  实际令牌权限返回的模型清单为准，并允许在 Codex 内继续切换全部候选模型。
+- 安全与兼容：API Key 仍仅由隐藏输入读取并写入 DPAPI SecureStore，不新增密钥
+  命令行参数；模型查询只在内存中使用密钥，限制响应大小且不记录认证头。普通
+  Codex `--model` 保持透传，配置继续使用 Responses wire API、`env_key` 和隔离
+  `CODEX_HOME`。
+- 实例与验证：第十个 `myxiaoji_sfm_qq` Profile 已从 Sub2API 实际发现 33 个模型，
+  排除 FLUX 图像模型后导入 32 个，默认设为 `DeepSeek-V4-Flash-0731`；
+  `codex debug models` 确认目标为 `visibility=list` / `supported_in_api=true`。
+  对该模型的真实 `/v1/responses` 请求返回 HTTP 200。全量测试为 144 passed、
+  2 skipped，`py_compile` 与 `git diff --check` 通过。
+
+### 2026-08-03：清理两个误建 ApiCodex Profile
+
+- 修改简介：移除 `myxiaji_sfm_qq` 与 `myxiaoji_gpt` 两个误建节点，清除对应
+  凭据登记，并将各自 Profile 目录归档到 `~/.codex-api/archived-profiles`。
+- 修改原因：两个节点名称录入有误，用户明确要求删除。
+- 验证情况：重新读取 `apicodex --api-list --json`，确认两个节点均已不存在；
+  两个归档目录均存在，其他 11 个 Profile 保持登记。
+
 ### 2026-07-28：Claude Desktop 按节点隔离多实例与无感生命周期
 
 - 修改简介：`apiclaude --desktop [--api-profile NODE]` 改为隐藏 worker 管理，
@@ -236,3 +275,11 @@
 - 修改简介：API Desktop 启动成功后按官方可执行文件和精确 `user-data-dir` 自动标记主窗口为 `ChatGPT (Profile名)`；Dream Skin WPF 启动器作为统一托盘与可视化控制面，保留原三栏皮肤功能。
 - 修改原因：本机并行运行账号与多个 API Profile 时，官方窗口和托盘名称相同，难以识别和安全管理。
 - 安全边界：不修改官方 Store 包、`app.asar`、签名、认证或会话；标题失败不阻断启动，托盘退出不关闭 ChatGPT，停止与聚焦只使用已验证实例归属。
+
+
+### 2026-07-31：账号态 DeepSeek 覆盖回滚与 ApiCodex 隔离 Profile
+
+- 修改简介：将账号端 `~/.codex/config.toml` 中误写入的 DeepSeek 默认模型、provider、模型目录覆盖项移除，恢复账号态默认模型为 `gpt-5.6-sol`；新增 `~/.codex-api` 下的 `deepseek` ApiCodex Profile，模型为 `deepseek-v4-flash`，上游为 `https://api.deepseek.com/`。
+- 修改原因：DeepSeek 配置脚本直接写入账号态 `~/.codex`，导致账号端 Codex 被切到第三方 provider；需要把第三方上游迁移到 ApiCodex 隔离 Profile。
+- 安全说明：DeepSeek 密钥仅从当前用户环境变量读取并写入 DPAPI `SecureStore`，Profile 文件只保存非敏感 base URL、模型和凭据 ID；账号态回滚前已创建时间戳备份。
+- 验证情况：写入后读回账号态配置确认不再包含 `model_provider = "deepseek"`、`model_catalog_json` 或 `[model_providers.deepseek]`；读回 `profiles.json` 与 Profile `config.toml` 确认 `deepseek` Profile 存在，DPAPI 凭据可读取非空值。

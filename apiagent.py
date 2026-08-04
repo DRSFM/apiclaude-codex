@@ -24,7 +24,9 @@ from datetime import datetime, timezone
 from getpass import getpass
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 from codex_history_images import (
     RepairReport,
@@ -621,10 +623,16 @@ def write_codex_config(
     reasoning_effort: str = DEFAULT_CODEX_REASONING_EFFORT,
 ) -> None:
     home.mkdir(parents=True, exist_ok=True)
-    config = f'''model = "{model}"
+    catalog_path = home / "models.json"
+    catalog_line = ""
+    if catalog_path.is_file():
+        catalog_line = (
+            f"model_catalog_json = {toml_basic_string(catalog_path.resolve().as_posix())}\n"
+        )
+    config = f'''model = {toml_basic_string(model)}
 model_provider = "apicodex"
-model_reasoning_effort = "{reasoning_effort}"
-cli_auth_credentials_store = "keyring"
+model_reasoning_effort = {toml_basic_string(reasoning_effort)}
+{catalog_line}cli_auth_credentials_store = "keyring"
 
 [windows]
 sandbox = "unelevated"
@@ -638,7 +646,7 @@ plugins = false
 
 [model_providers.apicodex]
 name = "API Codex"
-base_url = "{base_url}"
+base_url = {toml_basic_string(base_url)}
 wire_api = "responses"
 env_key = "APICODEX_API_KEY"
 requires_openai_auth = false
@@ -647,6 +655,193 @@ requires_openai_auth = false
 conversationDetailMode = "STEPS_COMMANDS"
 '''
     (home / "config.toml").write_text(config, encoding="utf-8")
+
+
+def read_codex_model_catalog(source: Path, model: str) -> dict[str, Any]:
+    try:
+        if not source.is_file():
+            raise ValueError("the path is not a file")
+        payload = json.loads(source.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+        raise ValueError(f"invalid model catalog '{source}': {exc}") from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("models"), list):
+        raise ValueError("model catalog must be a JSON object with a 'models' list")
+    slugs = {
+        item.get("slug")
+        for item in payload["models"]
+        if isinstance(item, dict) and isinstance(item.get("slug"), str)
+    }
+    if model not in slugs:
+        raise ValueError(f"model catalog does not contain selected model slug '{model}'")
+    return payload
+
+
+def install_codex_model_catalog(home: Path, payload: dict[str, Any]) -> Path:
+    home.mkdir(parents=True, exist_ok=True)
+    target = home / "models.json"
+    temporary = home / f".models-{secrets.token_hex(8)}.tmp"
+    try:
+        temporary.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(target)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return target
+
+
+def fetch_codex_provider_models(base_url: str, api_key: str) -> list[str]:
+    parsed = urlparse(base_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("API base URL must be an absolute HTTP or HTTPS URL")
+    request = Request(
+        base_url.rstrip("/") + "/models",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with urlopen(request, timeout=20) as response:
+            raw = response.read(4 * 1024 * 1024 + 1)
+    except HTTPError as exc:
+        raise ValueError(f"model discovery returned HTTP {exc.code}") from exc
+    except URLError as exc:
+        raise ValueError(f"model discovery failed: {exc.reason}") from exc
+    except OSError as exc:
+        raise ValueError(f"model discovery failed: {exc}") from exc
+    if len(raw) > 4 * 1024 * 1024:
+        raise ValueError("model discovery response exceeded 4 MiB")
+    try:
+        payload = json.loads(raw.decode("utf-8-sig"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError("model discovery returned invalid JSON") from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+        raise ValueError("model discovery response must contain a 'data' list")
+    models: list[str] = []
+    seen: set[str] = set()
+    for item in payload["data"]:
+        if not isinstance(item, dict) or not isinstance(item.get("id"), str):
+            continue
+        model_id = clean_hidden_prefix(item["id"])
+        if (
+            not model_id
+            or len(model_id) > 512
+            or any(ord(char) < 32 for char in model_id)
+            or model_id.casefold() in seen
+        ):
+            continue
+        seen.add(model_id.casefold())
+        models.append(model_id)
+    if not models:
+        raise ValueError("model discovery returned no usable model IDs")
+    return models
+
+
+def is_codex_text_model(model: str) -> bool:
+    normalized = model.casefold()
+    non_agent_markers = (
+        "embedding",
+        "rerank",
+        "whisper",
+        "text-to-speech",
+        "dall-e",
+        "flux",
+        "sora",
+    )
+    return not any(marker in normalized for marker in non_agent_markers)
+
+
+def build_codex_provider_catalog(
+    models: list[str],
+    default_model: str,
+) -> dict[str, Any]:
+    reasoning_markers = (
+        "deepseek",
+        "think",
+        "reason",
+        "glm-5",
+        "kimi",
+        "minimax",
+        "qwen",
+        "gpt-oss",
+    )
+    selected = next(
+        (model for model in models if model.casefold() == default_model.casefold()),
+        None,
+    )
+    if selected is None:
+        raise ValueError(f"default model '{default_model}' was not discovered")
+    ordered_models = [selected, *(model for model in models if model != selected)]
+    catalog: list[dict[str, Any]] = []
+    for priority, model in enumerate(ordered_models, start=1):
+        supports_reasoning = any(
+            marker in model.casefold() for marker in reasoning_markers
+        )
+        reasoning_levels = []
+        if supports_reasoning:
+            reasoning_levels = [
+                {
+                    "effort": "high",
+                    "description": "Use the provider's high reasoning mode",
+                }
+            ]
+        catalog.append(
+            {
+                "slug": model,
+                "display_name": model,
+                "description": "Imported from the configured OpenAI-compatible provider.",
+                "default_reasoning_level": "high" if supports_reasoning else None,
+                "supported_reasoning_levels": reasoning_levels,
+                "shell_type": "shell_command",
+                "visibility": "list",
+                "supported_in_api": True,
+                "priority": priority,
+                "availability_nux": None,
+                "upgrade": None,
+                "base_instructions": (
+                    "You are Codex, a coding agent. You and the user share a workspace. "
+                    "Work carefully, use the available tools when appropriate, and complete "
+                    "the user's software task with clear verification."
+                ),
+                "supports_reasoning_summary_parameter": supports_reasoning,
+                "default_reasoning_summary": "none",
+                "support_verbosity": False,
+                "default_verbosity": None,
+                "apply_patch_tool_type": "freeform",
+                "truncation_policy": {"mode": "tokens", "limit": 10000},
+                "supports_parallel_tool_calls": True,
+                "context_window": 128000,
+                "max_context_window": 128000,
+                "effective_context_window_percent": 95,
+                "experimental_supported_tools": [],
+                "input_modalities": ["text"],
+                "supports_search_tool": False,
+            }
+        )
+    return {"models": catalog}
+
+
+def choose_codex_provider_model(models: list[str], default: str | None = None) -> str:
+    print("Available Codex-compatible models")
+    for index, model in enumerate(models, start=1):
+        suffix = " (current)" if default and model.casefold() == default.casefold() else ""
+        print(f"[{index}] {model}{suffix}")
+    prompt = "Choose default model number or name"
+    if default and any(model.casefold() == default.casefold() for model in models):
+        prompt += f" [{default}]"
+    choice = input(prompt + ": ").strip()
+    if not choice and default:
+        for model in models:
+            if model.casefold() == default.casefold():
+                return model
+    if choice.isdigit() and 1 <= int(choice) <= len(models):
+        return models[int(choice) - 1]
+    for model in models:
+        if model.casefold() == choice.casefold():
+            return model
+    raise ValueError(f"model selection '{choice}' was not found")
 
 
 def ensure_codex_keyring_store(home: Path) -> None:
@@ -821,7 +1016,15 @@ def show_codex_profiles_json(profiles: list[dict[str, Any]]) -> bool:
     return True
 
 
-def add_codex_profile(requested: str | None = None) -> int:
+def add_codex_profile(
+    requested: str | None = None,
+    *,
+    name: str | None = None,
+    base_url: str | None = None,
+    model: str | None = None,
+    reasoning_effort: str | None = None,
+    model_catalog: Path | None = None,
+) -> int:
     profiles = load_codex_profiles()
     print("Add or update a Codex API profile")
     selected = find_profile(profiles, requested) if requested else None
@@ -835,18 +1038,21 @@ def add_codex_profile(requested: str | None = None) -> int:
         )
         return 1
     default_name = str(selected.get("name")) if selected else ""
-    prompt = f"Profile name [{default_name}]: " if default_name else "Profile name: "
-    name = input(prompt).strip() or default_name
-    if not name:
-        name = "default" if not profiles else ""
-    if not name:
+    if name is None:
+        prompt = f"Profile name [{default_name}]: " if default_name else "Profile name: "
+        profile_name = input(prompt).strip() or default_name
+        if not profile_name:
+            profile_name = "default" if not profiles else ""
+    else:
+        profile_name = clean_hidden_prefix(name)
+    if not profile_name:
         print("Error: profile name cannot be empty.", file=sys.stderr)
         return 1
 
-    existing = selected or find_profile(profiles, name)
-    conflict = find_profile(profiles, name)
+    existing = selected or find_profile(profiles, profile_name)
+    conflict = find_profile(profiles, profile_name)
     if selected and conflict and conflict.get("id") != selected.get("id"):
-        print(f"Error: profile name '{name}' is already in use.", file=sys.stderr)
+        print(f"Error: profile name '{profile_name}' is already in use.", file=sys.stderr)
         return 1
     if existing and not is_safe_api_profile_home(existing):
         print(
@@ -855,13 +1061,48 @@ def add_codex_profile(requested: str | None = None) -> int:
         )
         return 1
     default_url = existing.get("baseUrl") if existing else DEFAULT_CODEX_BASE_URL
-    base_url = clean_hidden_prefix(input(f"API base URL [{default_url}]: ") or default_url).rstrip("/")
+    if base_url is None:
+        provider_url = clean_hidden_prefix(
+            input(f"API base URL [{default_url}]: ") or default_url
+        ).rstrip("/")
+    else:
+        provider_url = clean_hidden_prefix(base_url).rstrip("/")
+    if not provider_url:
+        print("Error: API base URL cannot be empty.", file=sys.stderr)
+        return 1
+
+    selected_model = clean_hidden_prefix(
+        model or str((existing or {}).get("model") or DEFAULT_CODEX_MODEL)
+    )
+    selected_reasoning_effort = clean_hidden_prefix(
+        reasoning_effort
+        or str(
+            (existing or {}).get("reasoningEffort")
+            or DEFAULT_CODEX_REASONING_EFFORT
+        )
+    )
+    if not selected_model:
+        print("Error: model cannot be empty.", file=sys.stderr)
+        return 1
+    if not selected_reasoning_effort:
+        print("Error: reasoning effort cannot be empty.", file=sys.stderr)
+        return 1
+
+    catalog_payload: dict[str, Any] | None = None
+    if model_catalog is not None:
+        try:
+            catalog_payload = read_codex_model_catalog(
+                Path(model_catalog).expanduser(), selected_model
+            )
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
 
     if existing:
         profile = existing
         home = codex_profile_home(profile)
     else:
-        base_id = slugify(name)
+        base_id = slugify(profile_name)
         profile_id = base_id
         n = 2
         while find_profile(profiles, profile_id):
@@ -870,8 +1111,8 @@ def add_codex_profile(requested: str | None = None) -> int:
         home_rel = "." if not profiles and not (CODEX_HOME / "auth.json").exists() else str(Path("profiles") / profile_id)
         profile = {
             "id": profile_id,
-            "name": name,
-            "baseUrl": base_url,
+            "name": profile_name,
+            "baseUrl": provider_url,
             "home": home_rel,
             "createdAt": now_iso(),
             "lastUsedAt": None,
@@ -889,17 +1130,51 @@ def add_codex_profile(requested: str | None = None) -> int:
     if not api_key.strip():
         print("Error: API key cannot be empty.", file=sys.stderr)
         return 1
+    cleaned_api_key = clean_hidden_prefix(api_key)
+    if model is None and model_catalog is None:
+        try:
+            discovered_models = fetch_codex_provider_models(
+                provider_url,
+                cleaned_api_key,
+            )
+            compatible_models = [
+                item for item in discovered_models if is_codex_text_model(item)
+            ]
+            excluded_count = len(discovered_models) - len(compatible_models)
+            if not compatible_models:
+                raise ValueError("model discovery found no Codex-compatible text models")
+            if excluded_count:
+                print(
+                    f"Excluded {excluded_count} non-agent model(s) from the Codex picker."
+                )
+            selected_model = choose_codex_provider_model(
+                compatible_models,
+                str((existing or {}).get("model") or "") or None,
+            )
+            catalog_payload = build_codex_provider_catalog(
+                compatible_models,
+                selected_model,
+            )
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
     credential_id = codex_credential_id(profile)
-    SECRET_STORE.set(credential_id, clean_hidden_prefix(api_key))
+    SECRET_STORE.set(credential_id, cleaned_api_key)
+    if catalog_payload is not None:
+        install_codex_model_catalog(home, catalog_payload)
     write_codex_config(
         home,
-        base_url,
-        profile.get("model") or DEFAULT_CODEX_MODEL,
-        profile.get("reasoningEffort") or DEFAULT_CODEX_REASONING_EFFORT,
+        provider_url,
+        selected_model,
+        selected_reasoning_effort,
     )
 
-    profile["name"] = name
-    profile["baseUrl"] = base_url
+    profile["name"] = profile_name
+    profile["baseUrl"] = provider_url
+    profile["model"] = selected_model
+    profile["reasoningEffort"] = selected_reasoning_effort
+    if (home / "models.json").is_file():
+        profile["modelCatalog"] = "models.json"
     profile["credentialId"] = credential_id
     profile["lastUsedAt"] = now_iso()
     updated = [profile if item.get("id") == profile.get("id") else item for item in profiles]
@@ -1275,7 +1550,7 @@ def codex_help() -> None:
     print(
         """apicodex commands
   apicodex                         Select a saved API profile, then start Codex
-  apicodex --api-add               Add or update an API profile
+  apicodex --api-add               Add/update a profile and choose fetched models
   apicodex --setup                 Alias for --api-add
   apicodex --api-list              List saved API profiles
   apicodex --api-list --json       List non-sensitive profile metadata as JSON
@@ -1329,8 +1604,14 @@ def codex_main(args: list[str]) -> int:
         return codex_share_main(args[1:])
     pass_through: list[str] = []
     requested: str | None = None
+    add_name: str | None = None
+    add_base_url: str | None = None
+    add_model: str | None = None
+    add_reasoning_effort: str | None = None
+    add_model_catalog: Path | None = None
     do_add = do_list = do_remove = do_help = do_upgrade = do_vscode = False
     do_desktop = do_json = False
+    add_mode = any(arg in ("--api-add", "--setup") for arg in args)
     repair_mode = "--repair-images" in args
     do_repair = repair_all = repair_account = repair_dry_run = False
     repair_install_task = repair_uninstall_task = False
@@ -1370,6 +1651,28 @@ def codex_main(args: list[str]) -> int:
                 print("Error: --api-profile requires a profile name.", file=sys.stderr)
                 return 1
             requested = args[i + 1]
+            i += 1
+        elif add_mode and arg in {
+            "--name",
+            "--base-url",
+            "--model",
+            "--reasoning-effort",
+            "--model-catalog",
+        }:
+            if i + 1 >= len(args):
+                print(f"Error: {arg} requires a value.", file=sys.stderr)
+                return 1
+            value = args[i + 1]
+            if arg == "--name":
+                add_name = value
+            elif arg == "--base-url":
+                add_base_url = value
+            elif arg == "--model":
+                add_model = value
+            elif arg == "--reasoning-effort":
+                add_reasoning_effort = value
+            else:
+                add_model_catalog = Path(value)
             i += 1
         else:
             pass_through.append(arg)
@@ -1516,7 +1819,14 @@ def codex_main(args: list[str]) -> int:
     if do_remove:
         return remove_codex_profile(requested)
     if do_add:
-        code = add_codex_profile(requested)
+        code = add_codex_profile(
+            requested,
+            name=add_name,
+            base_url=add_base_url,
+            model=add_model,
+            reasoning_effort=add_reasoning_effort,
+            model_catalog=add_model_catalog,
+        )
         if code != 0 or not pass_through:
             return code
 

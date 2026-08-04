@@ -71,11 +71,33 @@ apiclaude.bat
 
 ## Codex Usage
 
-Add or update a Codex API profile:
+Add or update a Codex API profile with the guided setup:
 
 ```bash
 apicodex --api-add
 ```
+
+The setup asks for the profile name, the OpenAI-compatible API base URL, and the
+API key. It then calls the provider's authenticated `GET /models` endpoint,
+filters out obvious non-agent endpoints such as image and embedding models,
+and displays a numbered model picker:
+
+```text
+Profile name: my-provider
+API base URL [https://api.openai.com/v1]: https://gateway.example/v1
+API key:
+Available Codex-compatible models
+[1] model-a
+[2] model-b
+Choose default model number or name: 2
+```
+
+The discovered text models are saved to the isolated profile's `models.json`,
+so they remain available in Codex's later model picker. The chosen model becomes
+that profile's default. The API key is never accepted as a command-line
+argument; it is read through a hidden prompt, used in memory for discovery, and
+stored in the platform secure store. Normal Codex arguments such as
+`apicodex --model MODEL` continue to pass through to Codex.
 
 List profiles:
 
