@@ -1112,9 +1112,24 @@ class ApiAgentAuthTests(unittest.TestCase):
             other_config = (
                 api_root / "profiles" / "other" / "config.toml"
             ).read_text(encoding="utf-8")
-            self.assertIn('base_url = "http://127.0.0.1:19101"', deepseek_config)
-            self.assertIn('base_url = "http://127.0.0.1:19102/v1"', prism_config)
+            self.assertIn(
+                'base_url = "http://127.0.0.1:19101/__apicodex_vision__/on-demand"',
+                deepseek_config,
+            )
+            self.assertIn(
+                'base_url = "http://127.0.0.1:19102/__apicodex_vision__/on-demand/v1"',
+                prism_config,
+            )
             self.assertIn("enable_request_compression = false", deepseek_config)
+            self.assertIn("[features.code_mode]", deepseek_config)
+            self.assertIn(
+                'direct_only_tool_namespaces = ["mcp__apicodex_vision"]',
+                deepseek_config,
+            )
+            self.assertIn("[mcp_servers.apicodex_vision]", deepseek_config)
+            self.assertIn('"--vision-mcp"', deepseek_config)
+            self.assertIn('"deepseek"', deepseek_config)
+            self.assertNotIn("gemini-secret", deepseek_config)
             self.assertIn('base_url = "https://other.test/v1"', other_config)
             catalog = json.loads(
                 (api_root / "profiles" / "deepseek" / "models.json").read_text(
@@ -1226,6 +1241,8 @@ class ApiAgentAuthTests(unittest.TestCase):
             config = (home / "config.toml").read_text(encoding="utf-8")
             self.assertIn('base_url = "https://api.deepseek.com/"', config)
             self.assertNotIn("enable_request_compression", config)
+            self.assertNotIn("mcp__apicodex_vision", config)
+            self.assertNotIn("[mcp_servers.apicodex_vision]", config)
             catalog = json.loads((home / "models.json").read_text(encoding="utf-8"))
             self.assertEqual(catalog["models"][0]["input_modalities"], ["text"])
             with self.assertRaises(KeyError):
@@ -1233,6 +1250,57 @@ class ApiAgentAuthTests(unittest.TestCase):
             with self.assertRaises(KeyError):
                 store.get("vision:gemini")
             self.assertEqual(len(saved), 1)
+
+    def test_vision_config_preserves_other_direct_tool_namespaces(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            api_root = root / ".codex-api"
+            home = api_root / "profiles" / "deepseek"
+            home.mkdir(parents=True)
+            profile = {
+                "id": "deepseek",
+                "name": "deepseek",
+                "home": "profiles/deepseek",
+                "baseUrl": "https://api.deepseek.com/",
+                "model": "deepseek-v4-flash",
+                "vision": {
+                    "enabled": True,
+                    "proxyPort": 19101,
+                },
+            }
+            apiagent.write_codex_config(
+                home,
+                "https://api.deepseek.com/",
+                "deepseek-v4-flash",
+                "high",
+            )
+            config_path = home / "config.toml"
+            config_path.write_text(
+                config_path.read_text(encoding="utf-8")
+                + '\n[features.code_mode]\n'
+                + 'direct_only_tool_namespaces = ["mcp__existing"]\n',
+                encoding="utf-8",
+            )
+
+            with patch.object(apiagent, "CODEX_HOME", api_root):
+                apiagent.configure_codex_vision_files(profile, enabled=True)
+                enabled_config = config_path.read_text(encoding="utf-8")
+                apiagent.configure_codex_vision_files(
+                    profile,
+                    enabled=False,
+                    upstream_base_url="https://api.deepseek.com/",
+                )
+
+            self.assertIn(
+                'direct_only_tool_namespaces = ["mcp__existing", '
+                '"mcp__apicodex_vision"]',
+                enabled_config,
+            )
+            disabled_config = config_path.read_text(encoding="utf-8")
+            self.assertIn(
+                'direct_only_tool_namespaces = ["mcp__existing"]',
+                disabled_config,
+            )
 
     def test_vision_setup_rolls_back_new_credentials_when_profile_files_fail(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -172,14 +172,34 @@ apicodex vision status
 apicodex vision disable deepseek prism
 ```
 
-The initial adapter uses `gemini-3.5-flash-lite`. Setup validates the key with
-a small image before changing any profile. For each selected profile, a
-loopback-only Responses proxy starts automatically when ApiCodex launches the
-CLI, VS Code, Codex Desktop, or a Claude bridge that references that profile.
-Text-only requests pass through unchanged. When a request contains inline
-Base64 images, the proxy sends the images and current user prompt to Gemini,
-replaces the image items with Gemini's plain-text visual description, and then
-forwards the request to the profile's original upstream model.
+The adapter uses `gemini-3.5-flash-lite`. Setup validates the key with a small
+image before changing any profile. For each selected Codex profile, a
+loopback-only Responses proxy and a local `apicodex_vision` MCP server start
+automatically. You can attach images directly in the Codex input box. The proxy
+removes the raw image before forwarding, computes a SHA-256 image ID, and gives
+the text-only main model an `inspect_images` tool. The main model decides
+whether existing visual observations are sufficient and calls Gemini only when
+more visual evidence is needed. A replayed history image alone never triggers
+Gemini.
+
+Visual observations are cached by the ordered image IDs, focused question,
+Gemini model, and adapter prompt version. An identical inspection reuses the
+local text cache without uploading the image to Gemini or calling Gemini. A
+different focused question may require a new call. To deliberately bypass a matching
+cache, explicitly ask the main model to inspect the original image again; the
+tool exposes a `refresh` option for that user-directed case. Raw image bytes
+remain only in the running worker's memory, while the persistent profile cache
+contains Gemini's text observations, not copies of the images.
+
+Every final answer from a vision-enabled Codex profile appends one of these
+status lines, including turns where no image or vision tool is used:
+
+- `视觉辅助：本轮已调用 Gemini`
+- `视觉辅助：本轮未调用 Gemini（复用缓存）`
+- `视觉辅助：本轮未调用 Gemini`
+
+Claude bridges that reference the same Profile retain the earlier eager image
+captioning path because they do not load the Codex Profile's MCP server.
 
 Only the selected profiles are modified. The Gemini key and each proxy control
 token are stored in the platform secure store; neither is placed in profile
@@ -191,11 +211,12 @@ not added to that Gemini request. The original image is not forwarded to the
 text-only primary model.
 
 This experimental path currently handles inline PNG, JPEG, WebP, HEIC, and HEIF
-data URLs below Gemini's combined 20 MB request limit. Start the profile through
-`apicodex` after a reboot so its local worker is available. Disabling the
-fallback restores the original upstream URL and text-only model catalog entry;
-the shared Gemini credential is removed after the last enabled profile is
-disabled.
+data URLs below Gemini's combined 20 MB request limit. No computer reboot is
+required. Close and reopen an already-running Profile after an adapter update
+so Codex reloads the local MCP tool and worker. Disabling the fallback restores
+the original upstream URL, removes the Profile-owned MCP configuration, and
+restores the text-only model catalog entry; the shared Gemini credential is
+removed after the last enabled profile is disabled.
 
 ### Repair Missing Desktop History Images
 

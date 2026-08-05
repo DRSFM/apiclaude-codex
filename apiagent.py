@@ -11,6 +11,7 @@ older local tools:
 
 from __future__ import annotations
 
+import ast
 import json
 import hashlib
 import os
@@ -41,6 +42,7 @@ from codex_vision_proxy import (
     request_gemini_vision,
     vision_proxy,
 )
+from codex_vision_mcp import run_vision_mcp
 from claude_codex_bridge import (
     BridgeEndpoint,
     BridgeStartupError,
@@ -91,6 +93,7 @@ DEFAULT_CODEX_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_CODEX_MODEL = "gpt-5.6-sol"
 DEFAULT_CODEX_REASONING_EFFORT = "high"
 DEFAULT_GEMINI_VISION_MODEL = "gemini-3.5-flash-lite"
+CODEX_VISION_TOOL_NAMESPACE = "mcp__apicodex_vision"
 GEMINI_VISION_CREDENTIAL_ID = "vision:gemini"
 CODEX_API_AUTH_MARKER = "apicodex-managed-key-in-child-environment"
 CODEX_AUTH_STORE = "keyring"
@@ -727,6 +730,7 @@ def codex_vision_proxy_base_url(
     profile: dict[str, Any],
     *,
     upstream_base_url: str | None = None,
+    on_demand: bool = False,
 ) -> str:
     vision = codex_vision_config(profile)
     if vision is None:
@@ -736,7 +740,8 @@ def codex_vision_proxy_base_url(
     )
     parsed = urlparse(base_url)
     path = parsed.path.rstrip("/")
-    return f"http://127.0.0.1:{int(vision['proxyPort'])}{path}"
+    mode_path = "/__apicodex_vision__/on-demand" if on_demand else ""
+    return f"http://127.0.0.1:{int(vision['proxyPort'])}{mode_path}{path}"
 
 
 def choose_codex_vision_port(
@@ -806,6 +811,109 @@ def _replace_toml_key_in_section(
         path.write_text(updated, encoding="utf-8")
 
 
+def _update_toml_string_array_key_in_section(
+    path: Path,
+    section: str,
+    key: str,
+    value: str,
+    *,
+    enabled: bool,
+) -> None:
+    raw = path.read_text(encoding="utf-8-sig")
+    newline = "\r\n" if "\r\n" in raw else "\n"
+    lines = raw.splitlines(keepends=True)
+    header = f"[{section}]"
+    section_index: int | None = None
+    end_index = len(lines)
+    key_index: int | None = None
+    values: list[str] = []
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            if section_index is not None:
+                end_index = index
+                break
+            if stripped == header:
+                section_index = index
+                continue
+        if section_index is not None and re.match(rf"^{re.escape(key)}\s*=", stripped):
+            key_index = index
+            literal = stripped.split("=", 1)[1].strip()
+            try:
+                parsed = ast.literal_eval(literal)
+            except (SyntaxError, ValueError) as exc:
+                raise ValueError(
+                    f"unsupported TOML array syntax for [{section}] {key}"
+                ) from exc
+            if not isinstance(parsed, list) or not all(
+                isinstance(item, str) for item in parsed
+            ):
+                raise ValueError(f"[{section}] {key} must be an array of strings")
+            values = list(dict.fromkeys(parsed))
+
+    if enabled:
+        if value not in values:
+            values.append(value)
+    else:
+        values = [item for item in values if item != value]
+
+    if section_index is None:
+        if not enabled:
+            return
+        suffix = "" if not raw or raw.endswith(("\n", "\r")) else newline
+        rendered = ", ".join(toml_basic_string(item) for item in values)
+        lines.append(f"{suffix}{header}{newline}{key} = [{rendered}]{newline}")
+    elif key_index is not None:
+        if not values:
+            del lines[key_index]
+        else:
+            rendered = ", ".join(toml_basic_string(item) for item in values)
+            lines[key_index] = f"{key} = [{rendered}]{newline}"
+    elif enabled:
+        rendered = ", ".join(toml_basic_string(item) for item in values)
+        lines.insert(end_index, f"{key} = [{rendered}]{newline}")
+
+    updated = "".join(lines)
+    if updated != raw:
+        path.write_text(updated, encoding="utf-8")
+
+
+def _replace_toml_section(
+    path: Path,
+    section: str,
+    body: list[str] | None,
+) -> None:
+    raw = path.read_text(encoding="utf-8-sig")
+    newline = "\r\n" if "\r\n" in raw else "\n"
+    lines = raw.splitlines(keepends=True)
+    start: int | None = None
+    end: int | None = None
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if not (stripped.startswith("[") and stripped.endswith("]")):
+            continue
+        current = stripped[1:-1]
+        if start is None and (current == section or current.startswith(section + ".")):
+            start = index
+            continue
+        if start is not None and not (
+            current == section or current.startswith(section + ".")
+        ):
+            end = index
+            break
+    if start is not None:
+        del lines[start : end if end is not None else len(lines)]
+    updated = "".join(lines).rstrip("\r\n")
+    if body is not None:
+        if updated:
+            updated += newline + newline
+        updated += newline.join([f"[{section}]", *body])
+    if updated:
+        updated += newline
+    if updated != raw:
+        path.write_text(updated, encoding="utf-8")
+
+
 def configure_codex_vision_files(
     profile: dict[str, Any],
     *,
@@ -825,6 +933,7 @@ def configure_codex_vision_files(
         codex_vision_proxy_base_url(
             profile,
             upstream_base_url=upstream_base_url,
+            on_demand=True,
         )
         if enabled
         else str(upstream_base_url or profile.get("baseUrl") or DEFAULT_CODEX_BASE_URL)
@@ -841,6 +950,45 @@ def configure_codex_vision_files(
         "enable_request_compression",
         "false" if enabled else None,
     )
+    _update_toml_string_array_key_in_section(
+        config_path,
+        "features.code_mode",
+        "direct_only_tool_namespaces",
+        "mcp__apicodex_vision__",
+        enabled=False,
+    )
+    _update_toml_string_array_key_in_section(
+        config_path,
+        "features.code_mode",
+        "direct_only_tool_namespaces",
+        CODEX_VISION_TOOL_NAMESPACE,
+        enabled=enabled,
+    )
+    profile_id = str(profile.get("id") or profile.get("name") or "profile")
+    if enabled:
+        args = [
+            str(Path(__file__).resolve()),
+            "codex",
+            "--vision-mcp",
+            "--api-profile",
+            profile_id,
+        ]
+        _replace_toml_section(
+            config_path,
+            "mcp_servers.apicodex_vision",
+            [
+                f"command = {toml_basic_string(sys.executable)}",
+                "args = [" + ", ".join(toml_basic_string(value) for value in args) + "]",
+                "enabled = true",
+                "required = true",
+                'enabled_tools = ["inspect_images"]',
+                'default_tools_approval_mode = "auto"',
+                "startup_timeout_sec = 10",
+                "tool_timeout_sec = 60",
+            ],
+        )
+    else:
+        _replace_toml_section(config_path, "mcp_servers.apicodex_vision", None)
 
     catalog_path = home / "models.json"
     if catalog_path.is_file():
@@ -939,6 +1087,20 @@ def ensure_codex_vision_worker(profile: dict[str, Any]) -> bool:
     return False
 
 
+def prepare_codex_vision_runtime(profile: dict[str, Any]) -> bool:
+    if codex_vision_config(profile) is None:
+        return True
+    try:
+        configure_codex_vision_files(profile, enabled=True)
+    except (OSError, UnicodeError, ValueError) as exc:
+        print(
+            f"Error: failed to prepare vision tools for '{profile.get('name')}': {exc}",
+            file=sys.stderr,
+        )
+        return False
+    return ensure_codex_vision_worker(profile)
+
+
 def run_codex_vision_worker(requested: str) -> int:
     profiles = load_codex_profiles()
     profile = find_profile(profiles, requested)
@@ -972,6 +1134,9 @@ def run_codex_vision_worker(requested: str) -> int:
             gemini_model=str(vision.get("model") or DEFAULT_GEMINI_VISION_MODEL),
             control_token=control_token,
             profile_id=profile_id,
+            observation_cache_path=(
+                codex_profile_home(profile) / "vision-observations.json"
+            ),
             port=int(vision["proxyPort"]),
         ):
             while True:
@@ -988,6 +1153,27 @@ def run_codex_vision_worker(requested: str) -> int:
         return 1
     except KeyboardInterrupt:
         return 130
+
+
+def run_codex_vision_mcp(requested: str) -> int:
+    profiles = load_codex_profiles()
+    profile = find_profile(profiles, requested)
+    if not profile or not is_safe_api_profile_home(profile):
+        return 1
+    vision = codex_vision_config(profile)
+    if vision is None:
+        return 1
+    credential_id = str(
+        vision.get("controlCredentialId")
+        or codex_vision_control_credential_id(profile)
+    )
+    try:
+        control_token = clean_hidden_prefix(SECRET_STORE.get(credential_id))
+    except (KeyError, SecureStoreError):
+        return 1
+    parsed = urlparse(codex_vision_proxy_base_url(profile))
+    endpoint_origin = f"{parsed.scheme}://{parsed.netloc}"
+    return run_vision_mcp(endpoint_origin, control_token)
 
 
 def setup_codex_vision(profiles: list[dict[str, Any]], names: list[str]) -> int:
@@ -1885,7 +2071,7 @@ def launch_codex_desktop(
         selected["credentialId"] = credential_id
         save_codex_profiles(profiles)
 
-    if not ensure_codex_vision_worker(selected):
+    if not prepare_codex_vision_runtime(selected):
         return 1
 
     profile_id = slugify(str(selected.get("id") or selected.get("name") or "default"))
@@ -2022,7 +2208,7 @@ def launch_codex_vscode(
         selected["credentialId"] = credential_id
         save_codex_profiles(profiles)
 
-    if not ensure_codex_vision_worker(selected):
+    if not prepare_codex_vision_runtime(selected):
         return 1
 
     profile_id = slugify(str(selected.get("id") or selected.get("name") or "default"))
@@ -2113,6 +2299,10 @@ def codex_main(args: list[str]) -> int:
         if len(args) != 3 or args[1] != "--api-profile":
             return 1
         return run_codex_vision_worker(args[2])
+    if args and args[0] == "--vision-mcp":
+        if len(args) != 3 or args[1] != "--api-profile":
+            return 1
+        return run_codex_vision_mcp(args[2])
     if args and args[0] == "share":
         return codex_share_main(args[1:])
     pass_through: list[str] = []
@@ -2374,7 +2564,7 @@ def codex_main(args: list[str]) -> int:
         selected["credentialId"] = credential_id
         save_codex_profiles(profiles)
 
-    if not ensure_codex_vision_worker(selected):
+    if not prepare_codex_vision_runtime(selected):
         return 1
 
     add_current_project_trust(home)

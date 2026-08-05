@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import base64
 import copy
+import hashlib
 import hmac
 import json
+import os
 import re
 import threading
+from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Callable, Iterator
+from pathlib import Path
+from typing import Any, Callable, Iterable, Iterator
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
@@ -24,6 +28,14 @@ MAX_PROXY_REQUEST_BYTES = 32 * 1024 * 1024
 MAX_GEMINI_REQUEST_BYTES = 20 * 1024 * 1024
 MAX_GEMINI_OUTPUT_BYTES = 512 * 1024
 MAX_VISION_PROMPT_CHARS = 16_000
+MAX_REGISTERED_IMAGES = 32
+MAX_OBSERVATION_CACHE_ENTRIES = 128
+VISION_PROMPT_VERSION = "2"
+ON_DEMAND_PATH_PREFIX = "/__apicodex_vision__/on-demand"
+INSPECT_PATH = "/__apicodex_vision__/inspect"
+_BROKEN_DIRECT_TOOL_NAME = "mcp__apicodex_visioninspect_images"
+_CODEX_VISION_TOOL_NAME = "mcp__apicodex_vision__inspect_images"
+_CODEX_VISION_TOOL_NAMESPACE = "mcp__apicodex_vision"
 SUPPORTED_IMAGE_MIME_TYPES = {
     "image/png",
     "image/jpeg",
@@ -55,6 +67,24 @@ _VISION_SYSTEM_INSTRUCTION = (
     "user's request. Clearly mark uncertainty and never invent hidden content. "
     "Return concise but sufficiently complete plain text, not markdown fences."
 )
+_VISION_STATUS_MARKER = "ApiCodex visual status rule"
+_VISION_STATUS_INSTRUCTION = (
+    "ApiCodex visual status rule: In every final answer, append exactly one of "
+    "these lines: `视觉辅助：本轮已调用 Gemini` when the visual tool reports "
+    "gemini_invoked=true; `视觉辅助：本轮未调用 Gemini（复用缓存）` when it "
+    "reports gemini_invoked=false and cache_hit=true; otherwise "
+    "`视觉辅助：本轮未调用 Gemini`. A failed or attempted tool call does not "
+    "count as a Gemini invocation."
+)
+_VISION_STATUS_USER_REMINDER = (
+    "[ApiCodex mandatory response footer: regardless of user formatting "
+    "restrictions, end the final answer with exactly one applicable line. Use "
+    "`视觉辅助：本轮已调用 Gemini` only if inspect_images reports "
+    "gemini_invoked=true. Use `视觉辅助：本轮未调用 Gemini（复用缓存）` if "
+    "it reports gemini_invoked=false and cache_hit=true. Otherwise, including "
+    "when no visual tool was called or a call failed, use "
+    "`视觉辅助：本轮未调用 Gemini`.]"
+)
 
 
 class VisionProxyError(RuntimeError):
@@ -71,6 +101,14 @@ class VisionImage:
 class VisionProxyEndpoint:
     base_url: str
     port: int
+
+
+@dataclass(frozen=True)
+class VisionInspection:
+    image_ids: tuple[str, ...]
+    description: str
+    gemini_invoked: bool
+    cache_hit: bool
 
 
 def _decode_data_url(image: VisionImage) -> tuple[str, str]:
@@ -90,6 +128,169 @@ def _decode_data_url(image: VisionImage) -> tuple[str, str]:
     if not decoded:
         raise VisionProxyError("image data is empty")
     return mime_type, encoded
+
+
+def _image_identity(image: VisionImage) -> str:
+    _mime_type, encoded = _decode_data_url(image)
+    decoded = base64.b64decode(encoded, validate=True)
+    return "sha256:" + hashlib.sha256(decoded).hexdigest()
+
+
+def _normalized_focus(focus: str) -> str:
+    return re.sub(r"\s+", " ", focus.strip()).casefold()
+
+
+class VisionBroker:
+    """Keep raw images in memory and persist only reusable text observations."""
+
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        model: str,
+        cache_path: Path,
+        analyze: Callable[[str, list[VisionImage]], str] | None = None,
+    ) -> None:
+        self.api_key = api_key
+        self.model = model
+        self.cache_path = cache_path
+        self._analyze = analyze or (
+            lambda prompt, images: request_gemini_vision(
+                api_key=self.api_key,
+                model=self.model,
+                user_prompt=prompt,
+                images=images,
+            )
+        )
+        self._images: OrderedDict[str, VisionImage] = OrderedDict()
+        self._observations: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        self._lock = threading.RLock()
+        self._load_cache()
+
+    def _load_cache(self) -> None:
+        try:
+            payload = json.loads(self.cache_path.read_text(encoding="utf-8-sig"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return
+        if not isinstance(payload, dict) or payload.get("version") != 1:
+            return
+        entries = payload.get("entries")
+        if not isinstance(entries, list):
+            return
+        for item in entries[-MAX_OBSERVATION_CACHE_ENTRIES:]:
+            if not isinstance(item, dict):
+                continue
+            key = item.get("key")
+            description = item.get("description")
+            image_ids = item.get("imageIds")
+            if (
+                isinstance(key, str)
+                and isinstance(description, str)
+                and description.strip()
+                and isinstance(image_ids, list)
+                and all(isinstance(value, str) for value in image_ids)
+            ):
+                self._observations[key] = item
+
+    def _save_cache(self) -> None:
+        self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "version": 1,
+            "entries": list(self._observations.values()),
+        }
+        temporary = self.cache_path.with_name(
+            f"{self.cache_path.name}.{os.getpid()}.tmp"
+        )
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        os.replace(temporary, self.cache_path)
+
+    def register_images(self, images: list[VisionImage]) -> list[str]:
+        if not images:
+            raise VisionProxyError("no images were supplied for registration")
+        image_ids: list[str] = []
+        with self._lock:
+            for image in images:
+                image_id = _image_identity(image)
+                self._images[image_id] = image
+                self._images.move_to_end(image_id)
+                image_ids.append(image_id)
+            while len(self._images) > MAX_REGISTERED_IMAGES:
+                self._images.popitem(last=False)
+        return image_ids
+
+    def _cache_key(self, image_ids: list[str], focus: str) -> str:
+        identity = json.dumps(
+            {
+                "model": self.model,
+                "promptVersion": VISION_PROMPT_VERSION,
+                "imageIds": image_ids,
+                "focus": _normalized_focus(focus),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(identity).hexdigest()
+
+    def inspect(
+        self,
+        image_ids: list[str],
+        focus: str,
+        refresh: bool = False,
+    ) -> VisionInspection:
+        if not image_ids or not all(isinstance(value, str) for value in image_ids):
+            raise VisionProxyError("image_ids must contain at least one image ID")
+        clean_focus = re.sub(r"\s+", " ", focus.strip())
+        if not clean_focus:
+            raise VisionProxyError("visual focus cannot be empty")
+        clean_focus = clean_focus[:MAX_VISION_PROMPT_CHARS]
+        key = self._cache_key(image_ids, clean_focus)
+        with self._lock:
+            cached = self._observations.get(key)
+            if cached is not None and not refresh:
+                self._observations.move_to_end(key)
+                return VisionInspection(
+                    image_ids=tuple(image_ids),
+                    description=str(cached["description"]),
+                    gemini_invoked=False,
+                    cache_hit=True,
+                )
+            missing = [image_id for image_id in image_ids if image_id not in self._images]
+            if missing:
+                raise VisionProxyError(
+                    "image data is no longer registered; ask the user to reattach: "
+                    + ", ".join(missing[:4])
+                )
+            images = [self._images[image_id] for image_id in image_ids]
+            description = self._analyze(clean_focus, images).strip()
+            if not description:
+                raise VisionProxyError("vision assistant returned an empty description")
+            self._observations[key] = {
+                "key": key,
+                "model": self.model,
+                "promptVersion": VISION_PROMPT_VERSION,
+                "imageIds": image_ids,
+                "focus": clean_focus,
+                "description": description,
+            }
+            self._observations.move_to_end(key)
+            while len(self._observations) > MAX_OBSERVATION_CACHE_ENTRIES:
+                self._observations.popitem(last=False)
+            try:
+                self._save_cache()
+            except OSError as exc:
+                raise VisionProxyError(
+                    f"failed to save the visual observation cache: {exc}"
+                ) from exc
+            return VisionInspection(
+                image_ids=tuple(image_ids),
+                description=description,
+                gemini_invoked=True,
+                cache_hit=False,
+            )
 
 
 def _read_limited(response: Any, limit: int) -> bytes:
@@ -267,6 +468,52 @@ def _latest_user_text(payload: dict[str, Any]) -> str:
     return ""
 
 
+def _add_on_demand_vision_instructions(payload: dict[str, Any]) -> bool:
+    changed = False
+    existing = payload.get("instructions")
+    if existing is None:
+        payload["instructions"] = _VISION_STATUS_INSTRUCTION
+        changed = True
+    elif not isinstance(existing, str):
+        raise VisionProxyError("Responses instructions must be a string")
+    elif _VISION_STATUS_MARKER not in existing:
+        payload["instructions"] = (
+            existing.rstrip() + "\n\n" + _VISION_STATUS_INSTRUCTION
+        )
+        changed = True
+
+    inputs = payload.get("input")
+    if isinstance(inputs, str):
+        if _VISION_STATUS_USER_REMINDER not in inputs:
+            payload["input"] = inputs.rstrip() + "\n\n" + _VISION_STATUS_USER_REMINDER
+            changed = True
+        return changed
+    if not isinstance(inputs, list):
+        return changed
+    for item in reversed(inputs):
+        if not isinstance(item, dict) or item.get("role") != "user":
+            continue
+        content = item.get("content")
+        if isinstance(content, str):
+            if _VISION_STATUS_USER_REMINDER not in content:
+                item["content"] = (
+                    content.rstrip() + "\n\n" + _VISION_STATUS_USER_REMINDER
+                )
+                changed = True
+        elif isinstance(content, list) and not any(
+            isinstance(part, dict)
+            and part.get("type") in {"input_text", "text"}
+            and _VISION_STATUS_USER_REMINDER in str(part.get("text") or "")
+            for part in content
+        ):
+            content.append(
+                {"type": "input_text", "text": _VISION_STATUS_USER_REMINDER}
+            )
+            changed = True
+        break
+    return changed
+
+
 _REMOVE = object()
 
 
@@ -299,25 +546,130 @@ def _replace_images(value: Any, description: str, inserted: list[bool]) -> Any:
     }
 
 
+def _replace_images_with_handles(
+    value: Any,
+    image_ids: Iterator[str],
+) -> Any:
+    if isinstance(value, list):
+        return [_replace_images_with_handles(item, image_ids) for item in value]
+    if not isinstance(value, dict):
+        return value
+    if value.get("type") == "input_image":
+        try:
+            image_id = next(image_ids)
+        except StopIteration as exc:
+            raise VisionProxyError("failed to match registered image handles") from exc
+        return {
+            "type": "input_text",
+            "text": (
+                "[ApiCodex image available to the local "
+                "mcp__apicodex_vision__inspect_images tool: "
+                f"{image_id}. The original image was not "
+                "sent to the main model. Call the tool only if existing visual "
+                "observations are insufficient for the user's request.]"
+            ),
+        }
+    return {
+        key: _replace_images_with_handles(child, image_ids)
+        for key, child in value.items()
+    }
+
+
 def enrich_responses_request(
     payload: dict[str, Any],
     *,
     analyze: Callable[[str, list[VisionImage]], str],
+    on_demand: bool = False,
+    register: Callable[[list[VisionImage]], list[str]] | None = None,
 ) -> tuple[dict[str, Any], bool]:
-    """Replace Responses input_image items with one model-visible description."""
+    """Replace images with either eager observations or model-callable handles."""
 
     images: list[VisionImage] = []
     _collect_input_images(payload.get("input"), images)
     if not images:
+        if on_demand:
+            cloned = copy.deepcopy(payload)
+            changed = _add_on_demand_vision_instructions(cloned)
+            return (cloned, True) if changed else (payload, False)
         return payload, False
-    description = analyze(_latest_user_text(payload), images).strip()
-    if not description:
-        raise VisionProxyError("vision assistant returned an empty description")
     cloned = copy.deepcopy(payload)
-    replaced = _replace_images(cloned, description, [False])
+    if on_demand:
+        if register is None:
+            raise VisionProxyError("on-demand vision has no image registry")
+        image_ids = register(images)
+        if len(image_ids) != len(images):
+            raise VisionProxyError("image registry returned the wrong number of handles")
+        replaced = _replace_images_with_handles(cloned, iter(image_ids))
+    else:
+        description = analyze(_latest_user_text(payload), images).strip()
+        if not description:
+            raise VisionProxyError("vision assistant returned an empty description")
+        replaced = _replace_images(cloned, description, [False])
     if not isinstance(replaced, dict):
         raise VisionProxyError("failed to rebuild the Responses request")
+    if on_demand:
+        _add_on_demand_vision_instructions(replaced)
     return replaced, True
+
+
+def _repair_direct_vision_tool_call(value: Any) -> bool:
+    changed = False
+    if isinstance(value, list):
+        for item in value:
+            changed = _repair_direct_vision_tool_call(item) or changed
+        return changed
+    if not isinstance(value, dict):
+        return False
+    if (
+        value.get("type") == "function_call"
+        and value.get("name")
+        in {_BROKEN_DIRECT_TOOL_NAME, _CODEX_VISION_TOOL_NAME}
+        and not value.get("namespace")
+    ):
+        value["name"] = "inspect_images"
+        value["namespace"] = _CODEX_VISION_TOOL_NAMESPACE
+        changed = True
+    for child in value.values():
+        changed = _repair_direct_vision_tool_call(child) or changed
+    return changed
+
+
+def _rewrite_responses_protocol_line(line: bytes) -> bytes:
+    newline = b""
+    if line.endswith(b"\r\n"):
+        line, newline = line[:-2], b"\r\n"
+    elif line.endswith(b"\n"):
+        line, newline = line[:-1], b"\n"
+    prefix = b""
+    body = line
+    if line.startswith(b"data:"):
+        prefix = b"data: "
+        body = line[5:].lstrip()
+    if not body.startswith((b"{", b"[")):
+        return line + newline
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError):
+        return line + newline
+    if not _repair_direct_vision_tool_call(payload):
+        return line + newline
+    rendered = json.dumps(
+        payload, ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+    return prefix + rendered + newline
+
+
+def rewrite_direct_vision_tool_calls(chunks: Iterable[bytes]) -> Iterator[bytes]:
+    """Restore namespace calls returned as flat names by compatible gateways."""
+
+    pending = b""
+    for chunk in chunks:
+        pending += chunk
+        while b"\n" in pending:
+            line, pending = pending.split(b"\n", 1)
+            yield _rewrite_responses_protocol_line(line + b"\n")
+    if pending:
+        yield _rewrite_responses_protocol_line(pending)
 
 
 class _VisionProxyServer(ThreadingHTTPServer):
@@ -354,9 +706,24 @@ class _VisionProxyHandler(BaseHTTPRequestHandler):
         return hmac.compare_digest(actual, expected)
 
     def _is_allowed_path(self) -> bool:
-        path = urlsplit(self.path).path
+        path = urlsplit(self._upstream_path()).path
         prefix = self.vision_server.upstream_path_prefix
         return path == prefix or path.startswith(prefix.rstrip("/") + "/")
+
+    def _is_on_demand_path(self) -> bool:
+        path = urlsplit(self.path).path
+        return path == ON_DEMAND_PATH_PREFIX or path.startswith(
+            ON_DEMAND_PATH_PREFIX + "/"
+        )
+
+    def _upstream_path(self) -> str:
+        parsed = urlsplit(self.path)
+        path = parsed.path
+        if path == ON_DEMAND_PATH_PREFIX:
+            path = "/"
+        elif path.startswith(ON_DEMAND_PATH_PREFIX + "/"):
+            path = path[len(ON_DEMAND_PATH_PREFIX) :]
+        return path + (("?" + parsed.query) if parsed.query else "")
 
     def _health(self) -> None:
         token = self.headers.get("X-ApiCodex-Vision-Control", "")
@@ -400,7 +767,11 @@ class _VisionProxyHandler(BaseHTTPRequestHandler):
             self._write_json_error(413, "request body exceeds the local size limit")
             return
         body = self.rfile.read(length)
-        if urlsplit(self.path).path.endswith("/responses"):
+        request_path = urlsplit(self.path).path
+        if request_path == INSPECT_PATH:
+            self._inspect(body)
+            return
+        if urlsplit(self._upstream_path()).path.endswith("/responses"):
             try:
                 payload = json.loads(body.decode("utf-8-sig"))
                 if not isinstance(payload, dict):
@@ -413,6 +784,8 @@ class _VisionProxyHandler(BaseHTTPRequestHandler):
                         user_prompt=prompt,
                         images=images,
                     ),
+                    on_demand=self._is_on_demand_path(),
+                    register=self.vision_server.vision_broker.register_images,
                 )
                 if changed:
                     body = json.dumps(
@@ -422,6 +795,50 @@ class _VisionProxyHandler(BaseHTTPRequestHandler):
                 self._write_json_error(502, str(exc))
                 return
         self._forward(body)
+
+    def _inspect(self, body: bytes) -> None:
+        token = self.headers.get("X-ApiCodex-Vision-Control", "")
+        if not hmac.compare_digest(token, self.vision_server.control_token):
+            self._write_json_error(401, "invalid vision worker control token")
+            return
+        try:
+            payload = json.loads(body.decode("utf-8-sig"))
+            if not isinstance(payload, dict):
+                raise VisionProxyError("vision inspection body must be an object")
+            image_ids = payload.get("image_ids")
+            focus = payload.get("focus")
+            refresh = payload.get("refresh", False)
+            if not isinstance(image_ids, list) or not all(
+                isinstance(value, str) for value in image_ids
+            ):
+                raise VisionProxyError("image_ids must be a list of strings")
+            if not isinstance(focus, str):
+                raise VisionProxyError("focus must be a string")
+            if not isinstance(refresh, bool):
+                raise VisionProxyError("refresh must be a boolean")
+            result = self.vision_server.vision_broker.inspect(
+                image_ids,
+                focus,
+                refresh,
+            )
+        except (UnicodeError, json.JSONDecodeError, VisionProxyError) as exc:
+            self._write_json_error(400, str(exc))
+            return
+        response_body = json.dumps(
+            {
+                "imageIds": list(result.image_ids),
+                "description": result.description,
+                "geminiInvoked": result.gemini_invoked,
+                "cacheHit": result.cache_hit,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(response_body)))
+        self.end_headers()
+        self.wfile.write(response_body)
 
     def _forward(self, body: bytes | None) -> None:
         if not self._is_allowed_path():
@@ -438,7 +855,7 @@ class _VisionProxyHandler(BaseHTTPRequestHandler):
         }
         headers["Authorization"] = f"Bearer {self.vision_server.upstream_api_key}"
         headers["Accept-Encoding"] = "identity"
-        target = self.vision_server.upstream_origin + self.path
+        target = self.vision_server.upstream_origin + self._upstream_path()
         request = Request(target, data=body, headers=headers, method=self.command)
         try:
             response = urlopen(request, timeout=self.vision_server.upstream_timeout)
@@ -451,15 +868,28 @@ class _VisionProxyHandler(BaseHTTPRequestHandler):
 
         try:
             self.send_response(response.status)
+            rewrite_tool_name = self._is_on_demand_path() and urlsplit(
+                self._upstream_path()
+            ).path.endswith("/responses")
             for name, value in response.headers.items():
-                if name.lower() not in _HOP_BY_HOP_HEADERS:
+                if name.lower() not in _HOP_BY_HOP_HEADERS and not (
+                    rewrite_tool_name and name.lower() == "content-length"
+                ):
                     self.send_header(name, value)
             self.send_header("Connection", "close")
             self.end_headers()
-            while True:
-                chunk = response.read(64 * 1024)
-                if not chunk:
-                    break
+
+            def response_chunks() -> Iterator[bytes]:
+                while True:
+                    chunk = response.read(64 * 1024)
+                    if not chunk:
+                        return
+                    yield chunk
+
+            chunks = response_chunks()
+            if rewrite_tool_name:
+                chunks = rewrite_direct_vision_tool_calls(chunks)
+            for chunk in chunks:
                 self.wfile.write(chunk)
                 self.wfile.flush()
         except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
@@ -478,6 +908,7 @@ def vision_proxy(
     gemini_model: str,
     control_token: str,
     profile_id: str = "test",
+    observation_cache_path: Path | None = None,
     host: str = "127.0.0.1",
     port: int = 0,
     upstream_timeout: float = 120,
@@ -502,6 +933,12 @@ def vision_proxy(
     server.control_token = control_token
     server.profile_id = profile_id
     server.upstream_timeout = upstream_timeout
+    server.vision_broker = VisionBroker(
+        api_key=gemini_api_key,
+        model=gemini_model,
+        cache_path=observation_cache_path
+        or (Path.cwd() / f".apicodex-vision-{profile_id}.json"),
+    )
     actual_port = int(server.server_address[1])
     proxy_path = "" if path_prefix == "/" else path_prefix
     endpoint = VisionProxyEndpoint(

@@ -5,6 +5,25 @@
 
 ## 协作修改记录
 
+### 2026-08-05：Gemini 视觉辅助改为主模型按需调用与哈希缓存
+
+- 修改简介：Codex 视觉 Profile 新增本地 `apicodex_vision` STDIO MCP 工具；代理对
+  图片计算 SHA-256、以内存句柄替代原图，主模型仅在现有视觉观察不足或用户明确要求
+  重看时调用 Gemini。文字观察按图片哈希、关注点、模型与提示词版本持久缓存；最终
+  答复按工具结果标注本轮 Gemini 调用、缓存复用或未调用状态。Claude 桥保留原有
+  eager 兼容路径。
+- 修改原因：Codex 会在后续纯文本轮次重放历史 `input_image`，旧代理因此反复调用
+  Gemini 并消耗日限额；应把是否补充视觉信息的判断交给主模型，同时由确定性缓存
+  阻止完全相同的识图请求重复计费。
+- 安全说明：原始图片只登记在回环 worker 内存，不新增图片落盘副本；持久缓存仅保存
+  Gemini 文字观察。MCP 命令行只含 Profile ID，控制令牌与 Gemini Key 继续仅从
+  DPAPI SecureStore 读取；代理仍不向文本主模型转发原图。
+- 验证情况：完整测试 166 项通过、2 项按集成环境跳过，`py_compile` 与
+  `git diff --check` 通过。真实 Prism `gpt-5.5` 验证首次同图调用为
+  `gemini_invoked=true/cache_hit=false`，第二次为
+  `gemini_invoked=false/cache_hit=true`；纯文本轮次不调用并输出未调用状态。
+  持久缓存经检查仅含文字观察，不含图片 data URL 或 Base64 数据。
+
 ### 2026-08-05：ApiCodex 按 Profile 配置 Gemini 视觉辅助
 
 - 修改简介：新增 `apicodex vision setup/status/disable`，允许为指定 Codex API
