@@ -228,9 +228,9 @@
                 <div id="migration-view" class="view">
                     <div class="migration-page-head">
                         <div>
-                            <p class="migration-eyebrow">CODEX CONVERSATION TRANSFER</p>
+                            <p class="migration-eyebrow">CODEX ↔ CLAUDE CODE SESSION TRANSFER</p>
                             <h1>会话迁移面板</h1>
-                            <p>在账号态与任意 ApiCodex Profile 之间创建安全、独立的会话副本。</p>
+                            <p>在 Codex 账号态、ApiCodex Profile 与 Claude Code 节点之间创建安全、独立的会话副本。</p>
                         </div>
                         <div class="migration-head-actions">
                             <span class="migration-pool-state" id="migrationPoolState">正在检查共享池</span>
@@ -239,7 +239,7 @@
                         </div>
                     </div>
 
-                    <section class="migration-workspace" aria-label="Codex 会话迁移配置">
+                    <section class="migration-workspace" aria-label="Codex 与 Claude Code 会话迁移配置">
                         <article class="migration-card migration-source-card">
                             <div class="migration-card-head">
                                 <div>
@@ -249,8 +249,8 @@
                                 <span class="migration-count" id="migrationThreadCount">0 个会话</span>
                             </div>
 
-                            <label class="migration-field-label" for="migrationSourceTarget">来源账号或 Profile</label>
-                            <select class="migration-select" id="migrationSourceTarget" aria-label="来源账号或 Profile"></select>
+                            <label class="migration-field-label" for="migrationSourceTarget">来源账号、Profile 或 Claude 节点</label>
+                            <select class="migration-select" id="migrationSourceTarget" aria-label="来源账号、Profile 或 Claude 节点"></select>
 
                             <label class="migration-search" for="migrationThreadSearch">
                                 <span>搜索</span>
@@ -276,14 +276,14 @@
                                     <input type="checkbox" checked disabled>
                                     <span>
                                         <strong>保留可见上下文</strong>
-                                        <small>用户、助手、工具结果与图片引用</small>
+                                        <small>用户、助手与图片；同运行时保留兼容工具记录</small>
                                     </span>
                                 </label>
                                 <label class="migration-policy-item">
                                     <input type="checkbox" checked disabled>
                                     <span>
                                         <strong>清除私密运行态</strong>
-                                        <small>隐藏推理、加密内容、凭据与用量</small>
+                                        <small>隐藏推理、凭据、用量与跨运行时工具原始回显</small>
                                     </span>
                                 </label>
                                 <label class="migration-policy-item">
@@ -310,7 +310,7 @@
                                     <h2>选择迁移目标</h2>
                                 </div>
                             </div>
-                            <p class="migration-card-copy">目标会自动排除当前来源，账号态和已添加的 Profile 均可选择。</p>
+                            <p class="migration-card-copy">目标会自动排除当前来源，Codex 账号/Profile 和已添加的 Claude Code 节点均可选择。</p>
                             <div class="migration-target-list" id="migrationTargetList" role="radiogroup" aria-label="迁移目标">
                                 <div class="migration-empty">正在加载可用目标</div>
                             </div>
@@ -332,7 +332,7 @@
                             <div class="migration-result" id="migrationResult">
                                 <span class="migration-result-label">准备状态</span>
                                 <strong>请选择来源会话和迁移目标</strong>
-                                <p>迁移后将在目标中生成新的线程 ID。</p>
+                                <p>迁移后将在目标运行时生成新的独立会话 ID。</p>
                             </div>
                             <button class="migration-btn primary wide" type="button" onclick="startMigration()" id="startMigrationBtnInline" disabled>创建会话副本</button>
                         </aside>

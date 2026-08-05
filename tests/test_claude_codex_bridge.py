@@ -3,10 +3,7 @@ from __future__ import annotations
 import io
 import json
 import os
-import socket
-import struct
 import tempfile
-import time
 import unittest
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -19,6 +16,153 @@ from secure_store import SecureStore
 
 
 class ClaudeCodexBridgeTests(unittest.TestCase):
+    def test_mcp_tool_name_alias_is_restored_in_responses_output(self) -> None:
+        request = json.dumps(
+            {
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "mcp__apiclaude-web__get_weather",
+                    }
+                ]
+            }
+        ).encode()
+        aliases = claude_codex_bridge._tool_name_aliases_from_request(request)
+        response = {
+            "type": "response.completed",
+            "response": {
+                "output": [
+                    {
+                        "type": "function_call",
+                        "name": "get_weather",
+                        "arguments": '{"location":"Shanghai"}',
+                    }
+                ]
+            },
+        }
+
+        changed = claude_codex_bridge._rewrite_response_tool_names(
+            response,
+            aliases,
+        )
+
+        self.assertTrue(changed)
+        self.assertEqual(
+            response["response"]["output"][0]["name"],
+            "mcp__apiclaude-web__get_weather",
+        )
+
+    def test_ambiguous_or_declared_short_tool_names_are_not_rewritten(self) -> None:
+        request = json.dumps(
+            {
+                "tools": [
+                    {"type": "function", "name": "get_weather"},
+                    {
+                        "type": "function",
+                        "name": "mcp__one__get_weather",
+                    },
+                    {
+                        "type": "function",
+                        "name": "mcp__two__search",
+                    },
+                    {
+                        "type": "function",
+                        "name": "mcp__three__search",
+                    },
+                ]
+            }
+        ).encode()
+
+        aliases = claude_codex_bridge._tool_name_aliases_from_request(request)
+
+        self.assertEqual(aliases, {})
+
+    def test_streaming_response_restores_short_mcp_tool_name(self) -> None:
+        line = (
+            b'data: {"type":"response.output_item.added","item":'
+            b'{"type":"function_call","name":"get_weather"}}\n'
+        )
+
+        rewritten = claude_codex_bridge._rewrite_sse_tool_names(
+            line,
+            {"get_weather": "mcp__apiclaude-web__get_weather"},
+        )
+
+        payload = json.loads(rewritten[5:])
+        self.assertEqual(
+            payload["item"]["name"],
+            "mcp__apiclaude-web__get_weather",
+        )
+
+    def test_cpa_stringified_tool_result_is_flattened_for_responses(self) -> None:
+        body = json.dumps(
+            {
+                "input": [
+                    {
+                        "type": "function_call_output",
+                        "call_id": "call_test",
+                        "output": (
+                            "[{'type': 'input_text', "
+                            "'text': '{\"temperature_max_c\":39.5}'}]"
+                        ),
+                    }
+                ]
+            }
+        ).encode()
+
+        normalized = json.loads(
+            claude_codex_bridge._normalize_responses_request_body(body)
+        )
+
+        self.assertEqual(
+            normalized["input"][0]["output"],
+            '{"temperature_max_c":39.5}',
+        )
+
+    def test_plain_function_output_is_left_unchanged(self) -> None:
+        body = json.dumps(
+            {
+                "input": [
+                    {
+                        "type": "function_call_output",
+                        "call_id": "call_test",
+                        "output": "ordinary tool output",
+                    }
+                ]
+            }
+        ).encode()
+
+        normalized = claude_codex_bridge._normalize_responses_request_body(body)
+
+        self.assertEqual(normalized, body)
+
+    def test_cpa_tool_result_block_list_is_flattened_for_responses(self) -> None:
+        body = json.dumps(
+            {
+                "input": [
+                    {
+                        "type": "function_call_output",
+                        "call_id": "call_test",
+                        "output": [
+                            {
+                                "type": "input_text",
+                                "text": '{"temperature_max_c":39.5}',
+                            }
+                        ],
+                    }
+                ]
+            }
+        ).encode()
+
+        normalized = json.loads(
+            claude_codex_bridge._normalize_responses_request_body(body)
+        )
+
+        self.assertEqual(
+            normalized["input"][0]["output"],
+            '{"temperature_max_c":39.5}',
+        )
+
     def test_bridge_rejects_litellm_version_with_usage_warning_bug(self) -> None:
         with (
             patch.object(
@@ -43,26 +187,6 @@ class ClaudeCodexBridgeTests(unittest.TestCase):
             ):
                 pass
 
-    def test_bridge_silences_a_client_connection_reset(self) -> None:
-        errors = io.StringIO()
-        with redirect_stderr(errors):
-            with claude_codex_bridge.litellm_bridge(
-                upstream_base_url="https://upstream.test/v1",
-                upstream_api_key="sk-test",
-                model="gpt-test",
-            ) as endpoint:
-                port = int(endpoint.base_url.rsplit(":", 1)[1])
-                client = socket.create_connection(("127.0.0.1", port), timeout=2)
-                client.setsockopt(
-                    socket.SOL_SOCKET,
-                    socket.SO_LINGER,
-                    struct.pack("hh", 1, 0),
-                )
-                client.close()
-                time.sleep(0.05)
-
-        self.assertNotIn("ConnectionResetError", errors.getvalue())
-
     def test_cpa_auth_shim_silences_a_windows_connection_abort(self) -> None:
         upstream_response = Mock()
         upstream_response.status = 200
@@ -74,9 +198,7 @@ class ClaudeCodexBridgeTests(unittest.TestCase):
         handler = object.__new__(claude_codex_bridge._AuthShimRequestHandler)
         handler.path = "/responses"
         handler.headers = {
-            "Authorization": (
-                f"Bearer {claude_codex_bridge.CPA_SHIM_API_KEY}"
-            ),
+            "Authorization": "Bearer hosted-search-token",
             "Content-Length": "2",
         }
         handler.rfile = io.BytesIO(b"{}")
@@ -89,6 +211,7 @@ class ClaudeCodexBridgeTests(unittest.TestCase):
             upstream_base_url="https://upstream.test/v1",
             upstream_api_key="sk-test",
             proxy_url="direct",
+            hosted_search_token="hosted-search-token",
         )
         handler.send_response = Mock()
         handler.send_header = Mock()
@@ -135,6 +258,11 @@ class ClaudeCodexBridgeTests(unittest.TestCase):
                     node_name="gpt-shell",
                     cpa_executable=root / "cli-proxy-api.exe",
                     proxy_url="http://127.0.0.1:7897",
+                    desktop_models=[
+                        "claude-sonnet-5",
+                        "claude-sonnet-4-6",
+                        "claude-haiku-4-5",
+                    ],
                 )
 
             self.assertEqual(code, 0)
@@ -148,6 +276,14 @@ class ClaudeCodexBridgeTests(unittest.TestCase):
                 str((root / "cli-proxy-api.exe").resolve()),
             )
             self.assertEqual(node["proxy_url"], "http://127.0.0.1:7897")
+            self.assertEqual(
+                node["desktop_models"],
+                [
+                    "claude-sonnet-5",
+                    "claude-sonnet-4-6",
+                    "claude-haiku-4-5",
+                ],
+            )
             self.assertEqual(node["isolation"], "isolated")
             self.assertEqual(node["home"], "nodes/gpt-shell")
             self.assertNotIn("token", node)
@@ -173,6 +309,10 @@ class ClaudeCodexBridgeTests(unittest.TestCase):
                     "C:/tools/cli-proxy-api.exe",
                     "--proxy-url",
                     "http://127.0.0.1:7897",
+                    "--desktop-model",
+                    "claude-sonnet-5",
+                    "--desktop-model",
+                    "claude-haiku-4-5",
                 ]
             )
 
@@ -184,6 +324,7 @@ class ClaudeCodexBridgeTests(unittest.TestCase):
             model="gpt-override",
             cpa_executable=Path("C:/tools/cli-proxy-api.exe"),
             proxy_url="http://127.0.0.1:7897",
+            desktop_models=["claude-sonnet-5", "claude-haiku-4-5"],
         )
 
     def test_bridge_run_uses_cpa_with_ephemeral_token_and_codex_secret(self) -> None:
@@ -232,6 +373,9 @@ class ClaudeCodexBridgeTests(unittest.TestCase):
                 yield apiagent.BridgeEndpoint(
                     base_url="http://127.0.0.1:45678",
                     token="ephemeral-local-token",
+                    hosted_search_url="http://127.0.0.1:45679/responses",
+                    hosted_search_token="ephemeral-search-token",
+                    hosted_search_model="gpt-test",
                 )
 
             with (
@@ -269,6 +413,15 @@ class ClaudeCodexBridgeTests(unittest.TestCase):
             self.assertEqual(env["CLAUDE_CODE_SUBAGENT_MODEL"], "gpt-test")
             self.assertNotIn("sk-upstream-secret", run.call_args.args[1])
             self.assertNotIn("OPENAI_API_KEY", env)
+            self.assertEqual(
+                env["APICLAUDE_WEB_SEARCH_BASE_URL"],
+                "http://127.0.0.1:45679/responses",
+            )
+            self.assertEqual(
+                env["APICLAUDE_WEB_SEARCH_TOKEN"],
+                "ephemeral-search-token",
+            )
+            self.assertEqual(env["APICLAUDE_WEB_SEARCH_MODEL"], "gpt-test")
             settings = json.loads(
                 (node_home / "settings.json").read_text(encoding="utf-8")
             )
@@ -278,6 +431,14 @@ class ClaudeCodexBridgeTests(unittest.TestCase):
                 settings["skillOverrides"]["claude-api"],
                 "user-invocable-only",
             )
+            mcp_config = json.loads(
+                (node_home / ".claude.json").read_text(encoding="utf-8")
+            )
+            self.assertIn("apiclaude-web", mcp_config["mcpServers"])
+            serialized_mcp = json.dumps(mcp_config)
+            self.assertNotIn("ephemeral-local-token", serialized_mcp)
+            self.assertNotIn("ephemeral-search-token", serialized_mcp)
+            self.assertNotIn("sk-upstream-secret", serialized_mcp)
 
     def test_cpa_config_never_contains_the_upstream_secret(self) -> None:
         config = claude_codex_bridge._render_cpa_config(
@@ -288,12 +449,20 @@ class ClaudeCodexBridgeTests(unittest.TestCase):
             model="gpt-5.6-sol",
             local_token="desktop-local-token",
             route_model="claude-fable-5",
+            extra_models=[
+                "claude-sonnet-5",
+                "claude-sonnet-4-6",
+                "claude-haiku-4-5",
+            ],
         )
 
         self.assertIn("codex-api-key:", config)
         self.assertIn('  - "desktop-local-token"', config)
         self.assertIn('"gpt-5.6-sol"', config)
         self.assertIn('alias: "claude-fable-5"', config)
+        self.assertIn('alias: "claude-sonnet-5"', config)
+        self.assertIn('alias: "claude-sonnet-4-6"', config)
+        self.assertIn('alias: "claude-haiku-4-5"', config)
         self.assertIn("disable-image-generation: true", config)
         self.assertNotIn("sk-upstream-secret", config)
         self.assertNotIn("upstream_api_key", config)
@@ -454,6 +623,11 @@ class ClaudeCodexBridgeTests(unittest.TestCase):
                         "model": "gpt-test",
                         "gateway": "cpa",
                         "cpa_executable": str(root / "cli-proxy-api.exe"),
+                        "desktop_models": [
+                            "claude-sonnet-5",
+                            "claude-sonnet-4-6",
+                            "claude-haiku-4-5",
+                        ],
                     }
                 },
                 "current": "gpt-shell",
@@ -466,6 +640,9 @@ class ClaudeCodexBridgeTests(unittest.TestCase):
                 yield apiagent.BridgeEndpoint(
                     base_url="http://127.0.0.1:45678",
                     token="stable-local-token",
+                    hosted_search_url="http://127.0.0.1:45679/responses",
+                    hosted_search_token="ephemeral-search-token",
+                    hosted_search_model="gpt-test",
                 )
 
             class FakeDesktopProcess:
@@ -523,13 +700,46 @@ class ClaudeCodexBridgeTests(unittest.TestCase):
             self.assertEqual(bridge_calls[0]["local_token"], "stable-local-token")
             self.assertEqual(bridge_calls[0]["listen_port"], 45678)
             self.assertEqual(bridge_calls[0]["route_model"], "claude-fable-5")
+            self.assertEqual(
+                bridge_calls[0]["extra_models"],
+                [
+                    "claude-sonnet-5",
+                    "claude-sonnet-4-6",
+                    "claude-haiku-4-5",
+                ],
+            )
             self.assertEqual(prepare.call_args.kwargs["local_token"], "stable-local-token")
+            self.assertEqual(
+                prepare.call_args.kwargs["extra_models"],
+                [
+                    "claude-sonnet-5",
+                    "claude-sonnet-4-6",
+                    "claude-haiku-4-5",
+                ],
+            )
             self.assertNotIn("sk-upstream-secret", str(prepare.call_args))
             launch.assert_called_once()
+            self.assertEqual(
+                launch.call_args.kwargs,
+                {
+                    "web_search_base_url": "http://127.0.0.1:45679/responses",
+                    "web_search_token": "ephemeral-search-token",
+                    "web_search_model": "gpt-test",
+                },
+            )
             wait_for_start.assert_called_once_with(fake_process)
             monitor.assert_called_once_with(fake_process, root / ".apiclaude-desktop" / "nodes" / "gpt-shell")
             self.assertEqual(state_writes[0]["desktopPid"], 4242)
             self.assertEqual(state_writes[0]["port"], 45678)
+            self.assertEqual(
+                state_writes[0]["models"],
+                [
+                    "claude-fable-5",
+                    "claude-sonnet-5",
+                    "claude-sonnet-4-6",
+                    "claude-haiku-4-5",
+                ],
+            )
 
     def test_bridge_node_rejects_vscode_until_gateway_lifecycle_is_persistent(self) -> None:
         config = {

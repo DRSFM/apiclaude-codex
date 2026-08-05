@@ -33,6 +33,11 @@ from codex_conversation_pool import (
     sanitize_rollout,
     semantic_snapshot_hash,
 )
+from conversation_migration import (
+    list_claude_sessions,
+    materialize_claude_session,
+    snapshot_claude_session,
+)
 
 
 @dataclass(frozen=True)
@@ -42,6 +47,9 @@ class ShareTarget:
     home: Path
     model_provider: str
     model: str | None
+    kind: str = "api"
+    node_name: str | None = None
+    isolation: str | None = None
 
 
 @dataclass
@@ -50,6 +58,9 @@ class ShareContext:
     api_root: Path
     local_state_root: Path
     load_api_profiles: Callable[[], list[dict[str, Any]]]
+    claude_account_home: Path | None = None
+    claude_nodes_root: Path | None = None
+    load_claude_nodes: Callable[[], dict[str, Any]] | None = None
     codex_command: str = "codex"
     pool_security: PoolSecurity | None = None
     app_server_factory: Callable[..., CodexAppServer] = CodexAppServer
@@ -126,6 +137,7 @@ def _targets(context: ShareContext, *, include_profiles: bool) -> list[ShareTarg
                 "openai",
             ),
             model=_parse_config_value(account_home, "model", "") or None,
+            kind="account",
         )
     ]
     if not include_profiles:
@@ -148,9 +160,82 @@ def _targets(context: ShareContext, *, include_profiles: bool) -> list[ShareTarg
                 model=str(profile.get("model") or "").strip()
                 or _parse_config_value(profile_home, "model", "")
                 or None,
+                kind="api",
             )
         )
     return targets
+
+
+def _slugify_target(value: str) -> str:
+    slug = re.sub(r"[^a-zA-Z0-9._-]+", "-", value.strip().lower()).strip(".-")
+    return slug or "node"
+
+
+def _claude_targets(context: ShareContext) -> list[ShareTarget]:
+    if (
+        context.load_claude_nodes is None
+        or context.claude_account_home is None
+        or context.claude_nodes_root is None
+    ):
+        return []
+    account_home = context.claude_account_home.resolve()
+    nodes_root = context.claude_nodes_root.resolve()
+    raw_nodes = context.load_claude_nodes()
+    if not isinstance(raw_nodes, dict):
+        raise ConversationPoolError("Claude node configuration is invalid")
+    targets: list[ShareTarget] = []
+    for name, node in raw_nodes.items():
+        if not isinstance(name, str) or not name.strip() or not isinstance(node, dict):
+            continue
+        node_name = name.strip()
+        isolation = (
+            "isolated" if node.get("isolation") == "isolated" else "shared"
+        )
+        if isolation == "shared":
+            home = account_home
+        else:
+            raw_home = node.get("home") or f"nodes/{_slugify_target(node_name)}"
+            if not isinstance(raw_home, str) or not raw_home:
+                continue
+            relative = Path(raw_home)
+            if relative.is_absolute() or ".." in relative.parts:
+                continue
+            candidate = context.claude_nodes_root / relative
+            try:
+                home = candidate.resolve()
+            except (OSError, RuntimeError, ValueError):
+                continue
+            if (
+                home != candidate.absolute()
+                or home == account_home
+                or not home.is_relative_to(nodes_root)
+                or (candidate.exists() and candidate.is_symlink())
+            ):
+                continue
+        bridge = node.get("type") == "codex_bridge"
+        model = str(node.get("model") or "").strip() or None
+        targets.append(
+            ShareTarget(
+                id=f"claude:{node_name}",
+                label=f"Claude Code: {node_name}",
+                home=home,
+                model_provider=(
+                    "claude-codex-bridge" if bridge else "anthropic"
+                ),
+                model=model,
+                kind="claude",
+                node_name=node_name,
+                isolation=isolation,
+            )
+        )
+    return targets
+
+
+def _service_targets(context: ShareContext) -> list[ShareTarget]:
+    return [
+        *_targets(context, include_profiles=True),
+        *_claude_targets(context),
+    ]
 
 
 def _select_target(args: argparse.Namespace, context: ShareContext) -> ShareTarget:
@@ -334,6 +419,10 @@ def _new_app_server(
     context: ShareContext,
     target: ShareTarget,
 ) -> CodexAppServer:
+    if target.kind not in {"account", "api"}:
+        raise ConversationPoolError(
+            f"{target.label} is not a Codex app-server target"
+        )
     return context.app_server_factory(
         target.home,
         codex_command=context.codex_command,
@@ -342,36 +431,44 @@ def _new_app_server(
 
 def _target_by_id(context: ShareContext, target_id: str) -> ShareTarget:
     requested = str(target_id or "").strip().lower()
-    for target in _targets(context, include_profiles=True):
+    for target in _service_targets(context):
         if target.id.lower() == requested:
-            if not target.home.is_dir():
+            if target.kind != "claude" and not target.home.is_dir():
                 raise ConversationPoolError(
                     f"{target.label} CODEX_HOME does not exist: {target.home}"
                 )
             return target
-    raise ConversationPoolError(f"Codex target {target_id!r} was not found")
+    raise ConversationPoolError(f"migration target {target_id!r} was not found")
 
 
 def list_share_targets(context: ShareContext) -> list[dict[str, Any]]:
-    """Return non-sensitive account/Profile choices for a migration UI."""
+    """Return non-sensitive Codex and Claude Code migration choices."""
 
     targets: list[dict[str, Any]] = []
-    for target in _targets(context, include_profiles=True):
-        kind = "account" if target.id == "account" else "api"
-        name = (
-            "Account Codex"
-            if kind == "account"
-            else target.label.removeprefix("API Profile: ")
-        )
+    for target in _service_targets(context):
+        if target.kind == "account":
+            name = "Account Codex"
+        elif target.kind == "api":
+            name = target.label.removeprefix("API Profile: ")
+        else:
+            name = target.node_name or target.label.removeprefix("Claude Code: ")
         targets.append(
             {
                 "id": target.id,
                 "name": name,
                 "label": target.label,
-                "kind": kind,
+                "kind": target.kind,
                 "modelProvider": target.model_provider,
                 "model": target.model,
-                "available": target.home.is_dir(),
+                "available": (
+                    target.home.is_dir()
+                    if target.kind != "claude"
+                    else (
+                        target.isolation == "isolated"
+                        or target.home.is_dir()
+                    )
+                ),
+                "isolation": target.isolation,
             }
         )
     return targets
@@ -386,6 +483,21 @@ def list_share_threads(
     """List safe local thread metadata without exposing rollout paths."""
 
     target = _target_by_id(context, target_id)
+    if target.kind == "claude":
+        return [
+            {
+                "id": session.id,
+                "title": session.title,
+                "preview": session.preview,
+                "status": session.status,
+                "available": session.available,
+                "cwd": str(session.cwd),
+                "createdAt": session.created_at,
+                "updatedAt": session.updated_at,
+                "model": session.model,
+            }
+            for session in list_claude_sessions(target.home, limit=limit)
+        ]
     with _new_app_server(context, target) as client:
         threads = client.list_threads(limit=max(1, min(limit, 200)))
     result: list[dict[str, Any]] = []
@@ -419,14 +531,22 @@ def copy_share_thread(
     lineage_name: str | None = None,
     cwd: Path | None = None,
     title: str | None = None,
-    message: str = "Copy conversation between Codex targets",
+    message: str = "Copy conversation between local agent runtimes",
 ) -> dict[str, Any]:
-    """Publish one idle thread and clone it into another Codex target."""
+    """Publish visible history and create an independent target session."""
 
     source = _target_by_id(context, source_target_id)
     target = _target_by_id(context, target_target_id)
-    if source.id == target.id or source.home == target.home:
-        raise ConversationPoolError("source and target Codex profiles must be different")
+    if source.id == target.id:
+        raise ConversationPoolError("source and target must be different")
+    if (
+        source.kind != "claude"
+        and target.kind != "claude"
+        and source.home == target.home
+    ):
+        raise ConversationPoolError(
+            "source and target Codex profiles must be different"
+        )
 
     state = LocalMappingStore(context.local_state_root)
     pool = ConversationPool(
@@ -438,52 +558,88 @@ def copy_share_thread(
         f"transfer-{str(thread_id)[:8]}-{uuid.uuid4().hex[:8]}"
     )
 
-    with _new_app_server(context, source) as client:
-        thread, snapshot, temporary = _sanitize_thread(
-            client,
-            source,
-            thread_id,
-        )
+    if source.kind == "claude":
+        claude_snapshot = snapshot_claude_session(source.home, thread_id)
         try:
-            source_title = _thread_title(thread)
+            source_title = claude_snapshot.session.title
             commit = pool.publish(
                 shared_name,
-                snapshot,
+                claude_snapshot.snapshot,
                 title=source_title,
                 source_target=source.id,
                 message=message,
             )
-            state.register(
-                pool_id=pool.pool_id(),
-                target_id=source.id,
-                target_home=source.home,
-                thread_id=str(thread["id"]),
-                lineage_id=commit.lineage_id,
-                lineage_name=commit.lineage_name,
-                ref_name="main",
-                base_commit=commit.id,
-                rollout_path=_validate_rollout_path(
-                    source,
-                    thread.get("path"),
-                ),
-            )
+            source_thread_id = claude_snapshot.session.id
         finally:
-            temporary.cleanup()
+            claude_snapshot.cleanup()
+    else:
+        with _new_app_server(context, source) as client:
+            thread, snapshot, temporary = _sanitize_thread(
+                client,
+                source,
+                thread_id,
+            )
+            try:
+                source_title = _thread_title(thread)
+                commit = pool.publish(
+                    shared_name,
+                    snapshot,
+                    title=source_title,
+                    source_target=source.id,
+                    message=message,
+                )
+                state.register(
+                    pool_id=pool.pool_id(),
+                    target_id=source.id,
+                    target_home=source.home,
+                    thread_id=str(thread["id"]),
+                    lineage_id=commit.lineage_id,
+                    lineage_name=commit.lineage_name,
+                    ref_name="main",
+                    base_commit=commit.id,
+                    rollout_path=_validate_rollout_path(
+                        source,
+                        thread.get("path"),
+                    ),
+                )
+                source_thread_id = str(thread["id"])
+            finally:
+                temporary.cleanup()
 
     target_cwd = Path(cwd).resolve() if cwd else Path(commit.cwd).resolve()
     target_title = title or f"[shared] {source_title}"
-    clone = _clone_commit(
-        commit=commit,
-        pool=pool,
-        state=state,
-        target=target,
-        cwd=target_cwd,
-        title=target_title,
-        context=context,
-    )
+    if target.kind == "claude":
+        clone = materialize_claude_session(
+            pool.verify_object(commit.snapshot_hash),
+            target_home=target.home,
+            cwd=target_cwd,
+            title=target_title,
+            model=target.model,
+            target_node=target.node_name or target.id.removeprefix("claude:"),
+        )
+    else:
+        clone = _clone_commit(
+            commit=commit,
+            pool=pool,
+            state=state,
+            target=target,
+            cwd=target_cwd,
+            title=target_title,
+            context=context,
+        )
     public_clone = {
         key: clone[key]
-        for key in ("threadId", "title", "cwd", "modelProvider", "model")
+        for key in (
+            "threadId",
+            "sessionId",
+            "title",
+            "cwd",
+            "modelProvider",
+            "model",
+            "node",
+            "resumeCommand",
+            "messageCount",
+        )
         if key in clone
     }
     return {
@@ -494,7 +650,7 @@ def copy_share_thread(
         "source": {
             "targetId": source.id,
             "targetLabel": source.label,
-            "threadId": str(thread["id"]),
+            "threadId": source_thread_id,
             "title": source_title,
         },
         "target": {

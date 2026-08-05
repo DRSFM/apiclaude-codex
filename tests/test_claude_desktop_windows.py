@@ -98,6 +98,11 @@ class ClaudeDesktopWindowsTests(unittest.TestCase):
                     gateway_base_url="http://127.0.0.1:41001",
                     local_token="token-a",
                     model="gpt-a",
+                    extra_models=[
+                        "claude-sonnet-5",
+                        "claude-sonnet-4-6",
+                        "claude-haiku-4-5",
+                    ],
                 )
                 claude_desktop_windows.prepare_claude_desktop_profile(
                     profile_b,
@@ -145,6 +150,33 @@ class ClaudeDesktopWindowsTests(unittest.TestCase):
             )
             self.assertEqual(gateway_a["inferenceModels"][0]["labelOverride"], "gpt-a")
             self.assertEqual(gateway_b["inferenceModels"][0]["labelOverride"], "gpt-b")
+            self.assertEqual(
+                [entry["name"] for entry in gateway_a["inferenceModels"]],
+                [
+                    "claude-fable-5",
+                    "claude-sonnet-5",
+                    "claude-sonnet-4-6",
+                    "claude-haiku-4-5",
+                ],
+            )
+            self.assertEqual(
+                gateway_a["inferenceModels"][1]["anthropicFamilyTier"],
+                "sonnet",
+            )
+            self.assertTrue(gateway_a["inferenceModels"][1]["isFamilyDefault"])
+            self.assertEqual(
+                gateway_a["inferenceModels"][2]["anthropicFamilyTier"],
+                "sonnet",
+            )
+            self.assertNotIn(
+                "isFamilyDefault",
+                gateway_a["inferenceModels"][2],
+            )
+            self.assertEqual(
+                gateway_a["inferenceModels"][3]["anthropicFamilyTier"],
+                "haiku",
+            )
+            self.assertTrue(gateway_a["inferenceModels"][3]["isFamilyDefault"])
             desktop_a = json.loads(
                 (profile_a / "claude_desktop_config.json").read_text(encoding="utf-8")
             )
@@ -156,6 +188,31 @@ class ClaudeDesktopWindowsTests(unittest.TestCase):
                 desktop_a["coworkUserFilesPath"],
                 desktop_b["coworkUserFilesPath"],
             )
+            claude_code_a = json.loads(
+                (
+                    profile_a
+                    / "claude-code-config"
+                    / ".claude.json"
+                ).read_text(encoding="utf-8")
+            )
+            claude_code_b = json.loads(
+                (
+                    profile_b
+                    / "claude-code-config"
+                    / ".claude.json"
+                ).read_text(encoding="utf-8")
+            )
+            mcp_a = claude_code_a["mcpServers"]["apiclaude-web"]
+            mcp_b = claude_code_b["mcpServers"]["apiclaude-web"]
+            self.assertEqual(mcp_a, mcp_b)
+            self.assertEqual(mcp_a["type"], "stdio")
+            self.assertTrue(Path(mcp_a["command"]).is_absolute())
+            self.assertEqual(
+                Path(mcp_a["args"][0]).name,
+                "claude_gateway_mcp.py",
+            )
+            self.assertNotIn("token-a", json.dumps(claude_code_a))
+            self.assertNotIn("token-b", json.dumps(claude_code_b))
 
     def test_profile_update_preserves_existing_preferences_and_library_entries(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -209,7 +266,7 @@ class ClaudeDesktopWindowsTests(unittest.TestCase):
                     model="gpt-test",
                 )
 
-    def test_direct_launch_sets_only_isolated_user_data_environment(self) -> None:
+    def test_direct_launch_sets_isolated_user_data_and_code_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             executable = root / "Claude.exe"
@@ -224,6 +281,7 @@ class ClaudeDesktopWindowsTests(unittest.TestCase):
                         "ANTHROPIC_API_KEY": "anthropic-secret",
                         "OPENAI_API_KEY": "openai-secret",
                         "APICODEX_API_KEY": "codex-secret",
+                        "APICLAUDE_WEB_SEARCH_TOKEN": "stale-local-token",
                     },
                 ),
                 patch.object(
@@ -235,6 +293,9 @@ class ClaudeDesktopWindowsTests(unittest.TestCase):
                 returned = claude_desktop_windows.launch_claude_desktop_process(
                     executable,
                     profile,
+                    web_search_base_url="http://127.0.0.1:43101",
+                    web_search_token="active-local-token",
+                    web_search_model="claude-fable-5",
                 )
 
             self.assertIs(returned, fake_process)
@@ -242,9 +303,25 @@ class ClaudeDesktopWindowsTests(unittest.TestCase):
             environment = popen.call_args.kwargs["env"]
             self.assertEqual(command, [str(executable.resolve())])
             self.assertEqual(environment["CLAUDE_USER_DATA_DIR"], str(profile.resolve()))
+            self.assertEqual(
+                environment["CLAUDE_CONFIG_DIR"],
+                str((profile / "claude-code-config").resolve()),
+            )
             self.assertNotIn("ANTHROPIC_API_KEY", environment)
             self.assertNotIn("OPENAI_API_KEY", environment)
             self.assertNotIn("APICODEX_API_KEY", environment)
+            self.assertEqual(
+                environment["APICLAUDE_WEB_SEARCH_BASE_URL"],
+                "http://127.0.0.1:43101",
+            )
+            self.assertEqual(
+                environment["APICLAUDE_WEB_SEARCH_TOKEN"],
+                "active-local-token",
+            )
+            self.assertEqual(
+                environment["APICLAUDE_WEB_SEARCH_MODEL"],
+                "claude-fable-5",
+            )
 
     def test_desktop_start_rejects_a_process_that_exits_immediately(self) -> None:
         process = Mock()

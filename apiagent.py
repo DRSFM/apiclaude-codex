@@ -62,6 +62,7 @@ from claude_desktop_windows import (
     find_claude_desktop_executable,
     launch_claude_desktop_process,
     monitor_claude_desktop_process,
+    prepare_claude_gateway_mcp_config,
     prepare_claude_desktop_profile,
     process_is_running,
     read_runtime_state,
@@ -88,6 +89,7 @@ CLAUDE_ARCHIVE_ROOT = CLAUDE_NODES_ROOT / "archived-nodes"
 CLAUDE_VSCODE_DATA_ROOT = HOME / ".apiclaude-vscode"
 CLAUDE_DESKTOP_DATA_ROOT = HOME / ".apiclaude-desktop" / "nodes"
 CLAUDE_DESKTOP_GATEWAY_MODEL = CLAUDE_DESKTOP_ROUTE_MODEL
+CLAUDE_DESKTOP_MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,191}$")
 SECRET_STORE = SecureStore(HOME / ".apiagent-secrets")
 DEFAULT_CODEX_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_CODEX_MODEL = "gpt-5.6-sol"
@@ -133,6 +135,9 @@ CLAUDE_PROFILE_ENV = (
     "CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING",
     "CLAUDE_CODE_ATTRIBUTION_HEADER",
     "CLAUDE_CONFIG_DIR",
+    "APICLAUDE_WEB_SEARCH_BASE_URL",
+    "APICLAUDE_WEB_SEARCH_TOKEN",
+    "APICLAUDE_WEB_SEARCH_MODEL",
 )
 
 
@@ -2283,11 +2288,18 @@ def codex_share_main(args: list[str]) -> int:
             )
         return profiles
 
+    def load_claude_nodes_read_only() -> dict[str, Any]:
+        nodes = load_claude_config().get("nodes") or {}
+        return nodes if isinstance(nodes, dict) else {}
+
     context = ShareContext(
         account_home=(HOME / ".codex").resolve(),
         api_root=CODEX_HOME.resolve(),
         local_state_root=default_local_state_root(),
         load_api_profiles=load_profiles_read_only,
+        claude_account_home=(HOME / ".claude").resolve(),
+        claude_nodes_root=CLAUDE_NODES_ROOT.resolve(),
+        load_claude_nodes=load_claude_nodes_read_only,
     )
     return main(args, context)
 
@@ -2664,6 +2676,23 @@ def claude_node_slug(name: str, node: dict[str, Any]) -> str:
     return slugify(name)
 
 
+def normalize_claude_desktop_models(values: Any) -> list[str]:
+    if values is None:
+        return []
+    if not isinstance(values, (list, tuple)):
+        raise ValueError("desktop models must be a list")
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        model = clean_hidden_prefix(str(value or "")).strip()
+        if not model or not CLAUDE_DESKTOP_MODEL_RE.fullmatch(model):
+            raise ValueError(f"invalid Claude Desktop model ID: {model!r}")
+        if model not in seen:
+            normalized.append(model)
+            seen.add(model)
+    return normalized
+
+
 def claude_node_metadata(name: str, node: dict[str, Any]) -> dict[str, Any]:
     isolation = claude_node_isolation(node)
     if isolation == "isolated" and not is_safe_claude_node_home(name, node):
@@ -2680,6 +2709,9 @@ def claude_node_metadata(name: str, node: dict[str, Any]) -> dict[str, Any]:
         "baseUrl": str(node.get("base_url") or ""),
         "codexProfile": node.get("codex_profile"),
         "model": node.get("model"),
+        "desktopModels": normalize_claude_desktop_models(
+            node.get("desktop_models")
+        ),
         "isolation": isolation,
         "configDir": config_dir,
         "vscodeData": str((CLAUDE_VSCODE_DATA_ROOT / claude_node_slug(name, node)).resolve()),
@@ -2851,6 +2883,7 @@ def add_claude_codex_bridge(
     model: str | None = None,
     cpa_executable: Path | None = None,
     proxy_url: str | None = None,
+    desktop_models: list[str] | None = None,
 ) -> int:
     profiles = load_codex_profiles()
     profile = find_profile(profiles, clean_hidden_prefix(codex_profile_name))
@@ -2911,6 +2944,20 @@ def add_claude_codex_bridge(
     cleaned_proxy_url = clean_hidden_prefix(proxy_url or "")
     if cleaned_proxy_url:
         node["proxy_url"] = cleaned_proxy_url
+    requested_desktop_models = (
+        desktop_models
+        if desktop_models is not None
+        else (existing or {}).get("desktop_models")
+    )
+    try:
+        normalized_desktop_models = normalize_claude_desktop_models(
+            requested_desktop_models
+        )
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    if normalized_desktop_models:
+        node["desktop_models"] = normalized_desktop_models
     if existing and existing.get("home"):
         node["home"] = existing["home"]
     else:
@@ -2928,7 +2975,8 @@ def add_claude_codex_bridge(
     save_claude_config(config)
     print(
         f"Saved isolated Claude bridge node '{name}' from Codex profile "
-        f"'{profile.get('name')}' (model={selected_model})."
+        f"'{profile.get('name')}' (model={selected_model}, "
+        f"desktop_models={len(normalized_desktop_models)})."
     )
     return 0
 
@@ -3057,7 +3105,8 @@ def run_claude_codex_bridge_node(
         return 1
     try:
         ensure_claude_codex_bridge_settings(home)
-    except (OSError, UnicodeError, ValueError) as exc:
+        prepare_claude_gateway_mcp_config(home)
+    except (ClaudeDesktopError, OSError, UnicodeError, ValueError) as exc:
         print(
             f"Error: failed to configure bridge node settings for '{name}': {exc}",
             file=sys.stderr,
@@ -3110,6 +3159,18 @@ def run_claude_codex_bridge_node(
                 "CLAUDE_CODE_ATTRIBUTION_HEADER": "0",
                 "CLAUDE_CONFIG_DIR": str(home),
             }
+            if (
+                endpoint.hosted_search_url
+                and endpoint.hosted_search_token
+                and endpoint.hosted_search_model
+            ):
+                env.update(
+                    {
+                        "APICLAUDE_WEB_SEARCH_BASE_URL": endpoint.hosted_search_url,
+                        "APICLAUDE_WEB_SEARCH_TOKEN": endpoint.hosted_search_token,
+                        "APICLAUDE_WEB_SEARCH_MODEL": endpoint.hosted_search_model,
+                    }
+                )
             config["current"] = name
             node["lastUsedAt"] = now_iso()
             save_claude_config(config)
@@ -3201,6 +3262,12 @@ def run_claude_desktop_worker(
         if resolved is None:
             return 1
         node, profile, model, cpa_executable, upstream_base_url = resolved
+        try:
+            desktop_models = normalize_claude_desktop_models(
+                node.get("desktop_models")
+            )
+        except ValueError as exc:
+            raise ClaudeDesktopError(str(exc)) from exc
         profile_dir = claude_desktop_profile_home(name, node)
         if profile_dir is None:
             raise ClaudeDesktopError("refusing an unsafe Claude Desktop profile path")
@@ -3238,6 +3305,7 @@ def run_claude_desktop_worker(
                 listen_port=port,
                 local_token=local_token,
                 route_model=CLAUDE_DESKTOP_GATEWAY_MODEL,
+                extra_models=desktop_models,
             ) as endpoint:
                 prepare_claude_desktop_profile(
                     profile_dir,
@@ -3246,10 +3314,14 @@ def run_claude_desktop_worker(
                     local_token=local_token,
                     model=model,
                     route_model=CLAUDE_DESKTOP_GATEWAY_MODEL,
+                    extra_models=desktop_models,
                 )
                 desktop_process = launch_claude_desktop_process(
                     executable,
                     profile_dir,
+                    web_search_base_url=endpoint.hosted_search_url,
+                    web_search_token=endpoint.hosted_search_token,
+                    web_search_model=endpoint.hosted_search_model,
                 )
                 wait_for_claude_desktop_start(desktop_process)
                 endpoint_port = urlparse(endpoint.base_url).port
@@ -3261,6 +3333,10 @@ def run_claude_desktop_worker(
                         "schemaVersion": 1,
                         "node": name,
                         "model": model,
+                        "models": [
+                            CLAUDE_DESKTOP_GATEWAY_MODEL,
+                            *desktop_models,
+                        ],
                         "workerPid": os.getpid(),
                         "desktopPid": desktop_process.pid,
                         "port": endpoint_port,
@@ -3271,7 +3347,8 @@ def run_claude_desktop_worker(
                 )
                 print(
                     f"Claude Desktop worker ready for '{name}' "
-                    f"(model={model}, port={endpoint_port}, pid={desktop_process.pid}).",
+                    f"(model={model}, desktop_models={len(desktop_models)}, "
+                    f"port={endpoint_port}, pid={desktop_process.pid}).",
                     flush=True,
                 )
                 try:
@@ -3670,6 +3747,7 @@ def claude_help() -> None:
                                    shared:   default ~/.claude (legacy behavior)
   apiclaude bridge CODEX_PROFILE [--name NODE] [--model MODEL]
                    --cpa-exe PATH [--proxy-url URL]
+                   [--desktop-model MODEL]...
                                    Create/update an isolated CLI prototype node
                                    backed by an existing Codex API profile via CPA
 
@@ -3685,7 +3763,7 @@ def claude_bridge_main(args: list[str]) -> int:
         print(
             "Usage: apiclaude bridge CODEX_PROFILE "
             "[--name NODE] [--model MODEL] --cpa-exe PATH "
-            "[--proxy-url URL]"
+            "[--proxy-url URL] [--desktop-model MODEL]..."
         )
         return 0 if args else 1
 
@@ -3694,10 +3772,17 @@ def claude_bridge_main(args: list[str]) -> int:
     model: str | None = None
     cpa_executable: Path | None = None
     proxy_url: str | None = None
+    desktop_models: list[str] = []
     i = 1
     while i < len(args):
         option = args[i]
-        if option not in ("--name", "--model", "--cpa-exe", "--proxy-url"):
+        if option not in (
+            "--name",
+            "--model",
+            "--cpa-exe",
+            "--proxy-url",
+            "--desktop-model",
+        ):
             print(f"Error: unexpected bridge argument: {option}", file=sys.stderr)
             return 1
         if i + 1 >= len(args):
@@ -3710,8 +3795,10 @@ def claude_bridge_main(args: list[str]) -> int:
             model = value
         elif option == "--cpa-exe":
             cpa_executable = Path(value)
-        else:
+        elif option == "--proxy-url":
             proxy_url = value
+        else:
+            desktop_models.append(value)
         i += 2
 
     config = load_claude_config()
@@ -3722,6 +3809,7 @@ def claude_bridge_main(args: list[str]) -> int:
         model=model,
         cpa_executable=cpa_executable,
         proxy_url=proxy_url,
+        desktop_models=desktop_models or None,
     )
 
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import asyncio
 import importlib.util
 import json
@@ -17,7 +18,7 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib import metadata as importlib_metadata
 from pathlib import Path
-from typing import Any, AsyncIterator, Iterator
+from typing import Any, AsyncIterator, Iterator, Sequence
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 from urllib.parse import urlsplit
@@ -57,6 +58,9 @@ class BridgeStartupError(RuntimeError):
 class BridgeEndpoint:
     base_url: str
     token: str
+    hosted_search_url: str | None = None
+    hosted_search_token: str | None = None
+    hosted_search_model: str | None = None
 
 
 class _AuthShimServer(ThreadingHTTPServer):
@@ -69,11 +73,13 @@ class _AuthShimServer(ThreadingHTTPServer):
         upstream_base_url: str,
         upstream_api_key: str,
         proxy_url: str | None,
+        hosted_search_token: str,
     ) -> None:
         super().__init__(server_address, _AuthShimRequestHandler)
         self.upstream_base_url = upstream_base_url.rstrip("/")
         self.upstream_api_key = upstream_api_key
         self.proxy_url = proxy_url
+        self.hosted_search_token = hosted_search_token
 
 
 class _AuthShimRequestHandler(BaseHTTPRequestHandler):
@@ -95,10 +101,13 @@ class _AuthShimRequestHandler(BaseHTTPRequestHandler):
             self.send_error(404)
             return
         authorization = self.headers.get("Authorization", "")
-        if not secrets.compare_digest(
+        authorized = secrets.compare_digest(
+            authorization, f"Bearer {CPA_SHIM_API_KEY}"
+        ) or secrets.compare_digest(
             authorization,
-            f"Bearer {CPA_SHIM_API_KEY}",
-        ):
+            f"Bearer {getattr(self.server, 'hosted_search_token', '')}",
+        )
+        if not authorized:
             self.send_error(401)
             return
 
@@ -110,6 +119,8 @@ class _AuthShimRequestHandler(BaseHTTPRequestHandler):
         except ValueError as exc:
             self.send_error(400, str(exc))
             return
+        body = _normalize_responses_request_body(body)
+        tool_name_aliases = _tool_name_aliases_from_request(body)
 
         target_url = (
             f"{self.server.upstream_base_url}{request_path.path}"
@@ -121,6 +132,7 @@ class _AuthShimRequestHandler(BaseHTTPRequestHandler):
             if name.lower() not in _HOP_BY_HOP_HEADERS
         }
         headers.update(CODEX_COMPATIBLE_HEADERS)
+        headers["Accept-Encoding"] = "identity"
         headers["Authorization"] = f"Bearer {self.server.upstream_api_key}"
         upstream_request = urllib_request.Request(
             target_url,
@@ -157,12 +169,44 @@ class _AuthShimRequestHandler(BaseHTTPRequestHandler):
                     self.send_header(name, value)
             self.send_header("Connection", "close")
             self.end_headers()
-            while True:
-                chunk = upstream_response.read(64 * 1024)
-                if not chunk:
-                    break
-                self.wfile.write(chunk)
+            content_type = upstream_response.headers.get("Content-Type", "")
+            if tool_name_aliases and "text/event-stream" in content_type.lower():
+                while True:
+                    line = upstream_response.readline()
+                    if not line:
+                        break
+                    self.wfile.write(
+                        _rewrite_sse_tool_names(line, tool_name_aliases)
+                    )
+                    self.wfile.flush()
+            elif tool_name_aliases and "application/json" in content_type.lower():
+                response_body = upstream_response.read(64 * 1024 * 1024 + 1)
+                if len(response_body) > 64 * 1024 * 1024:
+                    raise ValueError("upstream response exceeded 64 MiB")
+                try:
+                    response_json = json.loads(response_body)
+                except (UnicodeDecodeError, ValueError):
+                    self.wfile.write(response_body)
+                else:
+                    _rewrite_response_tool_names(
+                        response_json,
+                        tool_name_aliases,
+                    )
+                    self.wfile.write(
+                        json.dumps(
+                            response_json,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    )
                 self.wfile.flush()
+            else:
+                while True:
+                    chunk = upstream_response.read(64 * 1024)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
         except _CLIENT_DISCONNECT_ERRORS:
             return
         finally:
@@ -453,30 +497,44 @@ def _render_cpa_config(
     model: str,
     local_token: str,
     route_model: str | None = None,
+    extra_models: Sequence[str] | None = None,
 ) -> str:
     advertised_model = route_model or model
-    return "\n".join(
-        (
-            f"host: {_yaml_string(host)}",
-            f"port: {port}",
-            f"auth-dir: {_yaml_string(auth_dir)}",
-            "api-keys:",
-            f"  - {_yaml_string(local_token)}",
-            "debug: false",
-            "logging-to-file: false",
-            "request-log: false",
-            "usage-statistics-enabled: false",
-            "disable-image-generation: true",
-            "codex-api-key:",
-            f"  - api-key: {_yaml_string(CPA_SHIM_API_KEY)}",
-            f"    base-url: {_yaml_string(shim_base_url)}",
-            "    models:",
-            f"      - name: {_yaml_string(model)}",
-            f"        alias: {_yaml_string(advertised_model)}",
-            "        force-mapping: true",
-            "",
+    routes = [(model, advertised_model)]
+    seen_aliases = {advertised_model}
+    for extra_model in extra_models or ():
+        cleaned = str(extra_model).strip()
+        if not cleaned or cleaned in seen_aliases:
+            continue
+        routes.append((cleaned, cleaned))
+        seen_aliases.add(cleaned)
+
+    lines = [
+        f"host: {_yaml_string(host)}",
+        f"port: {port}",
+        f"auth-dir: {_yaml_string(auth_dir)}",
+        "api-keys:",
+        f"  - {_yaml_string(local_token)}",
+        "debug: false",
+        "logging-to-file: false",
+        "request-log: false",
+        "usage-statistics-enabled: false",
+        "disable-image-generation: true",
+        "codex-api-key:",
+        f"  - api-key: {_yaml_string(CPA_SHIM_API_KEY)}",
+        f"    base-url: {_yaml_string(shim_base_url)}",
+        "    models:",
+    ]
+    for upstream_model, alias in routes:
+        lines.extend(
+            (
+                f"      - name: {_yaml_string(upstream_model)}",
+                f"        alias: {_yaml_string(alias)}",
+                "        force-mapping: true",
+            )
         )
-    )
+    lines.append("")
+    return "\n".join(lines)
 
 
 def _reserve_loopback_port() -> int:
@@ -491,6 +549,148 @@ def _redact_lines(lines: Iterator[str], secrets_to_hide: tuple[str, ...]) -> str
         if secret:
             output = output.replace(secret, "<redacted>")
     return output
+
+
+def _tool_name_aliases_from_request(body: bytes) -> dict[str, str]:
+    """Map a unique shortened MCP tool name back to its declared full name."""
+
+    try:
+        request = json.loads(body)
+    except (TypeError, ValueError):
+        return {}
+    if not isinstance(request, dict):
+        return {}
+    tools = request.get("tools")
+    if not isinstance(tools, list):
+        return {}
+
+    declared_names = {
+        str(tool.get("name") or "")
+        for tool in tools
+        if isinstance(tool, dict) and str(tool.get("name") or "")
+    }
+    candidates: dict[str, set[str]] = {}
+    for full_name in declared_names:
+        if not full_name.startswith("mcp__") or "__" not in full_name[5:]:
+            continue
+        short_name = full_name.rsplit("__", 1)[-1]
+        if not short_name or short_name == full_name:
+            continue
+        candidates.setdefault(short_name, set()).add(full_name)
+
+    aliases: dict[str, str] = {}
+    for short_name, full_names in candidates.items():
+        if len(full_names) == 1 and short_name not in declared_names:
+            aliases[short_name] = next(iter(full_names))
+    return aliases
+
+
+def _flatten_cpa_function_output(output: Any) -> str | None:
+    """Extract text from CPA's Anthropic tool-result block list representation."""
+
+    parsed: Any = output
+    if isinstance(output, str):
+        candidate = output.strip()
+        if (
+            len(candidate) > 2 * 1024 * 1024
+            or not candidate.startswith("[")
+            or "input_text" not in candidate
+        ):
+            return None
+        try:
+            parsed = json.loads(candidate)
+        except ValueError:
+            try:
+                parsed = ast.literal_eval(candidate)
+            except (MemoryError, RecursionError, SyntaxError, ValueError):
+                return None
+    if not isinstance(parsed, list) or not parsed:
+        return None
+    texts: list[str] = []
+    for block in parsed:
+        if (
+            not isinstance(block, dict)
+            or block.get("type") not in {"input_text", "output_text", "text"}
+            or not isinstance(block.get("text"), str)
+        ):
+            return None
+        texts.append(block["text"])
+    return "\n".join(texts)
+
+
+def _normalize_responses_function_outputs(value: Any) -> bool:
+    """Flatten CPA block arrays before forwarding function output to Responses."""
+
+    changed = False
+    if isinstance(value, dict):
+        if value.get("type") == "function_call_output":
+            flattened = _flatten_cpa_function_output(value.get("output"))
+            if flattened is not None:
+                value["output"] = flattened
+                changed = True
+        for child in value.values():
+            if _normalize_responses_function_outputs(child):
+                changed = True
+    elif isinstance(value, list):
+        for child in value:
+            if _normalize_responses_function_outputs(child):
+                changed = True
+    return changed
+
+
+def _normalize_responses_request_body(body: bytes) -> bytes:
+    try:
+        request = json.loads(body)
+    except (UnicodeDecodeError, ValueError):
+        return body
+    if not _normalize_responses_function_outputs(request):
+        return body
+    return json.dumps(
+        request,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _rewrite_response_tool_names(value: Any, aliases: dict[str, str]) -> bool:
+    """Restore MCP names in Responses function-call output objects in place."""
+
+    changed = False
+    if isinstance(value, dict):
+        if value.get("type") == "function_call":
+            name = value.get("name")
+            replacement = aliases.get(name) if isinstance(name, str) else None
+            if replacement:
+                value["name"] = replacement
+                changed = True
+        for child in value.values():
+            if _rewrite_response_tool_names(child, aliases):
+                changed = True
+    elif isinstance(value, list):
+        for child in value:
+            if _rewrite_response_tool_names(child, aliases):
+                changed = True
+    return changed
+
+
+def _rewrite_sse_tool_names(line: bytes, aliases: dict[str, str]) -> bytes:
+    if not aliases or not line.startswith(b"data:"):
+        return line
+    raw_payload = line[5:].strip()
+    if not raw_payload or raw_payload == b"[DONE]":
+        return line
+    try:
+        payload = json.loads(raw_payload)
+    except (UnicodeDecodeError, ValueError):
+        return line
+    if not _rewrite_response_tool_names(payload, aliases):
+        return line
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return b"data: " + encoded + (b"\r\n" if line.endswith(b"\r\n") else b"\n")
 
 
 def _wait_for_cpa(
@@ -539,6 +739,7 @@ def cpa_bridge(
     listen_port: int | None = None,
     local_token: str | None = None,
     route_model: str | None = None,
+    extra_models: Sequence[str] | None = None,
 ) -> Iterator[BridgeEndpoint]:
     executable = Path(cpa_executable).expanduser().resolve()
     if not executable.is_file():
@@ -548,6 +749,7 @@ def cpa_bridge(
     bridge_token = local_token or secrets.token_urlsafe(32)
     if not bridge_token:
         raise BridgeStartupError("CPA local token cannot be empty")
+    hosted_search_token = secrets.token_urlsafe(32)
 
     try:
         shim = _AuthShimServer(
@@ -555,6 +757,7 @@ def cpa_bridge(
             upstream_base_url=upstream_base_url,
             upstream_api_key=upstream_api_key,
             proxy_url=proxy_url,
+            hosted_search_token=hosted_search_token,
         )
     except OSError as exc:
         raise BridgeStartupError(f"Failed to bind the CPA auth shim: {exc}") from exc
@@ -585,6 +788,7 @@ def cpa_bridge(
                     model=model,
                     local_token=bridge_token,
                     route_model=route_model,
+                    extra_models=extra_models,
                 ),
                 encoding="utf-8",
             )
@@ -633,6 +837,9 @@ def cpa_bridge(
             yield BridgeEndpoint(
                 base_url=cpa_base_url,
                 token=bridge_token,
+                hosted_search_url=f"{shim_base_url}/responses",
+                hosted_search_token=hosted_search_token,
+                hosted_search_model=model,
             )
     finally:
         if process is not None and process.poll() is None:
@@ -644,6 +851,8 @@ def cpa_bridge(
                 process.wait(timeout=5)
         if log_thread is not None:
             log_thread.join(timeout=1)
+        if process is not None and process.stdout is not None:
+            process.stdout.close()
         shim.shutdown()
         shim.server_close()
         shim_thread.join(timeout=5)

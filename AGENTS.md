@@ -82,6 +82,93 @@
 - 验证情况：重新读取 `apicodex --api-list --json`，确认两个节点均已不存在；
   两个归档目录均存在，其他 11 个 Profile 保持登记。
 
+### 2026-07-31：LiteLLM 旧桥移出默认测试集
+
+- 修改简介：将会真实启动 LiteLLM 的客户端断流用例迁入已有的
+  `APICLAUDE_LITELLM_INTEGRATION=1` 可选集成测试类；默认单元测试仍保留
+  LiteLLM 最低版本与错误路径验证，但不再要求本机安装该可选依赖。
+- 修改原因：当前新建桥节点均使用 CPA，LiteLLM 只服务于旧节点兼容，不应让
+  未安装可选依赖的日常全量测试产生错误。
+- 验证情况：`python -m unittest discover -s tests -v` 运行 159 项，156 项
+  通过、3 项可选集成测试跳过且无错误；迁移后的 LiteLLM 断流用例在默认环境
+  明确跳过。Python 编译检查与 `git diff --check` 通过；当前环境未安装
+  `pytest`，因此未运行该入口。
+
+### 2026-07-31：ApiClaude 托管 WebSearch 优先与 zzzcoding Fable 节点
+
+- 修改简介：`apiclaude-web` 的 `web_search` 改为优先通过节点回环
+  认证转发器调用 Responses 托管搜索，仅实际返回 `web_search_call`
+  时判定成功；上游不支持、静默忽略或连接失败时自动降级为
+  Bing RSS。普通 Claude Code 桥与 Desktop 桥共用该 MCP。本机新增
+  `codex-zzzcoding` 隔离节点，将 `gpt-5.6-sol` 映射为
+  `claude-fable-5`，并部署当前仓库运行文件到 `C:\tools`。
+- 修改原因：GPT Responses 上游支持 Codex 同款托管 `web_search`时，
+  Claude Code 应优先获得结构化来源与更完整的联网能力；Prism 实测会
+  对该工具返回普通消息，不能将 HTTP 200 误判为搜索成功，因此仍需
+  保留无密钥 Bing 降级链路。
+- 安全说明：上游 API Key 仍只从 DPAPI 进入内存转发器；搜索子通道
+  使用独立随机回环令牌，仅经 Claude 子进程环境传递，不写入 MCP 配置、
+  命令行、运行状态或日志。部署前备份旧文件，节点目录继续使用私有
+  ACL，未读写普通 `~/.claude` 账号态。
+- 验证情况：zzzcoding / `gpt-5.6-sol` 直连 Responses 真实产生
+  `web_search_call`，经转发器搜索返回 25 个来源；Prism / `gpt-5.5`
+  无搜索事件并正确降级。真实 Claude Code 中 zzzcoding Fable 调用 MCP
+  后返回 `backend=hosted`，Prism Sonnet 5 返回 `backend=bing_rss`。聚焦
+  24 项通过，CPA 二进制集成测试 1 项通过且无 `ResourceWarning`；全量
+  `unittest` 运行 159 项，156 项通过、2 项按集成环境跳过，唯一错误仍为
+  本机未安装可选 LiteLLM 的旧桥测试。`py_compile`、`git diff --check`、
+  部署 SHA-256、Fable 目录映射、回环端口、私有 ACL 和无凭据日志均通过。
+
+### 2026-07-31：Codex ↔ Claude Code 双向会话迁移
+
+- 修改简介：将此前一次性的 Claude Fable 5 故障会话恢复固化到现有会话迁移
+  流程；新增 Claude Code 会话发现、安全快照与可续聊 transcript 物化，Web 面板
+  可在 Codex 账号态、任意 ApiCodex Profile 和已添加的 Claude 节点之间选择来源
+  与目标，覆盖 Codex→Codex、Claude→Codex、Codex→Claude 和 Claude→Claude。
+  每次迁移均生成独立会话 ID，Claude 目标额外返回可直接使用的 `--resume` 命令。
+- 修改原因：Claude Code 上游 API 中断后不应再依赖手工查找、转换会话 ID；
+  同一套本机安全迁移入口也应支持将 Codex 可见上下文交给 Claude Code 继续处理。
+- 安全说明：源会话保持不变；跨运行时仅迁移可见用户/助手消息与用户图片，清除
+  隐藏推理、签名、密文、凭据、用量及不可移植的原始工具协议。目标目录做边界
+  校验，Claude transcript 以原子方式安装并审计父链，Codex 继续只经 app-server
+  创建线程，不直接修改数据库。
+- 验证情况：新增转换器、服务与 Web 安全回归，聚焦 14 项通过；全量
+  `unittest` 运行 154 项，151 项通过、2 项按集成环境跳过，唯一错误仍为本机
+  未安装可选 LiteLLM 的旧桥兼容测试。真实 Codex→Claude 生成的新会话已被
+  Claude CLI `--resume` 接受（Prism 上游在长上下文续答时超时），随后
+  Claude→Codex 反向克隆并由 Codex app-server 读回完整可见历史。浏览器以本机
+  真实配置确认 Claude 来源、Codex/Claude 目标和“待继续”状态均正确，控制台
+  无 warning/error；`py_compile`、前端语法检查与聚焦测试通过。
+
+### 2026-07-31：本机 ApiClaude Desktop、Prism 原生多模型与联网工具
+
+- 修改简介：将 Windows PATH 中 `C:\tools` 的旧版启动器替换为当前仓库版本，
+  安装 Anthropic 官方 Claude Desktop MSIX `1.24012.9.0` 与固定版
+  CLIProxyAPI `7.2.101`，并从现有 Codex Profile 建立 `codex-muyuan` 和
+  `codex-prism` 两个隔离 Desktop 桥节点。CPA 与 Desktop 配置新增可重复的
+  `--desktop-model` 原名映射，Prism 节点加入 `claude-sonnet-5`、
+  `claude-sonnet-4-6` 和 `claude-haiku-4-5`，同时保留 GPT 兼容路由。Desktop
+  Code 再使用节点级 `CLAUDE_CONFIG_DIR` 自动加载无密钥 `apiclaude-web` MCP，
+  提供 Bing RSS 搜索和 Open-Meteo 天气；认证转发器兼容还原 Prism 缩短的唯一
+  MCP 工具名，并将 CPA 工具结果块规范化为 Responses 字符串。
+- 修改原因：本机原启动器尚不支持 `--desktop` 生命周期命令，且当前用户未注册
+  Claude Desktop 包、没有可用 CPA 二进制，无法使用仓库已有的多实例桥接能力；
+  Prism 又已提供可经 Responses 调用的原生 Claude 模型，需要让同一隔离窗口按
+  Sonnet/Haiku 家族显示并选择这些上游模型，而不是固定映射到单个 GPT 模型。
+  Claude Code 对 `gateway` 供应方明确禁用内置 WebSearch，且 Prism 会缩短 MCP
+  调用名、CPA 会输出块数组，需在不修改签名程序的前提下补齐本地联网和工具循环。
+- 安全说明：旧程序与节点配置均先做可恢复备份；上游凭据继续只从 DPAPI 进入
+  内存认证转发器，节点目录 ACL 仅允许当前用户、SYSTEM 和管理员，网关只监听
+  `127.0.0.1`；联网 MCP 不保存凭据，节点配置不读取普通 `~/.claude` 账号态，
+  部署和验证输出未包含本地令牌或上游密钥。
+- 验证情况：部署文件与仓库 SHA-256 一致且 `py_compile`、`git diff --check`
+  通过；本次新增 11 项联网/协议兼容测试全部通过。全量 `unittest` 共运行 151 项，
+  148 项通过、2 项按集成环境跳过，唯一错误仍是本机未安装可选 LiteLLM 的旧桥
+  兼容测试；`pytest` 同样未安装。三个 Prism 模型经上游 Responses 与本地 Messages
+  网关均保持模型名并返回 HTTP 200；部署后的 Sonnet 5 分别真实调用 `get_weather`
+  与 `web_search`，均在两轮内完成，天气结果为 2026-08-01 上海
+  39.5/29.2°C、最大降雨概率 80%。进程、回环端口、私有 ACL 和无凭据日志均通过。
+
 ### 2026-07-28：Claude Desktop 按节点隔离多实例与无感生命周期
 
 - 修改简介：`apiclaude --desktop [--api-profile NODE]` 改为隐藏 worker 管理，

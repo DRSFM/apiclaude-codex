@@ -356,6 +356,36 @@ experimental Codex capability; `share doctor` disables cloning safely if the
 installed Codex no longer exposes it. The implementation never falls back to
 editing Codex SQLite databases or target rollout JSONL directly.
 
+### Codex ↔ Claude Code conversation migration
+
+The Web manager's **Conversation Migration** view also exposes every configured
+Claude Code node alongside Account Codex and ApiCodex Profiles. It supports
+Codex → Codex, Claude Code → Codex, Codex → Claude Code, and copies between
+distinct Claude Code nodes. Every operation publishes the cleaned visible
+history to the same protected local pool and creates a new target session ID;
+the source transcript is never edited.
+
+Claude Code → Codex converts visible user/assistant messages and user image
+attachments into a portable Codex snapshot, then uses the target Codex
+app-server to create and verify an independent thread. An interrupted Claude
+turn can be recovered as a completed historical boundary so the new Codex task
+can continue from the last visible prompt.
+
+Codex → Claude Code materializes a new Claude transcript under the selected
+node's shared or isolated `CLAUDE_CONFIG_DIR`. The generated transcript has a
+new UUID, a validated parent chain, target cwd, target-node model metadata, and
+a `custom-title`; the result includes the exact
+`apiclaude --api-profile <node> --resume <session-id>` command. This path uses
+Claude Code's local transcript and `--resume` contract because Claude Code does
+not expose a Codex-style `thread/fork.path` API.
+
+Cross-runtime copies preserve visible user/assistant history and user-provided
+images. Runtime-specific hidden thinking, injected instructions, credentials,
+usage data, and raw tool protocol records are removed. Tool effects already
+present in the shared working directory remain available for the target agent
+to inspect. Same-runtime Codex copies retain the richer supported Codex tool
+lifecycle described above.
+
 For an opt-in Dream Skin instance, set `APICODEX_DREAM_SKIN_SCRIPT` to the
 skin launcher's PowerShell path and `APICODEX_DREAM_SKIN_PORT` to a dedicated
 loopback port before running `apicodex --desktop --api-profile <profile>`.
@@ -485,12 +515,54 @@ bridge console remains visible. Use a fixed port only for diagnostics:
 apiclaude --desktop --api-profile codex-muyuan --desktop-port 18765
 ```
 
+A CPA bridge node can also expose upstream Claude models by their native IDs.
+Repeat `--desktop-model` when creating or updating the node:
+
+```bash
+apiclaude bridge prism --name codex-prism \
+  --cpa-exe "C:/path/to/cli-proxy-api.exe" \
+  --desktop-model claude-sonnet-5 \
+  --desktop-model claude-sonnet-4-6 \
+  --desktop-model claude-haiku-4-5
+```
+
+The Desktop gateway keeps the compatibility `claude-fable-5` route for the
+node's primary GPT model and adds each requested native model as an identity
+mapping. The first configured model for each Anthropic family is the family
+default in Desktop. Model IDs are metadata only; the worker still loads the
+upstream credential from the referenced Codex Profile at runtime.
+
+Claude Code disables its Anthropic-hosted `WebSearch` implementation when the
+inference provider is `gateway`. Both regular Claude Code bridge nodes and
+Desktop bridge nodes therefore receive an isolated `CLAUDE_CONFIG_DIR` with a
+bundled, dependency-free `apiclaude-web` MCP server. It exposes:
+
+- `web_search`, which first asks the referenced Codex Profile's Responses
+  endpoint to run its hosted `web_search` tool. A response counts as hosted
+  search only when it contains a real `web_search_call`; unsupported routes,
+  transport failures, and compatibility gateways that silently return an
+  ordinary message fall back to Bing's public RSS search response.
+- `get_weather`, backed by Open-Meteo geocoding and daily forecasts.
+
+The hosted search request bypasses CPA's Responses tool conversion and uses a
+separate random token against the same in-memory loopback authentication shim;
+the MCP process never receives the upstream API key. The search token, shim
+address, and upstream model are inherited through the Claude process environment
+and are not written to `.claude.json`. The bridge also repairs two known
+Responses compatibility differences for native Claude models exposed by
+OpenAI-compatible gateways: shortened MCP function names are restored only when
+they map unambiguously to one declared tool, and CPA tool-result content-block
+arrays are flattened to the Responses function-output string expected by the
+upstream. Ambiguous tool names and ordinary function outputs are left unchanged.
+
 Each bridge node uses its own
 `~/.apiclaude-desktop/nodes/<node-slug>` as `CLAUDE_USER_DATA_DIR`. Desktop
 configuration, Recents, projects, session databases, logs, Cowork files, local
-gateway token, and window state are therefore independent. Different nodes can
-run concurrently on different ports. Starting the same node again reports the
-existing PID and does not create a second process against the same data dir.
+gateway token, Claude Code configuration, MCP processes, and window state are
+therefore independent. The normal account state in `~/.claude` is not read or
+modified by these Desktop bridge nodes. Different nodes can run concurrently on
+different ports. Starting the same node again reports the existing PID and does
+not create a second process against the same data dir.
 
 Manage the workers without finding processes manually:
 
@@ -526,8 +598,9 @@ alias is Desktop-only and does not change the regular Claude Code bridge route.
 
 Desktop third-party inference is an official Claude Desktop feature, but using
 a non-Anthropic model through CPA remains an experimental protocol translation
-and is not supported by Anthropic. Each worker serves one selected model for
-the lifetime of its corresponding Desktop process.
+and is not supported by Anthropic. Each worker serves one node-local gateway
+and its configured model routes for the lifetime of the corresponding Desktop
+process.
 
 On first launch, a bridge node adds a node-local
 `skillOverrides.claude-api = "user-invocable-only"` default when that skill has

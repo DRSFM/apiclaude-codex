@@ -109,11 +109,18 @@ def _share_context() -> ShareContext:
         profiles, _ = apiagent.load_codex_profiles_for_image_repair()
         return profiles
 
+    def load_claude_nodes_read_only() -> dict[str, Any]:
+        nodes = apiagent.load_claude_config().get("nodes") or {}
+        return nodes if isinstance(nodes, dict) else {}
+
     return ShareContext(
         account_home=(apiagent.HOME / ".codex").resolve(),
         api_root=apiagent.CODEX_HOME.resolve(),
         local_state_root=default_local_state_root(),
         load_api_profiles=load_profiles_read_only,
+        claude_account_home=(apiagent.HOME / ".claude").resolve(),
+        claude_nodes_root=apiagent.CLAUDE_NODES_ROOT.resolve(),
+        load_claude_nodes=load_claude_nodes_read_only,
     )
 
 

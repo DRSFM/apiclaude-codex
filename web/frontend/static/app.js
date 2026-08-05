@@ -173,18 +173,22 @@ function render(filter = '') {
 
 function migrationTargetName(target) {
     if (!target) return '尚未选择';
-    return target.kind === 'account' ? '账号态 Codex' : target.name;
+    if (target.kind === 'account') return '账号态 Codex';
+    if (target.kind === 'claude') return `Claude Code · ${target.name}`;
+    return `ApiCodex · ${target.name}`;
 }
 
 function migrationThreadStatus(status) {
     if (status === 'active') return '生成中';
     if (status === 'systemError') return '系统错误';
+    if (status === 'interrupted') return '待继续';
     return '空闲';
 }
 
 function migrationStatusClass(status) {
     if (status === 'active') return 'active';
     if (status === 'systemError') return 'error';
+    if (status === 'interrupted') return 'active';
     return '';
 }
 
@@ -258,7 +262,11 @@ function renderMigrationTargets() {
                 <span class="migration-option-status ${target.available ? '' : 'error'}">${target.available ? '可用' : '目录缺失'}</span>
             </span>
             <span class="migration-option-preview">${escapeHtml(target.model || '跟随目标默认模型')}</span>
-            <span class="migration-option-meta">${escapeHtml(target.modelProvider || 'Codex provider')}</span>
+            <span class="migration-option-meta">${escapeHtml(
+                target.kind === 'claude'
+                    ? `Claude Code · ${target.isolation === 'isolated' ? '隔离目录' : '共享目录'}`
+                    : (target.modelProvider || 'Codex provider')
+            )}</span>
         </button>
     `).join('');
     list.querySelectorAll('.migration-target-option').forEach(button => {
@@ -323,8 +331,8 @@ function updateMigrationSummary() {
             '',
             ready ? '准备就绪' : '请选择来源会话和迁移目标',
             ready
-                ? '确认后将清洗可见历史，并在目标中创建新的独立线程。'
-                : '迁移后将在目标中生成新的线程 ID。'
+                ? '确认后将清洗可见历史，并在目标运行时创建新的独立会话。'
+                : '迁移后将在目标运行时生成新的会话 ID。'
         );
     }
 }
@@ -419,7 +427,7 @@ async function startMigration() {
 
     migrationData.loading = true;
     updateMigrationSummary();
-    showMigrationResult('loading', '正在创建安全副本', '正在清洗可见历史、发布版本并在目标中创建独立线程。');
+    showMigrationResult('loading', '正在创建安全副本', '正在清洗可见历史、发布版本并在目标运行时创建独立会话。');
     setStatus('会话迁移进行中...');
     try {
         const response = await API.post('/api/share/copy', {
@@ -430,7 +438,11 @@ async function startMigration() {
         showMigrationResult(
             'success',
             `已迁移到 ${migrationTargetName(target)}`,
-            `新线程 ${response.target.threadId} · 共享版本 ${String(response.commit?.id || '').slice(0, 12)}`
+            [
+                `新会话 ${response.target.sessionId || response.target.threadId}`,
+                `共享版本 ${String(response.commit?.id || '').slice(0, 12)}`,
+                response.target.resumeCommand || '',
+            ].filter(Boolean).join(' · ')
         );
         toast('会话副本创建成功');
         const historyResponse = await API.get('/api/share/history');
