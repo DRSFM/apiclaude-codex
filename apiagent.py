@@ -984,6 +984,7 @@ def configure_codex_vision_files(
             [
                 f"command = {toml_basic_string(sys.executable)}",
                 "args = [" + ", ".join(toml_basic_string(value) for value in args) + "]",
+                'env = { PYTHONIOENCODING = "utf-8", PYTHONUTF8 = "1" }',
                 "enabled = true",
                 "required = true",
                 'enabled_tools = ["inspect_images"]',

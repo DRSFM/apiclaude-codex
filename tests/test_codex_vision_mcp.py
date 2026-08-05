@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import io
+import json
 import unittest
 
 import codex_vision_mcp
@@ -7,6 +9,39 @@ from codex_vision_proxy import VisionInspection
 
 
 class CodexVisionMcpTests(unittest.TestCase):
+    def test_stdio_initialize_frame_is_ascii_safe_for_windows_code_pages(self) -> None:
+        server = codex_vision_mcp.VisionMcpServer(
+            inspect=lambda *_args, **_kwargs: self.fail("tool was called")
+        )
+        source = io.StringIO(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {"protocolVersion": "2025-06-18"},
+                }
+            )
+            + "\n"
+        )
+        target = io.StringIO()
+
+        self.assertEqual(
+            codex_vision_mcp.serve_stdio(
+                server,
+                input_stream=source,
+                output_stream=target,
+            ),
+            0,
+        )
+
+        frame = target.getvalue()
+        self.assertTrue(frame.isascii())
+        self.assertIn(
+            "视觉辅助：本轮已调用 Gemini",
+            json.loads(frame)["result"]["instructions"],
+        )
+
     def test_initialize_exposes_model_guidance_and_visual_call_status_rule(self) -> None:
         server = codex_vision_mcp.VisionMcpServer(
             inspect=lambda *_args, **_kwargs: self.fail("tool was called")

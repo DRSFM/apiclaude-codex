@@ -5,6 +5,20 @@
 
 ## 协作修改记录
 
+### 2026-08-05：修复 Windows 下视觉 MCP 的 UTF-8 握手失败
+
+- 修改简介：`apicodex_vision` STDIO MCP 启动时显式将输入输出切换为 UTF-8，
+  JSON-RPC 响应额外使用 ASCII 安全转义；生成的 MCP 配置同时注入
+  `PYTHONIOENCODING=utf-8` 与 `PYTHONUTF8=1`。本机 Prism 配置和 `C:\tools`
+  运行文件已同步，旧 `apiagent.py` 已留时间戳备份。
+- 修改原因：Windows 管道继承本地代码页时，含中文状态说明的初始化响应不是合法
+  UTF-8；Codex 丢弃该响应后，在必需 MCP 的默认 10 秒期限到达时报告握手超时。
+- 验证情况：新增初始化帧 ASCII 安全与配置环境回归测试；故意设置 GBK 并关闭
+  Python UTF-8 模式时，部署后的 MCP 约 195 ms 完成握手且中文说明正确还原；真实
+  Prism `gpt-5.5` Codex 会话返回 `MCP_OK`，视觉 MCP 正常初始化且本轮未调用 Gemini。
+  全量 `unittest` 运行 188 项通过、3 项按集成环境跳过，`py_compile` 与
+  `git diff --check` 通过；当前环境未安装 `pytest`，因此未运行该入口。
+
 ### 2026-08-05：Gemini 视觉辅助改为主模型按需调用与哈希缓存
 
 - 修改简介：Codex 视觉 Profile 新增本地 `apicodex_vision` STDIO MCP 工具；代理对

@@ -259,13 +259,25 @@ def serve_stdio(
         except (json.JSONDecodeError, ValueError) as exc:
             response = VisionMcpServer._error(None, -32700, str(exc))
         if response is not None:
-            target.write(json.dumps(response, ensure_ascii=False, separators=(",", ":")))
+            # MCP stdio is UTF-8, but redirected Python streams on Windows can
+            # inherit a legacy system code page. Keep every protocol frame
+            # ASCII-safe as a second line of defense so non-ASCII instructions
+            # or Gemini observations cannot corrupt the JSON-RPC transport.
+            target.write(
+                json.dumps(response, ensure_ascii=True, separators=(",", ":"))
+            )
             target.write("\n")
             target.flush()
     return 0
 
 
 def run_vision_mcp(endpoint_origin: str, control_token: str) -> int:
+    # Codex speaks UTF-8 over MCP stdio. Explicitly override the Windows pipe
+    # defaults because they may otherwise use the active ANSI/OEM code page.
+    for stream in (sys.stdin, sys.stdout):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(encoding="utf-8", errors="strict")
     server = VisionMcpServer(
         inspect=lambda image_ids, focus, refresh: request_worker_inspection(
             endpoint_origin,

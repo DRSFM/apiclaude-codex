@@ -1129,6 +1129,10 @@ class ApiAgentAuthTests(unittest.TestCase):
             self.assertIn("[mcp_servers.apicodex_vision]", deepseek_config)
             self.assertIn('"--vision-mcp"', deepseek_config)
             self.assertIn('"deepseek"', deepseek_config)
+            self.assertIn(
+                'env = { PYTHONIOENCODING = "utf-8", PYTHONUTF8 = "1" }',
+                deepseek_config,
+            )
             self.assertNotIn("gemini-secret", deepseek_config)
             self.assertIn('base_url = "https://other.test/v1"', other_config)
             catalog = json.loads(
