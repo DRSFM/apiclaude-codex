@@ -5,6 +5,20 @@
 
 ## 协作修改记录
 
+### 2026-08-06：动态模型目录保留 OpenAI 推理档位
+
+- 修改简介：动态生成第三方模型目录时，将 `gpt-5*`、Codex 与 o 系列模型识别为
+  OpenAI 推理模型，写入 low/medium/high/xhigh 可选档位；同时新增按 slug 合并
+  Codex 内置官方模型元数据的能力，保留官方推理档位、上下文、图像和搜索能力。
+- 修改原因：此前仅按 DeepSeek 等名称判断推理能力，导致聚合上游中的
+  `gpt-5.6-sol` 被错误写成无推理档位、界面显示 `none`，且 `/model` 无法正常切换。
+- 验证情况：新增回归测试覆盖 OpenAI 推理模型、普通聊天模型及官方元数据合并；
+  内置目录探测使用临时隔离 `CODEX_HOME` 且不继承 API Key。全量测试
+  188 项通过、3 项按集成环境跳过，`py_compile` 与
+  `git diff --check` 通过。本机 `tiantiansub2api` 目录已按 Codex 内置目录修复，
+  `gpt-5.6-sol` 恢复 low/medium/high/xhigh/max/ultra，`codex debug models`
+  显示上下文 272k、图像及搜索能力均已恢复。
+
 ### 2026-08-05：修复 Windows 下视觉 MCP 的 UTF-8 握手失败
 
 - 修改简介：`apicodex_vision` STDIO MCP 启动时显式将输入输出切换为 UTF-8，

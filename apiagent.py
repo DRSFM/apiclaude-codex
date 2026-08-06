@@ -21,6 +21,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 from getpass import getpass
@@ -711,6 +712,87 @@ def install_codex_model_catalog(home: Path, payload: dict[str, Any]) -> Path:
     finally:
         temporary.unlink(missing_ok=True)
     return target
+
+
+def merge_codex_builtin_model_metadata(
+    payload: dict[str, Any],
+    builtin_payload: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if not builtin_payload or not isinstance(builtin_payload.get("models"), list):
+        return payload
+    builtin_models = {
+        item.get("slug").casefold(): item
+        for item in builtin_payload["models"]
+        if isinstance(item, dict) and isinstance(item.get("slug"), str)
+    }
+    merged_models: list[Any] = []
+    for item in payload.get("models", []):
+        if not isinstance(item, dict) or not isinstance(item.get("slug"), str):
+            merged_models.append(item)
+            continue
+        builtin = builtin_models.get(item["slug"].casefold())
+        if builtin is None:
+            merged_models.append(item)
+            continue
+        merged = dict(builtin)
+        merged.update(
+            {
+                "slug": item["slug"],
+                "display_name": builtin.get("display_name") or item.get("display_name"),
+                "description": builtin.get("description") or item.get("description"),
+                "visibility": "list",
+                "supported_in_api": True,
+                "priority": item.get("priority", builtin.get("priority")),
+            }
+        )
+        merged_models.append(merged)
+    return {**payload, "models": merged_models}
+
+
+def fetch_codex_builtin_model_catalog() -> dict[str, Any] | None:
+    exe = shutil.which("codex")
+    if not exe:
+        return None
+    if os.name == "nt" and Path(exe).suffix.lower() in {".bat", ".cmd"}:
+        comspec = os.environ.get("ComSpec", "cmd.exe")
+        command_line = subprocess.list2cmdline([exe, "debug", "models"])
+        command: list[str] | str = (
+            f"{subprocess.list2cmdline([comspec])} /d /s /c call {command_line}"
+        )
+    else:
+        command = [exe, "debug", "models"]
+
+    probe_env = os.environ.copy()
+    for key in (*CODEX_PARENT_CONTEXT_ENV, "APICODEX_API_KEY", "OPENAI_API_KEY"):
+        probe_env.pop(key, None)
+    try:
+        with tempfile.TemporaryDirectory(prefix="apicodex-model-catalog-") as probe_home:
+            probe_env.update(
+                {
+                    "CODEX_HOME": probe_home,
+                    "CODEX_NON_INTERACTIVE": "1",
+                }
+            )
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=probe_env,
+                timeout=20,
+            )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if completed.returncode != 0 or len(completed.stdout) > 16 * 1024 * 1024:
+        return None
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict) or not isinstance(payload.get("models"), list):
+        return None
+    return payload
 
 
 def codex_vision_config(profile: dict[str, Any]) -> dict[str, Any] | None:
@@ -1451,6 +1533,13 @@ def build_codex_provider_catalog(
         "qwen",
         "gpt-oss",
     )
+    openai_reasoning_markers = (
+        "codex",
+        "gpt-5",
+        "o1",
+        "o3",
+        "o4",
+    )
     selected = next(
         (model for model in models if model.casefold() == default_model.casefold()),
         None,
@@ -1460,17 +1549,35 @@ def build_codex_provider_catalog(
     ordered_models = [selected, *(model for model in models if model != selected)]
     catalog: list[dict[str, Any]] = []
     for priority, model in enumerate(ordered_models, start=1):
-        supports_reasoning = any(
-            marker in model.casefold() for marker in reasoning_markers
+        normalized_model = model.casefold()
+        is_openai_reasoning_model = any(
+            marker in normalized_model for marker in openai_reasoning_markers
         )
-        reasoning_levels = []
-        if supports_reasoning:
+        supports_reasoning = is_openai_reasoning_model or any(
+            marker in normalized_model for marker in reasoning_markers
+        )
+        if is_openai_reasoning_model:
+            reasoning_levels = [
+                {
+                    "effort": effort,
+                    "description": description,
+                }
+                for effort, description in (
+                    ("low", "Fast responses with lighter reasoning"),
+                    ("medium", "Balances speed and reasoning depth"),
+                    ("high", "Greater reasoning depth for complex tasks"),
+                    ("xhigh", "Extra high reasoning depth for complex tasks"),
+                )
+            ]
+        elif supports_reasoning:
             reasoning_levels = [
                 {
                     "effort": "high",
                     "description": "Use the provider's high reasoning mode",
                 }
             ]
+        else:
+            reasoning_levels = []
         catalog.append(
             {
                 "slug": model,
@@ -1838,6 +1945,10 @@ def add_codex_profile(
             catalog_payload = build_codex_provider_catalog(
                 compatible_models,
                 selected_model,
+            )
+            catalog_payload = merge_codex_builtin_model_metadata(
+                catalog_payload,
+                fetch_codex_builtin_model_catalog(),
             )
         except ValueError as exc:
             print(f"Error: {exc}", file=sys.stderr)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -509,6 +510,7 @@ class ApiAgentAuthTests(unittest.TestCase):
                     return_value=["gpt-5.6-sol"],
                     create=True,
                 ),
+                patch.object(apiagent, "fetch_codex_builtin_model_catalog", return_value=None),
                 patch("builtins.input", side_effect=["", "", ""]),
             ):
                 code = apiagent.add_codex_profile("muyuanpub")
@@ -546,6 +548,7 @@ class ApiAgentAuthTests(unittest.TestCase):
                     ],
                     create=True,
                 ) as fetch_models,
+                patch.object(apiagent, "fetch_codex_builtin_model_catalog", return_value=None),
                 patch("builtins.input", side_effect=answer),
             ):
                 code = apiagent.codex_main(["--api-add"])
@@ -579,6 +582,94 @@ class ApiAgentAuthTests(unittest.TestCase):
                 [1, 2],
             )
             self.assertTrue(all(item["visibility"] == "list" for item in catalog["models"]))
+
+    def test_provider_catalog_keeps_openai_reasoning_models_switchable(self) -> None:
+        catalog = apiagent.build_codex_provider_catalog(
+            ["gpt-5.6-sol", "gpt-5.2", "plain-chat-model"],
+            "gpt-5.6-sol",
+        )
+
+        models = {item["slug"]: item for item in catalog["models"]}
+        sol = models["gpt-5.6-sol"]
+        self.assertEqual(sol["default_reasoning_level"], "high")
+        self.assertTrue(sol["supports_reasoning_summary_parameter"])
+        self.assertEqual(
+            [level["effort"] for level in sol["supported_reasoning_levels"]],
+            ["low", "medium", "high", "xhigh"],
+        )
+        self.assertIsNone(models["plain-chat-model"]["default_reasoning_level"])
+        self.assertEqual(models["plain-chat-model"]["supported_reasoning_levels"], [])
+
+    def test_provider_catalog_can_reuse_exact_builtin_openai_metadata(self) -> None:
+        generated = apiagent.build_codex_provider_catalog(
+            ["gpt-5.6-sol", "vendor-model"],
+            "gpt-5.6-sol",
+        )
+        builtin = {
+            "models": [
+                {
+                    "slug": "gpt-5.6-sol",
+                    "display_name": "GPT-5.6-Sol",
+                    "description": "Official description",
+                    "default_reasoning_level": "low",
+                    "supported_reasoning_levels": [
+                        {"effort": "low", "description": "Low"},
+                        {"effort": "max", "description": "Maximum"},
+                    ],
+                    "supports_reasoning_summary_parameter": True,
+                    "context_window": 272000,
+                    "input_modalities": ["text", "image"],
+                    "supports_search_tool": True,
+                    "visibility": "list",
+                    "supported_in_api": True,
+                    "priority": 99,
+                }
+            ]
+        }
+
+        merged = apiagent.merge_codex_builtin_model_metadata(generated, builtin)
+        models = {item["slug"]: item for item in merged["models"]}
+        sol = models["gpt-5.6-sol"]
+        self.assertEqual(sol["default_reasoning_level"], "low")
+        self.assertEqual(
+            [level["effort"] for level in sol["supported_reasoning_levels"]],
+            ["low", "max"],
+        )
+        self.assertEqual(sol["context_window"], 272000)
+        self.assertEqual(sol["input_modalities"], ["text", "image"])
+        self.assertTrue(sol["supports_search_tool"])
+        self.assertEqual(sol["priority"], 1)
+        self.assertEqual(models["vendor-model"]["context_window"], 128000)
+
+    def test_builtin_catalog_probe_uses_temporary_isolated_codex_home(self) -> None:
+        builtin = {
+            "models": [
+                {
+                    "slug": "gpt-5.6-sol",
+                    "supported_reasoning_levels": [{"effort": "low"}],
+                }
+            ]
+        }
+        completed = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=json.dumps(builtin),
+            stderr="",
+        )
+        with (
+            patch.object(apiagent.shutil, "which", return_value="C:/tools/codex.exe"),
+            patch.object(apiagent.subprocess, "run", return_value=completed) as run,
+        ):
+            payload = apiagent.fetch_codex_builtin_model_catalog()
+
+        self.assertEqual(payload, builtin)
+        command = run.call_args.args[0]
+        self.assertEqual(command, ["C:/tools/codex.exe", "debug", "models"])
+        probe_env = run.call_args.kwargs["env"]
+        self.assertIn("apicodex-model-catalog-", probe_env["CODEX_HOME"])
+        self.assertNotEqual(probe_env["CODEX_HOME"], str(apiagent.CODEX_HOME))
+        self.assertNotIn("APICODEX_API_KEY", probe_env)
+        self.assertNotIn("OPENAI_API_KEY", probe_env)
 
     def test_api_add_accepts_generic_provider_options_and_installs_catalog(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
