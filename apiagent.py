@@ -100,7 +100,9 @@ CODEX_VISION_TOOL_NAMESPACE = "mcp__apicodex_vision"
 GEMINI_VISION_CREDENTIAL_ID = "vision:gemini"
 CODEX_API_AUTH_MARKER = "apicodex-managed-key-in-child-environment"
 CODEX_AUTH_STORE = "keyring"
+CODEX_EPHEMERAL_AUTH_OVERRIDE = 'cli_auth_credentials_store="ephemeral"'
 CODEX_INSTALL_SCRIPT = "$env:CODEX_NON_INTERACTIVE=1; irm https://chatgpt.com/codex/install.ps1 | iex"
+APICODEX_CODEX_EXE_ENV = "APICODEX_CODEX_EXE"
 CODEX_ACCOUNT_IMAGE_REPAIR_TASK = "ApiCodex Account History Image Repair"
 HIDDEN_PREFIX_CHARS = "\ufeff\u200b\u200c\u200d\u2060\ufffd"
 VISION_TEST_IMAGE = (
@@ -228,6 +230,27 @@ def run_command(
         return completed.returncode
     except KeyboardInterrupt:
         return 130
+
+
+def find_codex_cli_executable() -> str | None:
+    """Resolve the Codex CLI used by ApiCodex, preferring its local build."""
+    override = clean_hidden_prefix(os.environ.get(APICODEX_CODEX_EXE_ENV, ""))
+    if override:
+        candidate = Path(override).expanduser()
+        if candidate.is_file():
+            return str(candidate)
+        print(
+            f"Error: {APICODEX_CODEX_EXE_ENV} does not point to a file: {candidate}",
+            file=sys.stderr,
+        )
+        return None
+
+    if os.name == "nt":
+        local_cli = HOME / ".codex-local" / "bin" / "codex.exe"
+        if local_cli.is_file():
+            return str(local_cli)
+
+    return shutil.which("codex")
 
 
 def start_detached_process(
@@ -750,7 +773,7 @@ def merge_codex_builtin_model_metadata(
 
 
 def fetch_codex_builtin_model_catalog() -> dict[str, Any] | None:
-    exe = shutil.which("codex")
+    exe = find_codex_cli_executable()
     if not exe:
         return None
     if os.name == "nt" and Path(exe).suffix.lower() in {".bat", ".cmd"}:
@@ -1717,14 +1740,71 @@ def prepare_codex_desktop_profile(home: Path, profile: dict[str, Any]) -> None:
     ensure_codex_desktop_coding_mode(home)
 
 
+def codex_auth_decryption_failed(home: Path, codex_exe: str) -> bool:
+    """Return true only when Codex explicitly reports an unreadable secrets file."""
+    probe_env = os.environ.copy()
+    for key in CODEX_DESKTOP_ENV_REMOVE + (
+        "APICODEX_API_KEY",
+        "CODEX_ACCESS_TOKEN",
+    ):
+        probe_env.pop(key, None)
+    probe_env["CODEX_HOME"] = str(home)
+    try:
+        completed = subprocess.run(
+            [codex_exe, "login", "status"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=probe_env,
+            timeout=20,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    output = f"{completed.stdout}\n{completed.stderr}".casefold()
+    return "failed to decrypt secrets file" in output
+
+
+def archive_unreadable_codex_auth(home: Path) -> Path | None:
+    """Move an unreadable encrypted auth cache aside without deleting it."""
+    source = home / "secrets" / "codex_auth.age"
+    if not source.is_file():
+        return None
+    timestamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
+    target = source.with_name(f"codex_auth.age.unreadable-{timestamp}.bak")
+    counter = 1
+    while target.exists():
+        target = source.with_name(
+            f"codex_auth.age.unreadable-{timestamp}-{counter}.bak"
+        )
+        counter += 1
+    source.replace(target)
+    return target
+
+
 def ensure_codex_keyring_auth(home: Path, api_key: str) -> bool:
     """Sync one API profile's key into the official Codex keyring."""
     if os.name != "nt":
         print("Error: Codex keyring authentication requires Windows.", file=sys.stderr)
         return False
     prepare_codex_desktop_profile(home, {})
+    codex_exe = find_codex_cli_executable()
+    if not codex_exe:
+        print("Error: Codex CLI was not found.", file=sys.stderr)
+        return False
+    if codex_auth_decryption_failed(home, codex_exe):
+        try:
+            archived = archive_unreadable_codex_auth(home)
+        except OSError as exc:
+            print(
+                f"Error: failed to archive unreadable Codex auth for {home}: {exc}",
+                file=sys.stderr,
+            )
+            return False
+        if archived is not None:
+            print(f"Archived unreadable Codex auth cache to {archived}")
     code = run_command(
-        "codex",
+        codex_exe,
         ["login", "--with-api-key"],
         env={"CODEX_HOME": str(home)},
         input_text=clean_hidden_prefix(api_key) + "\n",
@@ -2693,9 +2773,21 @@ def codex_main(args: list[str]) -> int:
 
     add_current_project_trust(home)
     update_codex_last_used(selected)
+    codex_exe = find_codex_cli_executable()
+    if not codex_exe:
+        print("Error: Codex CLI was not found.", file=sys.stderr)
+        return 1
     return run_command(
-        "codex",
-        ["--disable", "apps", "--disable", "plugins", *pass_through],
+        codex_exe,
+        [
+            "-c",
+            CODEX_EPHEMERAL_AUTH_OVERRIDE,
+            "--disable",
+            "apps",
+            "--disable",
+            "plugins",
+            *pass_through,
+        ],
         env={
             "CODEX_HOME": str(home),
             "APICODEX_API_KEY": clean_hidden_prefix(api_key),

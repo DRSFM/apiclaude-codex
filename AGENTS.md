@@ -5,6 +5,23 @@
 
 ## 协作修改记录
 
+### 2026-08-07：ApiCodex 认证缓存自动自愈与终端临时认证
+
+- 修改简介：终端启动使用 `ephemeral` 认证并由 DPAPI SecureStore 经环境注入 API Key；Desktop 遇到明确解密失败时自动归档旧缓存并通过 stdin 重建。
+- 修改原因：多个隔离 Profile 的加密文件仍存在，但 Windows 凭据库中按 `CODEX_HOME` 绑定的配套密码已失配。
+- 安全说明：旧缓存只改名归档；API Key 不进入命令行或明文文件，普通 `~/.codex` 账号态保持隔离。
+- 验证情况：新增可恢复归档、自动重建及终端临时认证测试，并逐个验证本机 Profile。
+
+### 2026-08-07：ApiCodex 固定优先使用本地自定义 Codex CLI
+
+- 修改简介：ApiCodex 启动、API Key keyring 同步及内置模型目录探测统一通过同一
+  解析器选择 Codex CLI；优先读取 `APICODEX_CODEX_EXE` 显式覆盖，其次使用
+  `~/.codex-local/bin/codex.exe`，最后才回退 PATH。
+- 修改原因：官方 Codex Desktop 的 `codex.exe` 在 PATH 中排在本地编译版本之前，
+  导致 ApiCodex 未加载 `E:\新版codex工作区\cli美化改造` 编译安装的自定义状态栏。
+- 验证情况：新增本地安装优先级与显式覆盖回归测试；认证、启动和模型目录聚焦测试、
+  `py_compile` 与 `git diff --check` 通过，并验证本机解析到本地自定义 CLI。
+
 ### 2026-08-07：同步本机全局 ApiCodex 运行文件
 
 - 修改简介：将当前仓库 14 个 Python 运行模块同步到 Windows npm 全局目录

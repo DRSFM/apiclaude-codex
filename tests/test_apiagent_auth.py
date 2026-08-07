@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import subprocess
 import tempfile
 import unittest
@@ -14,6 +15,37 @@ from secure_store import SecureStore
 
 
 class ApiAgentAuthTests(unittest.TestCase):
+    @unittest.skipUnless(__import__("os").name == "nt", "Windows CLI resolution test")
+    def test_codex_cli_prefers_apicodex_local_install_over_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            local_cli = home / ".codex-local" / "bin" / "codex.exe"
+            local_cli.parent.mkdir(parents=True)
+            local_cli.write_bytes(b"local-cli")
+
+            with (
+                patch.object(apiagent, "HOME", home),
+                patch.dict(os.environ, {}, clear=False),
+                patch.object(apiagent.shutil, "which", return_value="C:/official/codex.exe"),
+            ):
+                os.environ.pop(apiagent.APICODEX_CODEX_EXE_ENV, None)
+                resolved = apiagent.find_codex_cli_executable()
+
+            self.assertEqual(resolved, str(local_cli))
+
+    def test_codex_cli_explicit_override_has_highest_priority(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            override = Path(tmp) / "custom-codex.exe"
+            override.write_bytes(b"custom-cli")
+
+            with patch.dict(
+                os.environ,
+                {apiagent.APICODEX_CODEX_EXE_ENV: str(override)},
+            ):
+                resolved = apiagent.find_codex_cli_executable()
+
+            self.assertEqual(resolved, str(override))
+
     def test_profile_storage_slug_cannot_be_dot_path(self) -> None:
         self.assertEqual(apiagent.slugify("."), "profile")
         self.assertEqual(apiagent.slugify(".."), "profile")
@@ -134,15 +166,55 @@ class ApiAgentAuthTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            with patch.object(apiagent, "run_command", return_value=0) as run:
+            with (
+                patch.object(apiagent, "find_codex_cli_executable", return_value="C:/custom/codex.exe"),
+                patch.object(apiagent, "codex_auth_decryption_failed", return_value=False),
+                patch.object(apiagent, "run_command", return_value=0) as run,
+            ):
                 result = apiagent.ensure_codex_keyring_auth(home, "sk-test-secret")
 
             self.assertTrue(result)
-            self.assertEqual(run.call_args.args, ("codex", ["login", "--with-api-key"]))
+            self.assertEqual(
+                run.call_args.args,
+                ("C:/custom/codex.exe", ["login", "--with-api-key"]),
+            )
             self.assertEqual(run.call_args.kwargs["input_text"], "sk-test-secret\n")
             self.assertEqual(run.call_args.kwargs["env"], {"CODEX_HOME": str(home)})
             self.assertNotIn("sk-test-secret", " ".join(run.call_args.args[1]))
             self.assertFalse((home / "auth.json").exists())
+
+    def test_archive_unreadable_codex_auth_preserves_original_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            source = home / "secrets" / "codex_auth.age"
+            source.parent.mkdir()
+            source.write_bytes(b"encrypted-auth")
+            archived = apiagent.archive_unreadable_codex_auth(home)
+            self.assertIsNotNone(archived)
+            assert archived is not None
+            self.assertFalse(source.exists())
+            self.assertEqual(archived.read_bytes(), b"encrypted-auth")
+
+    @unittest.skipUnless(__import__("os").name == "nt", "Windows keyring test")
+    def test_codex_keyring_auth_archives_unreadable_cache_before_rebuild(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            apiagent.write_codex_config(home, "https://example.test/v1", "test-model")
+            source = home / "secrets" / "codex_auth.age"
+            source.parent.mkdir(exist_ok=True)
+            source.write_bytes(b"unreadable-auth")
+            with (
+                patch.object(apiagent, "find_codex_cli_executable", return_value="C:/custom/codex.exe"),
+                patch.object(apiagent, "codex_auth_decryption_failed", return_value=True),
+                patch.object(apiagent, "run_command", return_value=0),
+                redirect_stdout(io.StringIO()),
+            ):
+                result = apiagent.ensure_codex_keyring_auth(home, "sk-test-secret")
+            self.assertTrue(result)
+            self.assertFalse(source.exists())
+            backups = list(source.parent.glob("codex_auth.age.unreadable-*.bak"))
+            self.assertEqual(len(backups), 1)
+            self.assertEqual(backups[0].read_bytes(), b"unreadable-auth")
 
     @unittest.skipUnless(__import__("os").name == "nt", "Windows desktop app test")
     def test_codex_desktop_launch_isolates_account_and_profile_state(self) -> None:
@@ -657,7 +729,11 @@ class ApiAgentAuthTests(unittest.TestCase):
             stderr="",
         )
         with (
-            patch.object(apiagent.shutil, "which", return_value="C:/tools/codex.exe"),
+            patch.object(
+                apiagent,
+                "find_codex_cli_executable",
+                return_value="C:/tools/codex.exe",
+            ),
             patch.object(apiagent.subprocess, "run", return_value=completed) as run,
         ):
             payload = apiagent.fetch_codex_builtin_model_catalog()
@@ -802,7 +878,16 @@ class ApiAgentAuthTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(
             run.call_args.args[1],
-            ["--disable", "apps", "--disable", "plugins", "--model", "one-shot-model"],
+            [
+                "-c",
+                'cli_auth_credentials_store="ephemeral"',
+                "--disable",
+                "apps",
+                "--disable",
+                "plugins",
+                "--model",
+                "one-shot-model",
+            ],
         )
 
     def test_api_add_rejects_unsafe_existing_home_before_secret_or_config_writes(self) -> None:
@@ -1048,7 +1133,15 @@ class ApiAgentAuthTests(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertEqual(
                 run.call_args.args[1],
-                ["--disable", "apps", "--disable", "plugins", "--version"],
+                [
+                    "-c",
+                    'cli_auth_credentials_store="ephemeral"',
+                    "--disable",
+                    "apps",
+                    "--disable",
+                    "plugins",
+                    "--version",
+                ],
             )
             self.assertNotIn("sk-test-secret", " ".join(run.call_args.args[1]))
             self.assertEqual(
