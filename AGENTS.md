@@ -5,6 +5,28 @@
 
 ## 协作修改记录
 
+### 2026-08-25：macOS 凭据存储与新版 CLI 启动修复
+
+- 修改简介：`SecureStore` 新增 macOS 登录钥匙串后端，通过 Security
+  framework 在进程内完成凭据的新增、更新、读取和删除；Windows DPAPI
+  与现有凭据迁移格式保持不变，并补充 macOS 路由与参数校验回归测试。
+- 修改原因：macOS 安装路径会在首次读取 ApiCodex/ApiClaude 配置时
+  触发明文凭据迁移，原实现却仅支持 Windows DPAPI，导致两个 CLI 启动崩溃。
+- 安全说明：密钥直接经 Security framework 写入当前用户钥匙串，不进入
+  子进程命令行或明文文件；迁移仍在读回验证成功后才清理旧凭据。
+- 测试隔离：新增 `tests/support.py` 的 `KeychainIsolationMixin`，在 macOS 上把
+  `SecureStore` 的钥匙串调用替换为内存假实现，并应用到 6 个会写入凭据的测试类。
+  macOS 后端的 service 名由 store root 派生，临时目录每次运行都不同，若不隔离
+  会在开发者登录钥匙串里按次累积无法读回的 generic password。真实后端改由
+  `MacOSKeychainBackendTests` 覆盖，用 `addCleanup` 保证断言失败也会清理。
+- 验证情况：`tests/test_secure_store.py` 9 项（6 通过 + 3 项 Windows 用例按
+  平台跳过），含真实 Keychain 新增/更新/读取/删除闭环；从仓库外调用已安装
+  `apicodex` / `apiclaude` 的列表和版本链路均通过，迁移后明文字段、旧
+  `auth.json` 密钥与不可读凭据引用均为 0。全量 `unittest` 195 项，钥匙串条目
+  净增 0；与 `origin/main` 逐用例比对无回归，坏项由 64 项降至 50 项。
+  `pytest` 因本机未安装未运行；剩余失败来自既有 Python 3.9 标准库参数缺失、
+  Windows 专用用例与 FastAPI 未安装。
+
 ### 2026-08-07：同步本机全局 ApiCodex 运行文件
 
 - 修改简介：将当前仓库 14 个 Python 运行模块同步到 Windows npm 全局目录

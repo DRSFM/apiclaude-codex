@@ -7,6 +7,7 @@ BIN_DIR="${HOME}/.local/bin"
 mkdir -p "$BIN_DIR"
 chmod +x "$SCRIPT_DIR/apiagent" "$SCRIPT_DIR/apicodex" "$SCRIPT_DIR/apiclaude"
 
+ln -sf "$SCRIPT_DIR/apiagent.py" "$BIN_DIR/apiagent.py"
 ln -sf "$SCRIPT_DIR/apiagent" "$BIN_DIR/apiagent"
 ln -sf "$SCRIPT_DIR/apicodex" "$BIN_DIR/apicodex"
 ln -sf "$SCRIPT_DIR/apiclaude" "$BIN_DIR/apiclaude"

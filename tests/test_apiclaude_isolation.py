@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 import apiagent
 from secure_store import SecureStore, SecureStoreError
+from tests.support import KeychainIsolationMixin
 
 
 def _relay_config(**node_extra: object) -> dict:
@@ -21,7 +22,7 @@ def _relay_config(**node_extra: object) -> dict:
     return {"nodes": {"relay": node}, "current": "relay"}
 
 
-class ApiClaudeIsolationTests(unittest.TestCase):
+class ApiClaudeIsolationTests(KeychainIsolationMixin):
     def test_shared_legacy_node_keeps_default_config_dir(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = SecureStore(Path(tmp))

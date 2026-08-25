@@ -10,7 +10,7 @@ apiagent / apicodex / apiclaude：为 Codex CLI 和 Claude Code 提供多 API Pr
 隔离启动。核心模块均为仓库根目录下的单文件 Python：
 
 - `apiagent.py` — 三个入口的主体逻辑（Codex Profile 管理 + Claude 节点管理）
-- `secure_store.py` — Windows DPAPI 凭据加密（`~/.apiagent-secrets`）
+- `secure_store.py` — Windows DPAPI / macOS Keychain 凭据存储
 - `codex_conversation_pool.py` / `codex_share_cli.py` — `apicodex share` 本机会话共享池
 - `codex_history_images.py` — Desktop 历史图片自愈
 - `codex_app_server.py` — Codex app-server 交互
@@ -30,7 +30,7 @@ apiagent / apicodex / apiclaude：为 Codex CLI 和 Claude Code 提供多 API Pr
 ## 安全边界（不可违反）
 
 - API key / token **绝不放命令行参数、绝不写明文文件**；只经子进程环境变量或
-  stdin 传递，持久化必须走 `SecureStore`（DPAPI）。
+  stdin 传递，持久化必须走 `SecureStore`（Windows DPAPI / macOS Keychain）。
 - **不读写账号态**：`~/.codex` 与 `~/.claude`（账号登录数据）除显式 `--account`
   类命令外一律不碰；API Profile 数据隔离在 `~/.codex-api`、`~/.apicodex-*`、
   `~/.apiclaude*` 下。

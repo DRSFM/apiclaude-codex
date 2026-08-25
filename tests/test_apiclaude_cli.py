@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 import apiagent
 from secure_store import SecureStore
+from tests.support import KeychainIsolationMixin
 
 
 def _two_node_config() -> dict:
@@ -32,7 +33,7 @@ def _no_input(prompt: str = "") -> str:
     raise AssertionError(f"unexpected interactive prompt: {prompt!r}")
 
 
-class ApiClaudeCodexStyleCliTests(unittest.TestCase):
+class ApiClaudeCodexStyleCliTests(KeychainIsolationMixin):
     def test_api_list_json_flag_matches_legacy_contract(self) -> None:
         config = _two_node_config()
         output = io.StringIO()

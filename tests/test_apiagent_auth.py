@@ -11,9 +11,10 @@ from unittest.mock import patch
 
 import apiagent
 from secure_store import SecureStore
+from tests.support import KeychainIsolationMixin
 
 
-class ApiAgentAuthTests(unittest.TestCase):
+class ApiAgentAuthTests(KeychainIsolationMixin):
     def test_profile_storage_slug_cannot_be_dot_path(self) -> None:
         self.assertEqual(apiagent.slugify("."), "profile")
         self.assertEqual(apiagent.slugify(".."), "profile")
