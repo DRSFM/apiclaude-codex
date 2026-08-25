@@ -3839,6 +3839,7 @@ def claude_help() -> None:
   apiclaude --api-list             List saved API nodes
   apiclaude --api-list --json      List non-sensitive node metadata as JSON
   apiclaude --api-profile <name>   Start a specific API node
+  apiclaude --yolo                 Start with all permission checks bypassed
   apiclaude --api-remove           Unregister/archive a saved API node
   apiclaude --vscode               Choose a node and open VS Code here
   apiclaude --vscode --api-profile <name>
@@ -3851,7 +3852,7 @@ def claude_help() -> None:
                                    Show isolated Desktop instance status
   apiclaude --desktop-stop [--api-profile <bridge-node>]
                                    Stop one isolated Desktop instance
-  apiclaude desktop-token [NODE]   Print the DPAPI-backed local gateway token
+  apiclaude desktop-token [NODE]   Print the securely stored local gateway token
   apiclaude --up                   Update Claude Code
   apiclaude --api-help             Show this help
   apiclaude mode NAME [MODE]       Show or switch a node between isolated/shared
@@ -4087,6 +4088,8 @@ def claude_main(args: list[str]) -> int:
                 return 1
             requested = args[i + 1]
             i += 1
+        elif arg == "--yolo":
+            pass_through.extend(["--permission-mode", "bypassPermissions"])
         else:
             pass_through.append(arg)
         i += 1

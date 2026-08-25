@@ -633,10 +633,16 @@ apiclaude --api-profile mysub2api resume
 Pass Claude Code arguments after `apiclaude`:
 
 ```bash
+apiclaude --yolo
 apiclaude --permission-mode bypassPermissions
 apiclaude resume
 apiclaude -c
 ```
+
+`apiclaude --yolo` is a shortcut for
+`apiclaude --permission-mode bypassPermissions`, matching the convenience of
+`apicodex --yolo`. It can also be combined with `--api-profile` and other
+Claude Code arguments.
 
 Other management commands:
 

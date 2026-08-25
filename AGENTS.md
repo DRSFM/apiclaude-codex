@@ -5,6 +5,16 @@
 
 ## 协作修改记录
 
+### 2026-08-25：ApiClaude 完全权限快捷参数
+
+- 修改简介：新增 `apiclaude --yolo`，启动 Claude Code 时将其展开为
+  `--permission-mode bypassPermissions`，并补充帮助、README 与 CLI 回归测试。
+- 修改原因：让 ApiClaude 与现有 `apicodex --yolo` 保持一致的简便调用方式。
+- 验证情况：ApiClaude CLI 聚焦测试 17 项通过，`py_compile`、`git diff --check`
+  与已安装全局入口的帮助检查通过。全量 `unittest` 运行 195 项，其中本次新增
+  用例通过；其余 27 个失败和 23 个错误来自既有 macOS/Windows 平台假设、
+  Python 3.9 缺少新版标准库参数及 FastAPI 未安装。
+
 ### 2026-08-25：macOS 凭据存储与新版 CLI 启动修复
 
 - 修改简介：`SecureStore` 新增 macOS 登录钥匙串后端，通过 Security
