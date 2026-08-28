@@ -703,7 +703,14 @@ saved or passed to the underlying CLI.
 
 - On Windows, encryption is bound to the current user through DPAPI. On macOS,
   credentials are stored as generic passwords in the user's login Keychain.
-  No application-specific master password is required.
+  ApiAgent v2 Keychain items allow non-interactive access within the logged-in
+  user session, so replacing or updating the Python interpreter does not trigger
+  repeated password dialogs. No application-specific master password is required.
+- Existing macOS v1 Keychain items are copied to v2 on first use, read back for
+  exact verification, and then removed. That one-time read may require a final
+  Keychain confirmation; subsequent loads use v2 without prompting. If both
+  versions exist with different values, ApiAgent rejects the conflict instead of
+  silently sending an ambiguous credential. Node listings never read values.
 - Existing plaintext Claude `token` fields and Codex `auth.json` API keys are
   migrated on the first `apiclaude` or `apicodex` load.
 - Migration writes and reads back the encrypted value before removing plaintext

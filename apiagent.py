@@ -2934,11 +2934,7 @@ def show_claude_nodes(config: dict[str, Any]) -> None:
         if is_claude_codex_bridge(node):
             print("    Token: managed by the referenced Codex profile")
         else:
-            try:
-                token = get_claude_secret(name, node)
-            except (KeyError, SecureStoreError):
-                token = ""
-            print(f"    Token: {mask_secret(token)}")
+            print("    Token: stored")
 
 
 def add_claude_node(config: dict[str, Any], requested: str | None = None) -> int:
@@ -4000,11 +3996,7 @@ def claude_legacy_main(args: list[str]) -> int:
         if is_claude_codex_bridge(node):
             print("ANTHROPIC_AUTH_TOKEN=<ephemeral local bridge token>")
         else:
-            try:
-                token = get_claude_secret(current, node)
-            except (KeyError, SecureStoreError):
-                token = ""
-            print(f"ANTHROPIC_AUTH_TOKEN={mask_secret(token)}")
+            print("ANTHROPIC_AUTH_TOKEN=<stored>")
         return 0
     if command == "mode":
         if len(args) < 2:

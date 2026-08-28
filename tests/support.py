@@ -12,7 +12,7 @@ import secure_store
 class _FakeKeychain:
     """In-memory stand-in for the macOS login keychain.
 
-    Mirrors the observable behaviour of the Security framework helpers in
+    Mirrors the observable behaviour of the macOS ``security`` tool helpers in
     ``secure_store`` so tests exercise the same ``SecureStore`` code paths
     without writing generic passwords into the developer's real keychain.
     """
@@ -39,7 +39,7 @@ class KeychainIsolationMixin(unittest.TestCase):
     The macOS backend derives its keychain service name from the store root, so
     tests backed by throwaway temporary directories would otherwise leave one
     unreachable generic password behind per run. Tests that assert on the real
-    Security framework calls should not use this mixin.
+    real Keychain calls should not use this mixin.
     """
 
     def setUp(self) -> None:
@@ -48,9 +48,9 @@ class KeychainIsolationMixin(unittest.TestCase):
         if sys.platform != "darwin":
             return
         for name, target in (
-            ("_macos_keychain_set", self.fake_keychain.set),
-            ("_macos_keychain_get", self.fake_keychain.get),
-            ("_macos_keychain_clear", self.fake_keychain.clear),
+            ("_macos_security_tool_set", self.fake_keychain.set),
+            ("_macos_security_tool_get", self.fake_keychain.get),
+            ("_macos_security_tool_clear", self.fake_keychain.clear),
         ):
             patcher = patch.object(secure_store, name, target)
             patcher.start()

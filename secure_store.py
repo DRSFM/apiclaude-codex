@@ -4,80 +4,21 @@ import ctypes
 import hashlib
 import os
 import secrets
+import subprocess
 import sys
 from ctypes import wintypes
-from functools import lru_cache
 from pathlib import Path
 
 
 CRYPTPROTECT_UI_FORBIDDEN = 0x01
 CLEARED_MARKER = b"APIAGENT-CLEARED-V1\x00"
-MACOS_KEYCHAIN_SERVICE = b"apiagent.credentials.v1"
-ERR_SEC_DUPLICATE_ITEM = -25299
-ERR_SEC_ITEM_NOT_FOUND = -25300
+MACOS_KEYCHAIN_SERVICE = b"apiagent.credentials.v2"
+MACOS_LEGACY_KEYCHAIN_SERVICE = b"apiagent.credentials.v1"
+MACOS_KEYCHAIN_TOOL = "/usr/bin/security"
 
 
 class SecureStoreError(RuntimeError):
     pass
-
-
-@lru_cache(maxsize=1)
-def _macos_frameworks() -> tuple[ctypes.CDLL, ctypes.CDLL]:
-    try:
-        security = ctypes.CDLL(
-            "/System/Library/Frameworks/Security.framework/Security"
-        )
-        core_foundation = ctypes.CDLL(
-            "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
-        )
-    except OSError as exc:
-        raise SecureStoreError(
-            "macOS Keychain frameworks are unavailable"
-        ) from exc
-
-    security.SecKeychainAddGenericPassword.argtypes = [
-        ctypes.c_void_p,
-        ctypes.c_uint32,
-        ctypes.c_char_p,
-        ctypes.c_uint32,
-        ctypes.c_char_p,
-        ctypes.c_uint32,
-        ctypes.c_void_p,
-        ctypes.POINTER(ctypes.c_void_p),
-    ]
-    security.SecKeychainAddGenericPassword.restype = ctypes.c_int32
-    security.SecKeychainFindGenericPassword.argtypes = [
-        ctypes.c_void_p,
-        ctypes.c_uint32,
-        ctypes.c_char_p,
-        ctypes.c_uint32,
-        ctypes.c_char_p,
-        ctypes.POINTER(ctypes.c_uint32),
-        ctypes.POINTER(ctypes.c_void_p),
-        ctypes.POINTER(ctypes.c_void_p),
-    ]
-    security.SecKeychainFindGenericPassword.restype = ctypes.c_int32
-    security.SecKeychainItemModifyAttributesAndData.argtypes = [
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-        ctypes.c_uint32,
-        ctypes.c_void_p,
-    ]
-    security.SecKeychainItemModifyAttributesAndData.restype = ctypes.c_int32
-    security.SecKeychainItemDelete.argtypes = [ctypes.c_void_p]
-    security.SecKeychainItemDelete.restype = ctypes.c_int32
-    security.SecKeychainItemFreeContent.argtypes = [
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-    ]
-    security.SecKeychainItemFreeContent.restype = ctypes.c_int32
-    core_foundation.CFRelease.argtypes = [ctypes.c_void_p]
-    core_foundation.CFRelease.restype = None
-    return security, core_foundation
-
-
-def _macos_keychain_error(action: str, status: int) -> SecureStoreError:
-    return SecureStoreError(f"macOS Keychain {action} failed with status {status}")
 
 
 def _macos_keychain_service(root: Path) -> bytes:
@@ -89,120 +30,110 @@ def _macos_keychain_service(root: Path) -> bytes:
     return MACOS_KEYCHAIN_SERVICE + b"." + digest
 
 
-def _macos_keychain_set(service: bytes, credential_id: str, secret: str) -> None:
-    security, core_foundation = _macos_frameworks()
-    account = credential_id.encode("utf-8")
-    secret_bytes = secret.encode("utf-8")
-    secret_buffer = ctypes.create_string_buffer(secret_bytes, len(secret_bytes))
-    secret_pointer = ctypes.cast(secret_buffer, ctypes.c_void_p)
-    item = ctypes.c_void_p()
-
-    status = security.SecKeychainFindGenericPassword(
-        None,
-        len(service),
-        service,
-        len(account),
-        account,
-        None,
-        None,
-        ctypes.byref(item),
+def _macos_legacy_keychain_service(root: Path) -> bytes:
+    service = _macos_keychain_service(root)
+    return service.replace(
+        MACOS_KEYCHAIN_SERVICE, MACOS_LEGACY_KEYCHAIN_SERVICE, 1
     )
-    if status == 0:
-        try:
-            status = security.SecKeychainItemModifyAttributesAndData(
-                item,
-                None,
-                len(secret_bytes),
-                secret_pointer,
-            )
-        finally:
-            core_foundation.CFRelease(item)
-        if status != 0:
-            raise _macos_keychain_error("update", status)
-        return
-    if status != ERR_SEC_ITEM_NOT_FOUND:
-        raise _macos_keychain_error("lookup", status)
 
-    status = security.SecKeychainAddGenericPassword(
-        None,
-        len(service),
-        service,
-        len(account),
-        account,
-        len(secret_bytes),
-        secret_pointer,
-        ctypes.byref(item),
+
+def _macos_security_tool_get(service: bytes, credential_id: str) -> str:
+    completed = subprocess.run(
+        [
+            MACOS_KEYCHAIN_TOOL,
+            "find-generic-password",
+            "-a",
+            credential_id,
+            "-s",
+            service.decode("ascii"),
+            "-w",
+        ],
+        text=True,
+        encoding="utf-8",
+        capture_output=True,
+        check=False,
     )
-    if item.value:
-        core_foundation.CFRelease(item)
-    if status == ERR_SEC_DUPLICATE_ITEM:
-        # Another process may have inserted the same credential after lookup.
-        _macos_keychain_set(service, credential_id, secret)
-        return
-    if status != 0:
-        raise _macos_keychain_error("write", status)
-
-
-def _macos_keychain_get(service: bytes, credential_id: str) -> str:
-    security, core_foundation = _macos_frameworks()
-    account = credential_id.encode("utf-8")
-    password_length = ctypes.c_uint32()
-    password_data = ctypes.c_void_p()
-    item = ctypes.c_void_p()
-    status = security.SecKeychainFindGenericPassword(
-        None,
-        len(service),
-        service,
-        len(account),
-        account,
-        ctypes.byref(password_length),
-        ctypes.byref(password_data),
-        ctypes.byref(item),
-    )
-    if status == ERR_SEC_ITEM_NOT_FOUND:
-        raise KeyError(f"Credential '{credential_id}' is not stored")
-    if status != 0:
-        raise _macos_keychain_error("read", status)
-
-    try:
-        value = ctypes.string_at(password_data, password_length.value)
-    finally:
-        if password_data.value:
-            security.SecKeychainItemFreeContent(None, password_data)
-        if item.value:
-            core_foundation.CFRelease(item)
-    try:
-        return value.decode("utf-8")
-    except UnicodeDecodeError as exc:
+    if completed.returncode != 0:
+        if completed.returncode == 44 or "could not be found" in completed.stderr:
+            raise KeyError(f"Credential '{credential_id}' is not stored")
         raise SecureStoreError(
-            f"Credential '{credential_id}' contains invalid data"
-        ) from exc
+            f"macOS Keychain read failed with status {completed.returncode}"
+        )
+    return completed.stdout.rstrip("\n")
 
 
-def _macos_keychain_clear(service: bytes, credential_id: str) -> None:
-    security, core_foundation = _macos_frameworks()
-    account = credential_id.encode("utf-8")
-    item = ctypes.c_void_p()
-    status = security.SecKeychainFindGenericPassword(
-        None,
-        len(service),
-        service,
-        len(account),
-        account,
-        None,
-        None,
-        ctypes.byref(item),
+def _macos_security_tool_set(
+    service: bytes, credential_id: str, secret: str
+) -> None:
+    lookup = subprocess.run(
+        [
+            MACOS_KEYCHAIN_TOOL,
+            "find-generic-password",
+            "-a",
+            credential_id,
+            "-s",
+            service.decode("ascii"),
+        ],
+        text=True,
+        encoding="utf-8",
+        capture_output=True,
+        check=False,
     )
-    if status == ERR_SEC_ITEM_NOT_FOUND:
-        return
-    if status != 0:
-        raise _macos_keychain_error("lookup", status)
-    try:
-        status = security.SecKeychainItemDelete(item)
-    finally:
-        core_foundation.CFRelease(item)
-    if status != 0:
-        raise _macos_keychain_error("delete", status)
+    exists = lookup.returncode == 0
+    missing = lookup.returncode == 44 or "could not be found" in lookup.stderr
+    if not exists and not missing:
+        raise SecureStoreError(
+            f"macOS Keychain lookup failed with status {lookup.returncode}"
+        )
+    command = [
+        MACOS_KEYCHAIN_TOOL,
+        "add-generic-password",
+        "-a",
+        credential_id,
+        "-s",
+        service.decode("ascii"),
+    ]
+    if exists:
+        command.append("-U")
+    else:
+        command.append("-A")
+    command.append("-w")
+    completed = subprocess.run(
+        command,
+        input=f"{secret}\n{secret}\n",
+        text=True,
+        encoding="utf-8",
+        capture_output=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise SecureStoreError(
+            f"macOS Keychain write failed with status {completed.returncode}"
+        )
+
+
+def _macos_security_tool_clear(service: bytes, credential_id: str) -> None:
+    completed = subprocess.run(
+        [
+            MACOS_KEYCHAIN_TOOL,
+            "delete-generic-password",
+            "-a",
+            credential_id,
+            "-s",
+            service.decode("ascii"),
+        ],
+        text=True,
+        encoding="utf-8",
+        capture_output=True,
+        check=False,
+    )
+    if (
+        completed.returncode not in (0, 44)
+        and "could not be found" not in completed.stderr
+    ):
+        raise SecureStoreError(
+            f"macOS Keychain delete failed with status {completed.returncode}"
+        )
 
 
 class _DataBlob(ctypes.Structure):
@@ -316,6 +247,7 @@ def _unprotect(data: bytes, entropy: bytes) -> bytes:
 class SecureStore:
     def __init__(self, root: Path) -> None:
         self.root = root
+        self._cache: dict[str, str] = {}
 
     @staticmethod
     def _entropy(credential_id: str) -> bytes:
@@ -332,13 +264,20 @@ class SecureStore:
             raise ValueError("secret cannot be empty")
 
         if sys.platform == "darwin":
-            _macos_keychain_set(
-                _macos_keychain_service(self.root), credential_id, secret
+            service = _macos_keychain_service(self.root)
+            legacy_service = _macos_legacy_keychain_service(self.root)
+            _macos_security_tool_set(
+                service, credential_id, secret
             )
-            if self.get(credential_id) != secret:
+            if _macos_security_tool_get(service, credential_id) != secret:
                 raise SecureStoreError(
                     f"Failed to verify stored credential '{credential_id}'"
                 )
+            # A successfully verified v2 value is authoritative. Removing the
+            # interpreter-bound v1 copy prevents a later read from seeing two
+            # credentials that may diverge after an update.
+            _macos_security_tool_clear(legacy_service, credential_id)
+            self._cache[credential_id] = secret
             return
 
         encrypted = _protect(secret.encode("utf-8"), self._entropy(credential_id))
@@ -358,9 +297,37 @@ class SecureStore:
 
     def get(self, credential_id: str) -> str:
         if sys.platform == "darwin":
-            return _macos_keychain_get(
-                _macos_keychain_service(self.root), credential_id
-            )
+            cached = self._cache.get(credential_id)
+            if cached is not None:
+                return cached
+            service = _macos_keychain_service(self.root)
+            legacy_service = _macos_legacy_keychain_service(self.root)
+            try:
+                value = _macos_security_tool_get(service, credential_id)
+            except KeyError:
+                value = _macos_security_tool_get(legacy_service, credential_id)
+                _macos_security_tool_set(service, credential_id, value)
+                if _macos_security_tool_get(service, credential_id) != value:
+                    raise SecureStoreError(
+                        f"Failed to verify migrated credential '{credential_id}'"
+                    )
+                _macos_security_tool_clear(legacy_service, credential_id)
+            else:
+                try:
+                    legacy_value = _macos_security_tool_get(
+                        legacy_service, credential_id
+                    )
+                except KeyError:
+                    pass
+                else:
+                    if legacy_value != value:
+                        raise SecureStoreError(
+                            f"Conflicting macOS Keychain credentials for "
+                            f"'{credential_id}'; re-save the API credential"
+                        )
+                    _macos_security_tool_clear(legacy_service, credential_id)
+            self._cache[credential_id] = value
+            return value
 
         path = self._path(credential_id)
         if not path.exists():
@@ -380,8 +347,12 @@ class SecureStore:
 
     def clear(self, credential_id: str) -> None:
         if sys.platform == "darwin":
-            _macos_keychain_clear(
+            self._cache.pop(credential_id, None)
+            _macos_security_tool_clear(
                 _macos_keychain_service(self.root), credential_id
+            )
+            _macos_security_tool_clear(
+                _macos_legacy_keychain_service(self.root), credential_id
             )
             return
 
