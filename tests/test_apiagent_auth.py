@@ -558,6 +558,122 @@ class ApiAgentAuthTests(KeychainIsolationMixin):
                 config,
             )
 
+    def test_codex_config_rewrite_preserves_existing_mcp_servers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / "config.toml").write_text(
+                '[mcp_servers.local]\ncommand = "local-mcp"\n',
+                encoding="utf-8",
+            )
+
+            apiagent.write_codex_config(
+                home,
+                "https://example.test/v1",
+                "new-model",
+                "high",
+            )
+
+            config = (home / "config.toml").read_text(encoding="utf-8")
+            self.assertIn('model = "new-model"', config)
+            self.assertIn('[mcp_servers.local]\ncommand = "local-mcp"', config)
+
+    def test_shared_enable_syncs_account_mcp_and_preserves_profile_owned_mcp(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            account_home = root / ".codex"
+            account_home.mkdir()
+            (account_home / "config.toml").write_text(
+                '[mcp_servers.fetch]\ncommand = "shared-fetch"\n\n'
+                '[mcp_servers.node_repl]\ncommand = "account-node"\n',
+                encoding="utf-8",
+            )
+            api_root = root / ".codex-api"
+            profile_home = api_root / "profiles" / "relay"
+            profile_home.mkdir(parents=True)
+            profile_config = profile_home / "config.toml"
+            profile_config.write_text(
+                'model = "test"\n\n'
+                '[mcp_servers.local]\ncommand = "local-mcp"\n\n'
+                '[mcp_servers.node_repl]\ncommand = "profile-node"\n',
+                encoding="utf-8",
+            )
+            profile = {"id": "relay", "name": "relay", "home": "profiles/relay"}
+            output = io.StringIO()
+
+            with (
+                patch.object(apiagent, "HOME", root),
+                patch.object(apiagent, "CODEX_HOME", api_root),
+                patch.object(apiagent, "load_codex_profiles", return_value=[profile]),
+                redirect_stdout(output),
+            ):
+                code = apiagent.codex_shared_main(["enable", "--account"])
+
+            self.assertEqual(code, 0)
+            config = profile_config.read_text(encoding="utf-8")
+            self.assertIn('command = "shared-fetch"', config)
+            self.assertIn('command = "local-mcp"', config)
+            self.assertIn('command = "profile-node"', config)
+            self.assertNotIn('command = "account-node"', config)
+            state = json.loads((api_root / "shared-mcp.json").read_text(encoding="utf-8"))
+            self.assertTrue(state["accountMcpEnabled"])
+            self.assertEqual(list(state["managedServers"]), ["fetch"])
+            backups = list((api_root / "shared-mcp-backups").glob("*/relay.config.toml"))
+            self.assertEqual(len(backups), 1)
+            self.assertIn("Profile-owned servers not copied: node_repl", output.getvalue())
+
+    def test_shared_sync_updates_then_disable_removes_managed_mcp(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            account_home = root / ".codex"
+            account_home.mkdir()
+            account_config = account_home / "config.toml"
+            account_config.write_text(
+                '[mcp_servers.fetch]\ncommand = "fetch-v1"\n',
+                encoding="utf-8",
+            )
+            api_root = root / ".codex-api"
+            profile_home = api_root / "profiles" / "relay"
+            profile_home.mkdir(parents=True)
+            profile_config = profile_home / "config.toml"
+            profile_config.write_text('model = "test"\n', encoding="utf-8")
+            profile = {"id": "relay", "name": "relay", "home": "profiles/relay"}
+
+            with (
+                patch.object(apiagent, "HOME", root),
+                patch.object(apiagent, "CODEX_HOME", api_root),
+                patch.object(apiagent, "load_codex_profiles", return_value=[profile]),
+                redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(
+                    apiagent.codex_shared_main(["enable", "--account"]),
+                    0,
+                )
+                account_config.write_text(
+                    '[mcp_servers.fetch]\ncommand = "fetch-v2"\n',
+                    encoding="utf-8",
+                )
+                self.assertEqual(apiagent.codex_shared_main(["sync"]), 0)
+                self.assertIn(
+                    'command = "fetch-v2"',
+                    profile_config.read_text(encoding="utf-8"),
+                )
+                self.assertEqual(apiagent.codex_shared_main(["disable"]), 0)
+
+            config = profile_config.read_text(encoding="utf-8")
+            self.assertNotIn("[mcp_servers.fetch]", config)
+            state = json.loads((api_root / "shared-mcp.json").read_text(encoding="utf-8"))
+            self.assertFalse(state["accountMcpEnabled"])
+            self.assertEqual(state["managedServers"], {})
+
+    def test_shared_enable_requires_explicit_account_authorization(self) -> None:
+        error = io.StringIO()
+
+        with redirect_stderr(error):
+            code = apiagent.codex_shared_main(["enable"])
+
+        self.assertEqual(code, 1)
+        self.assertIn("requires --account", error.getvalue())
+
     def test_api_add_preserves_profile_model_and_reasoning_effort(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
