@@ -5,6 +5,64 @@
 
 ## 协作修改记录
 
+### 2026-09-03：合并远端 macOS 凭据支持与 ApiClaude 权限快捷参数
+
+- 修改简介：先将本地 MCP 全局共享与 ApiClaude 节点代理功能提交，再基于最新
+  `origin/main` 完成 rebase；保留远端 macOS Keychain 后端、免重复授权改进、
+  `apiclaude --yolo` 和凭据展示收紧，并按时间顺序合并双方协作记录。
+- 修改原因：本地工作区包含尚未提交的大型功能，同时远端领先 3 个提交且修改了
+  相同入口与文档，需要先固定本地改动再进行可审计的功能合并。
+- 验证情况：合并前完整测试 209 项通过、3 项跳过；合并态聚焦测试 85 项通过、
+  9 项跳过；合并后完整 `pytest` 211 项通过、12 项按平台或集成环境跳过，
+  `py_compile` 与 `git diff --check` 通过。
+
+### 2026-09-03：SDW Search 跨 ApiCodex / ApiClaude 全局共享
+
+- 修改简介：将 `SDW_Search` 注册进 Codex 账号 MCP 源与 Claude user-scope MCP；
+  新增 `apiclaude shared enable/sync/status/disable`，把 `~/.claude.json` 中的
+  `mcpServers` 原子同步到现有及未来的隔离 CLI、VS Code、桥接与 Desktop 节点。
+- 修改原因：论文与增强搜索 MCP 此前只存在于 zzzcoding Codex Profile，其他
+  ApiCodex Profile 和 ApiClaude 隔离节点无法共用。
+- 安全说明：首次启用必须显式传入 `--account`；Claude 侧只复制 `mcpServers`，
+  不复制账号、会话、项目或缓存状态。同名本地修改保留为冲突，配置变更前自动
+  备份且原子替换；MCP 环境值不写入状态或命令输出。
+- 验证情况：新增 5 项共享 JSON/同步回归测试，完整 `pytest` 209 项通过、3 项
+  按集成环境跳过，`py_compile` 与 `git diff --check` 通过。13 个 ApiCodex
+  Profile、3 个隔离 ApiClaude 节点均通过定义哈希校验，另 3 个 shared 节点直接
+  使用账号源；二次 dry-run 无待更新项。Claude 账号态和隔离节点均实测 MCP
+  `Connected`，tiantiansub2api 的 Codex 列表显示已启用；全局部署 SHA-256 一致。
+
+### 2026-09-03：ApiClaude 节点默认代理与交互开关
+
+- 修改简介：所有 ApiClaude 节点新增 `proxy_enabled` / `proxy_url`，默认启用
+  `http://127.0.0.1:7897`；普通 Claude CLI/VS Code 注入 `HTTP_PROXY` 与
+  `HTTPS_PROXY`，CPA CLI/Desktop 桥复用同一代理状态。新增节点默认勾选代理，
+  `apiclaude --proxy [--api-profile NAME]` 可选择节点并随时启停。
+- 修改原因：AnyRouter 等上游在未开启系统 TUN 时需要显式代理，而开启 TUN 又会
+  影响部分 tiantiansub2api 节点；节点级代理可让两类上游独立运行。
+- 安全说明：关闭时会清除继承的 HTTP(S) 代理环境，代理地址不含凭据；旧节点仅
+  迁移非敏感代理字段，不读取或修改 `~/.claude` 账号态。部署和迁移前均已创建
+  时间戳备份。
+- 验证情况：新增 7 项代理回归测试先失败后通过；相关测试 101 项通过，完整
+  `pytest` 204 项通过、3 项按集成环境跳过；`py_compile` 与 `git diff --check`
+  通过。全局运行文件与仓库 SHA-256 一致，本机 6 个 ApiClaude 节点均迁移为
+  代理开启；真实 `--proxy` 交互通过，经 7897 访问 AnyRouter 返回 HTTP 200。
+
+### 2026-09-02：账号 Skill 与 MCP 跨 ApiCodex Profile 共享
+
+- 修改简介：新增 `apicodex shared enable/sync/status/disable`，以账号态
+  `~/.codex/config.toml` 的 MCP 区段为受管共享源，在所有隔离 Profile 启动前
+  原子合并；Profile 配置重写会保留既有 MCP，用户 Skill 统一迁入
+  `~/.agents/skills`。本机全局启动器已同步部署并启用共享。
+- 修改原因：各 API 上游使用独立 `CODEX_HOME`，此前不会继承官网账号的 Skill
+  和 MCP，且更新 Profile 可能清空已有 MCP 配置。
+- 安全说明：功能必须通过 `--account` 显式启用，只读取账号 `config.toml` 的
+  `[mcp_servers.*]`，不复制认证、会话、数据库或 API Key；`node_repl`、
+  `cua_repl` 与 `apicodex_*` 保持 Profile 自有，本地冲突保留且修改前自动备份。
+- 验证情况：聚焦测试 52 项通过；完整 `pytest` 197 项通过、3 项按集成环境跳过；
+  本机 14 个自定义 Skill 逐文件 SHA-256 校验后迁入共享目录，4 个用户 MCP 已同步
+  到 13 个 Profile，二次 dry-run 无待更新项，账号态与 API Profile 列表均验证通过。
+
 ### 2026-08-27：macOS ApiClaude 钥匙串免重复授权
 
 - 修改简介：macOS 凭据新增免交互 v2 Keychain service，同一登录用户会话内不再按

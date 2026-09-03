@@ -44,6 +44,11 @@ from codex_vision_proxy import (
     vision_proxy,
 )
 from codex_vision_mcp import run_vision_mcp
+from claude_shared_config import merge_shared_mcp_servers as merge_claude_shared_mcp
+from codex_shared_config import (
+    merge_shared_mcp_servers as merge_codex_shared_mcp,
+    preserve_mcp_server_sections,
+)
 from claude_codex_bridge import (
     BridgeEndpoint,
     BridgeStartupError,
@@ -95,6 +100,7 @@ SECRET_STORE = SecureStore(HOME / ".apiagent-secrets")
 DEFAULT_CODEX_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_CODEX_MODEL = "gpt-5.6-sol"
 DEFAULT_CODEX_REASONING_EFFORT = "high"
+DEFAULT_CLAUDE_PROXY_URL = "http://127.0.0.1:7897"
 DEFAULT_GEMINI_VISION_MODEL = "gemini-3.5-flash-lite"
 CODEX_VISION_TOOL_NAMESPACE = "mcp__apicodex_vision"
 GEMINI_VISION_CREDENTIAL_ID = "vision:gemini"
@@ -102,6 +108,11 @@ CODEX_API_AUTH_MARKER = "apicodex-managed-key-in-child-environment"
 CODEX_AUTH_STORE = "keyring"
 CODEX_INSTALL_SCRIPT = "$env:CODEX_NON_INTERACTIVE=1; irm https://chatgpt.com/codex/install.ps1 | iex"
 CODEX_ACCOUNT_IMAGE_REPAIR_TASK = "ApiCodex Account History Image Repair"
+CODEX_SHARED_MCP_STATE_NAME = "shared-mcp.json"
+CODEX_SHARED_MCP_BACKUP_DIR = "shared-mcp-backups"
+CLAUDE_SHARED_MCP_STATE_NAME = "shared-mcp.json"
+CLAUDE_SHARED_MCP_BACKUP_DIR = "shared-mcp-backups"
+CLAUDE_DESKTOP_CODE_CONFIG_DIR_NAME = "claude-code-config"
 HIDDEN_PREFIX_CHARS = "\ufeff\u200b\u200c\u200d\u2060\ufffd"
 VISION_TEST_IMAGE = (
     "data:image/png;base64,"
@@ -139,6 +150,10 @@ CLAUDE_PROFILE_ENV = (
     "APICLAUDE_WEB_SEARCH_BASE_URL",
     "APICLAUDE_WEB_SEARCH_TOKEN",
     "APICLAUDE_WEB_SEARCH_MODEL",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "http_proxy",
+    "https_proxy",
 )
 
 
@@ -185,6 +200,33 @@ def read_json(path: Path, default: Any) -> Any:
 def write_json(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def write_text_atomic(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="",
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            dir=path.parent,
+            delete=False,
+        ) as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+            temp_path = Path(handle.name)
+        os.replace(temp_path, path)
+    finally:
+        if temp_path is not None and temp_path.exists():
+            temp_path.unlink()
+
+
+def write_json_atomic(path: Path, data: Any) -> None:
+    write_text_atomic(path, json.dumps(data, indent=2, ensure_ascii=False))
 
 
 def run_command(
@@ -646,6 +688,10 @@ def write_codex_config(
     reasoning_effort: str = DEFAULT_CODEX_REASONING_EFFORT,
 ) -> None:
     home.mkdir(parents=True, exist_ok=True)
+    config_path = home / "config.toml"
+    existing = (
+        config_path.read_text(encoding="utf-8-sig") if config_path.is_file() else ""
+    )
     catalog_path = home / "models.json"
     catalog_line = ""
     if catalog_path.is_file():
@@ -677,7 +723,258 @@ requires_openai_auth = false
 [desktop]
 conversationDetailMode = "STEPS_COMMANDS"
 '''
-    (home / "config.toml").write_text(config, encoding="utf-8")
+    if existing:
+        config = preserve_mcp_server_sections(config, existing)
+    write_text_atomic(config_path, config)
+
+
+def codex_account_config_path() -> Path:
+    return HOME / ".codex" / "config.toml"
+
+
+def codex_shared_mcp_state_path() -> Path:
+    return CODEX_HOME / CODEX_SHARED_MCP_STATE_NAME
+
+
+def load_codex_shared_mcp_state() -> dict[str, Any]:
+    raw = read_json(
+        codex_shared_mcp_state_path(),
+        {"version": 1, "accountMcpEnabled": False, "managedServers": {}},
+    )
+    if not isinstance(raw, dict):
+        return {"version": 1, "accountMcpEnabled": False, "managedServers": {}}
+    managed = raw.get("managedServers")
+    raw["managedServers"] = (
+        {
+            str(name): str(fingerprint)
+            for name, fingerprint in managed.items()
+            if isinstance(name, str) and isinstance(fingerprint, str)
+        }
+        if isinstance(managed, dict)
+        else {}
+    )
+    return raw
+
+
+def _shared_mcp_backup_root() -> Path:
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    return CODEX_HOME / CODEX_SHARED_MCP_BACKUP_DIR / stamp
+
+
+def _backup_shared_mcp_configs(
+    changes: list[tuple[dict[str, Any], Path, str, str]],
+) -> Path | None:
+    if not changes:
+        return None
+    backup_root = _shared_mcp_backup_root()
+    backup_root.mkdir(parents=True, exist_ok=False)
+    manifest: list[dict[str, str]] = []
+    for profile, config_path, existing, _updated in changes:
+        profile_id = slugify(str(profile.get("id") or profile.get("name") or "profile"))
+        backup_path = backup_root / f"{profile_id}.config.toml"
+        write_text_atomic(backup_path, existing)
+        manifest.append(
+            {
+                "profile": str(profile.get("name") or profile_id),
+                "source": str(config_path),
+                "backup": str(backup_path),
+            }
+        )
+    write_json_atomic(
+        backup_root / "manifest.json",
+        {"version": 1, "createdAt": now_iso(), "files": manifest},
+    )
+    return backup_root
+
+
+def sync_codex_shared_mcp(
+    profiles: list[dict[str, Any]],
+    *,
+    enabled: bool | None = None,
+    dry_run: bool = False,
+    quiet: bool = False,
+) -> tuple[bool, dict[str, Any]]:
+    state = load_codex_shared_mcp_state()
+    was_enabled = state.get("accountMcpEnabled") is True
+    desired_enabled = was_enabled if enabled is None else enabled
+    report: dict[str, Any] = {
+        "enabled": desired_enabled,
+        "changedProfiles": [],
+        "conflicts": {},
+        "skippedProfiles": [],
+        "servers": [],
+        "excludedServers": [],
+        "backup": None,
+        "dryRun": dry_run,
+    }
+    if enabled is None and not was_enabled:
+        return True, report
+
+    source_path = codex_account_config_path()
+    if desired_enabled:
+        if not source_path.is_file():
+            if not quiet:
+                print(
+                    f"Error: account Codex config was not found at {source_path}.",
+                    file=sys.stderr,
+                )
+            return False, report
+        try:
+            source_text = source_path.read_text(encoding="utf-8-sig")
+        except (OSError, UnicodeError) as exc:
+            if not quiet:
+                print(f"Error: failed to read {source_path}: {exc}", file=sys.stderr)
+            return False, report
+    else:
+        source_text = ""
+
+    previous_hashes = state.get("managedServers") or {}
+    changes: list[tuple[dict[str, Any], Path, str, str]] = []
+    source_summary = merge_codex_shared_mcp("", source_text, previous_hashes)
+    source_hashes = source_summary.source_hashes
+    excluded = source_summary.excluded
+    for profile in profiles:
+        if not is_safe_api_profile_home(profile):
+            if not quiet:
+                print(
+                    f"Error: refusing to sync MCP into unsafe profile "
+                    f"'{profile.get('name')}'.",
+                    file=sys.stderr,
+                )
+            return False, report
+        config_path = codex_profile_home(profile) / "config.toml"
+        if not config_path.is_file():
+            report["skippedProfiles"].append(str(profile.get("name") or "profile"))
+            continue
+        try:
+            existing = config_path.read_text(encoding="utf-8-sig")
+        except (OSError, UnicodeError) as exc:
+            if not quiet:
+                print(f"Error: failed to read {config_path}: {exc}", file=sys.stderr)
+            return False, report
+        result = merge_codex_shared_mcp(existing, source_text, previous_hashes)
+        profile_name = str(profile.get("name") or profile.get("id") or "profile")
+        if result.conflicts:
+            report["conflicts"][profile_name] = list(result.conflicts)
+        if result.changed:
+            changes.append((profile, config_path, existing, result.text))
+            report["changedProfiles"].append(profile_name)
+
+    report["servers"] = list(source_hashes)
+    report["excludedServers"] = list(excluded)
+    next_state = {
+        "version": 1,
+        "accountMcpEnabled": desired_enabled,
+        "source": str(source_path),
+        "managedServers": source_hashes,
+        "updatedAt": now_iso(),
+    }
+    if dry_run:
+        return True, report
+
+    backup_root: Path | None = None
+    written: list[tuple[Path, str]] = []
+    try:
+        backup_root = _backup_shared_mcp_configs(changes)
+        for _profile, config_path, existing, updated in changes:
+            write_text_atomic(config_path, updated)
+            written.append((config_path, existing))
+        write_json_atomic(codex_shared_mcp_state_path(), next_state)
+    except OSError as exc:
+        for config_path, existing in reversed(written):
+            try:
+                write_text_atomic(config_path, existing)
+            except OSError:
+                pass
+        if not quiet:
+            print(f"Error: shared MCP sync failed: {exc}", file=sys.stderr)
+        return False, report
+    report["backup"] = str(backup_root) if backup_root else None
+    return True, report
+
+
+def _print_codex_shared_mcp_report(report: dict[str, Any]) -> None:
+    status = "enabled" if report.get("enabled") else "disabled"
+    print(f"Account MCP sharing: {status}")
+    servers = report.get("servers") or []
+    print(f"Shared servers: {', '.join(servers) if servers else '(none)'}")
+    excluded = report.get("excludedServers") or []
+    if excluded:
+        print(f"Profile-owned servers not copied: {', '.join(excluded)}")
+    changed = report.get("changedProfiles") or []
+    action = "Would update" if report.get("dryRun") else "Updated"
+    print(f"{action} profiles: {', '.join(changed) if changed else '(none)'}")
+    skipped = report.get("skippedProfiles") or []
+    if skipped:
+        print(f"Profiles without config.toml: {', '.join(skipped)}")
+    conflicts = report.get("conflicts") or {}
+    for profile, names in conflicts.items():
+        print(
+            f"Conflict in '{profile}' (kept profile-local): {', '.join(names)}",
+            file=sys.stderr,
+        )
+    if report.get("backup"):
+        print(f"Backup: {report['backup']}")
+
+
+def codex_shared_main(args: list[str]) -> int:
+    action = args[0] if args else "status"
+    flags = set(args[1:])
+    allowed_flags = {"--account", "--dry-run"}
+    if action not in {"enable", "sync", "status", "disable"} or not flags.issubset(
+        allowed_flags
+    ):
+        print(
+            "Usage: apicodex shared <enable|sync|status|disable> "
+            "[--account] [--dry-run]",
+            file=sys.stderr,
+        )
+        return 1
+    if action == "enable" and "--account" not in flags:
+        print(
+            "Error: shared enable requires --account to authorize reading "
+            "~/.codex/config.toml.",
+            file=sys.stderr,
+        )
+        return 1
+
+    state = load_codex_shared_mcp_state()
+    if action == "status":
+        report = {
+            "enabled": state.get("accountMcpEnabled") is True,
+            "servers": list((state.get("managedServers") or {}).keys()),
+            "changedProfiles": [],
+            "conflicts": {},
+            "skippedProfiles": [],
+            "excludedServers": [],
+            "dryRun": False,
+        }
+        _print_codex_shared_mcp_report(report)
+        print(f"Source: {state.get('source') or codex_account_config_path()}")
+        return 0
+    if action == "sync" and state.get("accountMcpEnabled") is not True:
+        print(
+            "Error: account MCP sharing is disabled. Run "
+            "'apicodex shared enable --account' first.",
+            file=sys.stderr,
+        )
+        return 1
+
+    profiles = load_codex_profiles()
+    requested_enabled = True if action == "enable" else False if action == "disable" else None
+    ok, report = sync_codex_shared_mcp(
+        profiles,
+        enabled=requested_enabled,
+        dry_run="--dry-run" in flags,
+    )
+    if ok:
+        _print_codex_shared_mcp_report(report)
+        if action == "enable" and not report.get("dryRun"):
+            print(
+                "Future ApiCodex launches will refresh shared MCP servers from "
+                "the account config."
+            )
+    return 0 if ok else 1
 
 
 def read_codex_model_catalog(source: Path, model: str) -> dict[str, Any]:
@@ -1982,6 +2279,7 @@ def add_codex_profile(
     if not any(item.get("id") == profile.get("id") for item in profiles):
         updated.append(profile)
     save_codex_profiles(updated)
+    sync_codex_shared_mcp(updated)
     print(f"Saved Codex profile '{profile['name']}'.")
     return 0
 
@@ -2190,6 +2488,7 @@ def launch_codex_desktop(
 
     if not prepare_codex_vision_runtime(selected):
         return 1
+    sync_codex_shared_mcp(profiles)
 
     profile_id = slugify(str(selected.get("id") or selected.get("name") or "default"))
     dream_skin_id = dream_skin_instance_id(selected)
@@ -2327,6 +2626,7 @@ def launch_codex_vscode(
 
     if not prepare_codex_vision_runtime(selected):
         return 1
+    sync_codex_shared_mcp(profiles)
 
     profile_id = slugify(str(selected.get("id") or selected.get("name") or "default"))
     vscode_data = CODEX_VSCODE_DATA_ROOT / profile_id
@@ -2363,6 +2663,10 @@ def codex_help() -> None:
   apicodex --api-list --json       List non-sensitive profile metadata as JSON
   apicodex --api-profile <name>    Start a specific API profile
   apicodex --api-remove            Unregister/archive a saved API profile
+  apicodex shared enable --account Share account MCP config with API profiles
+  apicodex shared sync             Refresh shared MCP config now
+  apicodex shared status           Show account MCP sharing status
+  apicodex shared disable          Remove managed MCP copies from API profiles
   apicodex --vscode                Choose a profile and open VS Code here
   apicodex --desktop               Choose a profile and open an isolated desktop app
   apicodex --repair-images         Repair one API profile's missing history images
@@ -2429,6 +2733,8 @@ def codex_main(args: list[str]) -> int:
         return run_codex_vision_mcp(args[2])
     if args and args[0] == "share":
         return codex_share_main(args[1:])
+    if args and args[0] == "shared":
+        return codex_shared_main(args[1:])
     pass_through: list[str] = []
     requested: str | None = None
     add_name: str | None = None
@@ -2690,6 +2996,7 @@ def codex_main(args: list[str]) -> int:
 
     if not prepare_codex_vision_runtime(selected):
         return 1
+    sync_codex_shared_mcp(profiles)
 
     add_current_project_trust(home)
     update_codex_last_used(selected)
@@ -2706,7 +3013,10 @@ def codex_main(args: list[str]) -> int:
 
 def load_claude_config() -> dict[str, Any]:
     config = read_json(CLAUDE_CONFIG_PATH, {"nodes": {}, "current": None})
-    if migrate_claude_secrets(config, SECRET_STORE):
+    changed = migrate_claude_secrets(config, SECRET_STORE)
+    if migrate_claude_proxy_settings(config):
+        changed = True
+    if changed:
         save_claude_config(config)
     return config
 
@@ -2739,6 +3049,32 @@ def is_claude_codex_bridge(node: dict[str, Any]) -> bool:
 
 def claude_node_isolation(node: dict[str, Any]) -> str:
     return "isolated" if node.get("isolation") == "isolated" else "shared"
+
+
+def claude_node_proxy_enabled(node: dict[str, Any]) -> bool:
+    enabled = node.get("proxy_enabled")
+    if isinstance(enabled, bool):
+        return enabled
+    return clean_hidden_prefix(str(node.get("proxy_url") or "")).lower() != "direct"
+
+
+def claude_node_proxy_url(node: dict[str, Any]) -> str:
+    proxy_url = clean_hidden_prefix(str(node.get("proxy_url") or ""))
+    if not proxy_url or proxy_url.lower() == "direct":
+        return DEFAULT_CLAUDE_PROXY_URL
+    return proxy_url
+
+
+def claude_node_effective_proxy(node: dict[str, Any]) -> str:
+    return claude_node_proxy_url(node) if claude_node_proxy_enabled(node) else "direct"
+
+
+def add_claude_proxy_environment(env: dict[str, str], node: dict[str, Any]) -> None:
+    if not claude_node_proxy_enabled(node):
+        return
+    proxy_url = claude_node_proxy_url(node)
+    env["HTTP_PROXY"] = proxy_url
+    env["HTTPS_PROXY"] = proxy_url
 
 
 def claude_node_home(name: str, node: dict[str, Any]) -> Path:
@@ -2824,6 +3160,8 @@ def claude_node_metadata(name: str, node: dict[str, Any]) -> dict[str, Any]:
         "desktopModels": normalize_claude_desktop_models(
             node.get("desktop_models")
         ),
+        "proxyEnabled": claude_node_proxy_enabled(node),
+        "proxyUrl": claude_node_proxy_url(node),
         "isolation": isolation,
         "configDir": config_dir,
         "vscodeData": str((CLAUDE_VSCODE_DATA_ROOT / claude_node_slug(name, node)).resolve()),
@@ -2863,6 +3201,287 @@ def ensure_claude_node_home(
     home = claude_node_home(name, node)
     home.mkdir(parents=True, exist_ok=True)
     return home
+
+
+def claude_account_mcp_config_path() -> Path:
+    return HOME / ".claude.json"
+
+
+def claude_shared_mcp_state_path() -> Path:
+    return CLAUDE_NODES_ROOT / CLAUDE_SHARED_MCP_STATE_NAME
+
+
+def load_claude_shared_mcp_state() -> dict[str, Any]:
+    raw = read_json(
+        claude_shared_mcp_state_path(),
+        {"version": 1, "accountMcpEnabled": False, "managedServers": {}},
+    )
+    if not isinstance(raw, dict):
+        return {"version": 1, "accountMcpEnabled": False, "managedServers": {}}
+    managed = raw.get("managedServers")
+    raw["managedServers"] = (
+        {
+            str(name): str(fingerprint)
+            for name, fingerprint in managed.items()
+            if isinstance(name, str) and isinstance(fingerprint, str)
+        }
+        if isinstance(managed, dict)
+        else {}
+    )
+    return raw
+
+
+def _read_json_object_strict(path: Path, *, missing_ok: bool = False) -> dict[str, Any]:
+    if not path.exists():
+        if missing_ok:
+            return {}
+        raise OSError(f"file was not found: {path}")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"failed to read JSON config '{path}': {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"JSON config '{path}' must contain an object")
+    return payload
+
+
+def _claude_shared_mcp_targets(
+    config: dict[str, Any],
+) -> list[tuple[str, Path]]:
+    targets: list[tuple[str, Path]] = []
+    seen: set[Path] = set()
+    for name, node in (config.get("nodes") or {}).items():
+        if not isinstance(name, str) or not isinstance(node, dict):
+            continue
+        if claude_node_isolation(node) == "isolated":
+            if not is_safe_claude_node_home(name, node):
+                raise ValueError(f"unsafe isolated config dir for Claude node '{name}'")
+            path = claude_node_home(name, node) / ".claude.json"
+            resolved = path.resolve()
+            if resolved not in seen:
+                targets.append((f"node:{name}", path))
+                seen.add(resolved)
+
+        desktop_home = claude_desktop_profile_home(name, node)
+        if desktop_home is None:
+            continue
+        desktop_path = (
+            desktop_home
+            / CLAUDE_DESKTOP_CODE_CONFIG_DIR_NAME
+            / ".claude.json"
+        )
+        if desktop_path.exists():
+            resolved = desktop_path.resolve()
+            if resolved not in seen:
+                targets.append((f"desktop:{name}", desktop_path))
+                seen.add(resolved)
+    return targets
+
+
+def _claude_shared_mcp_backup_root() -> Path:
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    return CLAUDE_NODES_ROOT / CLAUDE_SHARED_MCP_BACKUP_DIR / stamp
+
+
+def _backup_claude_shared_mcp_configs(
+    changes: list[tuple[str, Path, str | None, dict[str, Any]]],
+) -> Path | None:
+    if not changes:
+        return None
+    backup_root = _claude_shared_mcp_backup_root()
+    backup_root.mkdir(parents=True, exist_ok=False)
+    manifest: list[dict[str, Any]] = []
+    for index, (label, config_path, existing, _updated) in enumerate(changes, 1):
+        backup_path = backup_root / f"{index:02d}-{slugify(label)}.claude.json"
+        write_text_atomic(backup_path, existing or "")
+        manifest.append(
+            {
+                "target": label,
+                "source": str(config_path),
+                "backup": str(backup_path),
+                "existed": existing is not None,
+            }
+        )
+    write_json_atomic(
+        backup_root / "manifest.json",
+        {"version": 1, "createdAt": now_iso(), "files": manifest},
+    )
+    return backup_root
+
+
+def sync_claude_shared_mcp(
+    config: dict[str, Any],
+    *,
+    enabled: bool | None = None,
+    dry_run: bool = False,
+    quiet: bool = False,
+) -> tuple[bool, dict[str, Any]]:
+    state = load_claude_shared_mcp_state()
+    was_enabled = state.get("accountMcpEnabled") is True
+    desired_enabled = was_enabled if enabled is None else enabled
+    report: dict[str, Any] = {
+        "enabled": desired_enabled,
+        "changedTargets": [],
+        "conflicts": {},
+        "servers": [],
+        "backup": None,
+        "dryRun": dry_run,
+    }
+    if enabled is None and not was_enabled:
+        return True, report
+
+    source_path = claude_account_mcp_config_path()
+    try:
+        source_payload = (
+            _read_json_object_strict(source_path)
+            if desired_enabled
+            else {"mcpServers": {}}
+        )
+        previous_hashes = state.get("managedServers") or {}
+        source_summary = merge_claude_shared_mcp({}, source_payload, previous_hashes)
+        source_hashes = source_summary.source_hashes
+        targets = _claude_shared_mcp_targets(config)
+    except (OSError, ValueError) as exc:
+        if not quiet:
+            print(f"Error: failed to prepare shared Claude MCP sync: {exc}", file=sys.stderr)
+        return False, report
+
+    changes: list[tuple[str, Path, str | None, dict[str, Any]]] = []
+    for label, config_path in targets:
+        try:
+            existing = (
+                config_path.read_text(encoding="utf-8-sig")
+                if config_path.exists()
+                else None
+            )
+            target_payload = (
+                _read_json_object_strict(config_path, missing_ok=True)
+                if existing is not None
+                else {}
+            )
+            result = merge_claude_shared_mcp(
+                target_payload,
+                source_payload,
+                previous_hashes,
+            )
+        except (OSError, UnicodeError, ValueError) as exc:
+            if not quiet:
+                print(f"Error: failed to inspect {config_path}: {exc}", file=sys.stderr)
+            return False, report
+        if result.conflicts:
+            report["conflicts"][label] = list(result.conflicts)
+        if result.changed:
+            changes.append((label, config_path, existing, result.payload))
+            report["changedTargets"].append(label)
+
+    report["servers"] = list(source_hashes)
+    next_state = {
+        "version": 1,
+        "accountMcpEnabled": desired_enabled,
+        "source": str(source_path),
+        "managedServers": source_hashes,
+        "updatedAt": now_iso(),
+    }
+    if dry_run:
+        return True, report
+
+    backup_root: Path | None = None
+    written: list[tuple[Path, str | None]] = []
+    try:
+        backup_root = _backup_claude_shared_mcp_configs(changes)
+        for _label, config_path, existing, updated in changes:
+            write_json_atomic(config_path, updated)
+            written.append((config_path, existing))
+        write_json_atomic(claude_shared_mcp_state_path(), next_state)
+    except OSError as exc:
+        for config_path, existing in reversed(written):
+            try:
+                if existing is None:
+                    config_path.unlink(missing_ok=True)
+                else:
+                    write_text_atomic(config_path, existing)
+            except OSError:
+                pass
+        if not quiet:
+            print(f"Error: shared Claude MCP sync failed: {exc}", file=sys.stderr)
+        return False, report
+    report["backup"] = str(backup_root) if backup_root else None
+    return True, report
+
+
+def _print_claude_shared_mcp_report(report: dict[str, Any]) -> None:
+    status = "enabled" if report.get("enabled") else "disabled"
+    print(f"Account MCP sharing: {status}")
+    servers = report.get("servers") or []
+    print(f"Shared servers: {', '.join(servers) if servers else '(none)'}")
+    changed = report.get("changedTargets") or []
+    action = "Would update" if report.get("dryRun") else "Updated"
+    print(f"{action} targets: {', '.join(changed) if changed else '(none)'}")
+    for target, names in (report.get("conflicts") or {}).items():
+        print(
+            f"Conflict in '{target}' (kept target-local): {', '.join(names)}",
+            file=sys.stderr,
+        )
+    if report.get("backup"):
+        print(f"Backup: {report['backup']}")
+
+
+def claude_shared_main(args: list[str]) -> int:
+    action = args[0] if args else "status"
+    flags = set(args[1:])
+    allowed_flags = {"--account", "--dry-run"}
+    if action not in {"enable", "sync", "status", "disable"} or not flags.issubset(
+        allowed_flags
+    ):
+        print(
+            "Usage: apiclaude shared <enable|sync|status|disable> "
+            "[--account] [--dry-run]",
+            file=sys.stderr,
+        )
+        return 1
+    if action == "enable" and "--account" not in flags:
+        print(
+            "Error: shared enable requires --account to authorize reading "
+            "~/.claude.json.",
+            file=sys.stderr,
+        )
+        return 1
+
+    state = load_claude_shared_mcp_state()
+    if action == "status":
+        report = {
+            "enabled": state.get("accountMcpEnabled") is True,
+            "servers": list((state.get("managedServers") or {}).keys()),
+            "changedTargets": [],
+            "conflicts": {},
+            "dryRun": False,
+        }
+        _print_claude_shared_mcp_report(report)
+        print(f"Source: {state.get('source') or claude_account_mcp_config_path()}")
+        return 0
+    if action == "sync" and state.get("accountMcpEnabled") is not True:
+        print(
+            "Error: account MCP sharing is disabled. Run "
+            "'apiclaude shared enable --account' first.",
+            file=sys.stderr,
+        )
+        return 1
+
+    config = load_claude_config()
+    requested_enabled = True if action == "enable" else False if action == "disable" else None
+    ok, report = sync_claude_shared_mcp(
+        config,
+        enabled=requested_enabled,
+        dry_run="--dry-run" in flags,
+    )
+    if ok:
+        _print_claude_shared_mcp_report(report)
+        if action == "enable" and not report.get("dryRun"):
+            print(
+                "Future ApiClaude isolated nodes will refresh shared MCP servers "
+                "from the account user config."
+            )
+    return 0 if ok else 1
 
 
 def ensure_claude_codex_bridge_settings(home: Path) -> None:
@@ -2905,6 +3524,22 @@ def migrate_claude_secrets(config: dict[str, Any], store: SecureStore) -> bool:
     return changed
 
 
+def migrate_claude_proxy_settings(config: dict[str, Any]) -> bool:
+    changed = False
+    for node in (config.get("nodes") or {}).values():
+        if not isinstance(node, dict):
+            continue
+        proxy_url = claude_node_proxy_url(node)
+        proxy_enabled = claude_node_proxy_enabled(node)
+        if node.get("proxy_url") != proxy_url:
+            node["proxy_url"] = proxy_url
+            changed = True
+        if node.get("proxy_enabled") is not proxy_enabled:
+            node["proxy_enabled"] = proxy_enabled
+            changed = True
+    return changed
+
+
 def get_claude_secret(name: str, node: dict[str, Any]) -> str:
     credential_id = node.get("credential_id") or claude_credential_id(name)
     return SECRET_STORE.get(credential_id)
@@ -2930,6 +3565,8 @@ def show_claude_nodes(config: dict[str, Any]) -> None:
             print(f"    Mode: isolated ({claude_node_home(name, node)})")
         else:
             print(f"    Mode: shared ({HOME / '.claude'})")
+        proxy_status = "enabled" if claude_node_proxy_enabled(node) else "disabled"
+        print(f"    Proxy: {proxy_status} ({claude_node_proxy_url(node)})")
         print(f"    Last used: {node.get('lastUsedAt') or '-'}")
         if is_claude_codex_bridge(node):
             print("    Token: managed by the referenced Codex profile")
@@ -2963,12 +3600,34 @@ def add_claude_node(config: dict[str, Any], requested: str | None = None) -> int
     else:
         print("Error: config mode must be 'isolated' or 'shared'.", file=sys.stderr)
         return 1
+    default_proxy_enabled = (
+        claude_node_proxy_enabled(existing) if existing is not None else True
+    )
+    proxy_default = "Y/n" if default_proxy_enabled else "y/N"
+    proxy_choice = input(
+        f"Use proxy {DEFAULT_CLAUDE_PROXY_URL}? [{proxy_default}]: "
+    ).strip().lower()
+    if not proxy_choice:
+        proxy_enabled = default_proxy_enabled
+    elif proxy_choice in ("y", "yes"):
+        proxy_enabled = True
+    elif proxy_choice in ("n", "no"):
+        proxy_enabled = False
+    else:
+        print("Error: proxy choice must be 'y' or 'n'.", file=sys.stderr)
+        return 1
     credential_id = claude_credential_id(name)
     SECRET_STORE.set(credential_id, token)
     node: dict[str, Any] = {
         "base_url": base_url,
         "credential_id": credential_id,
         "isolation": mode,
+        "proxy_enabled": proxy_enabled,
+        "proxy_url": (
+            claude_node_proxy_url(existing)
+            if existing is not None
+            else DEFAULT_CLAUDE_PROXY_URL
+        ),
         "lastUsedAt": existing.get("lastUsedAt") if existing else None,
     }
     if existing and existing.get("home"):
@@ -2979,6 +3638,8 @@ def add_claude_node(config: dict[str, Any], requested: str | None = None) -> int
     if not config.get("current"):
         config["current"] = name
     save_claude_config(config)
+    if not sync_claude_shared_mcp(config)[0]:
+        return 1
     print(f"Saved Claude node '{name}' ({mode}).")
     return 0
 
@@ -3050,8 +3711,25 @@ def add_claude_codex_bridge(
         "lastUsedAt": existing.get("lastUsedAt") if existing else None,
     }
     cleaned_proxy_url = clean_hidden_prefix(proxy_url or "")
-    if cleaned_proxy_url:
+    if cleaned_proxy_url.lower() == "direct":
+        node["proxy_enabled"] = False
+        node["proxy_url"] = (
+            claude_node_proxy_url(existing)
+            if existing is not None
+            else DEFAULT_CLAUDE_PROXY_URL
+        )
+    elif cleaned_proxy_url:
+        node["proxy_enabled"] = True
         node["proxy_url"] = cleaned_proxy_url
+    else:
+        node["proxy_enabled"] = (
+            claude_node_proxy_enabled(existing) if existing is not None else True
+        )
+        node["proxy_url"] = (
+            claude_node_proxy_url(existing)
+            if existing is not None
+            else DEFAULT_CLAUDE_PROXY_URL
+        )
     requested_desktop_models = (
         desktop_models
         if desktop_models is not None
@@ -3081,6 +3759,8 @@ def add_claude_codex_bridge(
     if not config.get("current"):
         config["current"] = name
     save_claude_config(config)
+    if not sync_claude_shared_mcp(config)[0]:
+        return 1
     print(
         f"Saved isolated Claude bridge node '{name}' from Codex profile "
         f"'{profile.get('name')}' (model={selected_model}, "
@@ -3245,7 +3925,7 @@ def run_claude_codex_bridge_node(
                 upstream_api_key=api_key,
                 model=model,
                 cpa_executable=cpa_executable,
-                proxy_url=clean_hidden_prefix(str(node.get("proxy_url") or "")),
+                proxy_url=claude_node_effective_proxy(node),
             )
         else:
             bridge_context = litellm_bridge(
@@ -3409,7 +4089,7 @@ def run_claude_desktop_worker(
                 upstream_api_key=upstream_api_key,
                 model=model,
                 cpa_executable=cpa_executable,
-                proxy_url=clean_hidden_prefix(str(node.get("proxy_url") or "")),
+                proxy_url=claude_node_effective_proxy(node),
                 listen_port=port,
                 local_token=local_token,
                 route_model=CLAUDE_DESKTOP_GATEWAY_MODEL,
@@ -3424,6 +4104,8 @@ def run_claude_desktop_worker(
                     route_model=CLAUDE_DESKTOP_GATEWAY_MODEL,
                     extra_models=desktop_models,
                 )
+                if not sync_claude_shared_mcp(config)[0]:
+                    return 1
                 desktop_process = launch_claude_desktop_process(
                     executable,
                     profile_dir,
@@ -3698,12 +4380,15 @@ def run_claude_node(config: dict[str, Any], name: str, claude_args: list[str]) -
     if not node:
         print(f"Error: Claude node '{name}' was not found.", file=sys.stderr)
         return 1
+    if not sync_claude_shared_mcp(config)[0]:
+        return 1
     if is_claude_codex_bridge(node):
         return run_claude_codex_bridge_node(config, name, node, claude_args)
     env = {
         "ANTHROPIC_BASE_URL": clean_hidden_prefix(node.get("base_url", "")),
         "ANTHROPIC_AUTH_TOKEN": get_claude_secret(name, node),
     }
+    add_claude_proxy_environment(env, node)
     if claude_node_isolation(node) == "isolated":
         home = ensure_claude_node_home(config, name, node)
         if home is None:
@@ -3729,6 +4414,8 @@ def launch_claude_vscode(config: dict[str, Any], name: str) -> int:
     if not node:
         print(f"Error: Claude node '{name}' was not found.", file=sys.stderr)
         return 1
+    if not sync_claude_shared_mcp(config)[0]:
+        return 1
     if is_claude_codex_bridge(node):
         print(
             "Error: Codex bridge nodes are a CLI prototype; VS Code needs a "
@@ -3746,6 +4433,7 @@ def launch_claude_vscode(config: dict[str, Any], name: str) -> int:
         "ANTHROPIC_BASE_URL": clean_hidden_prefix(node.get("base_url", "")),
         "ANTHROPIC_AUTH_TOKEN": clean_hidden_prefix(token),
     }
+    add_claude_proxy_environment(env, node)
     if claude_node_isolation(node) == "isolated":
         home = ensure_claude_node_home(config, name, node)
         if home is None:
@@ -3810,6 +4498,8 @@ def set_claude_node_mode(config: dict[str, Any], name: str, requested: str | Non
             return 1
         node["isolation"] = "isolated"
         save_claude_config(config)
+        if not sync_claude_shared_mcp(config)[0]:
+            return 1
         print(f"Node '{name}' switched to isolated (CLAUDE_CONFIG_DIR={home}).")
         print(
             "Note: an empty isolated dir starts fresh (onboarding, trust prompts). "
@@ -3826,6 +4516,34 @@ def set_claude_node_mode(config: dict[str, Any], name: str, requested: str | Non
     return 0
 
 
+def set_claude_node_proxy(config: dict[str, Any], name: str) -> int:
+    node = (config.get("nodes") or {}).get(name)
+    if not node:
+        print(f"Error: Claude node '{name}' was not found.", file=sys.stderr)
+        return 1
+    enabled = claude_node_proxy_enabled(node)
+    proxy_url = claude_node_proxy_url(node)
+    current = "enabled" if enabled else "disabled"
+    print(f"Node '{name}' proxy: {current} ({proxy_url})")
+    default = "Y/n" if enabled else "y/N"
+    choice = input(f"Enable proxy for '{name}'? [{default}]: ").strip().lower()
+    if not choice:
+        requested = enabled
+    elif choice in ("y", "yes"):
+        requested = True
+    elif choice in ("n", "no"):
+        requested = False
+    else:
+        print("Error: proxy choice must be 'y' or 'n'.", file=sys.stderr)
+        return 1
+    node["proxy_enabled"] = requested
+    node["proxy_url"] = proxy_url
+    save_claude_config(config)
+    status = "enabled" if requested else "disabled"
+    print(f"Node '{name}' proxy {status}: {proxy_url}")
+    return 0
+
+
 def claude_help() -> None:
     print(
         """apiclaude commands
@@ -3837,6 +4555,9 @@ def claude_help() -> None:
   apiclaude --api-profile <name>   Start a specific API node
   apiclaude --yolo                 Start with all permission checks bypassed
   apiclaude --api-remove           Unregister/archive a saved API node
+  apiclaude --proxy                Choose a node and enable/disable its proxy
+  apiclaude --proxy --api-profile <name>
+                                   Configure the proxy for a specific node
   apiclaude --vscode               Choose a node and open VS Code here
   apiclaude --vscode --api-profile <name>
                                    Open VS Code with a specific node
@@ -3851,6 +4572,10 @@ def claude_help() -> None:
   apiclaude desktop-token [NODE]   Print the securely stored local gateway token
   apiclaude --up                   Update Claude Code
   apiclaude --api-help             Show this help
+  apiclaude shared enable --account Share account user MCP with isolated nodes
+  apiclaude shared sync             Refresh shared MCP config now
+  apiclaude shared status           Show account MCP sharing status
+  apiclaude shared disable          Remove managed MCP copies from isolated nodes
   apiclaude mode NAME [MODE]       Show or switch a node between isolated/shared
                                    isolated: node-scoped CLAUDE_CONFIG_DIR
                                    shared:   default ~/.claude (legacy behavior)
@@ -3861,7 +4586,7 @@ def claude_help() -> None:
                                    backed by an existing Codex API profile via CPA
 
 Legacy subcommands remain available: add, list [--json], current,
-remove [NAME], run [ARGS], vscode [NAME], update, help.
+remove [NAME], proxy [NAME], run [ARGS], vscode [NAME], update, help.
 
 Any remaining arguments are passed to Claude Code."""
     )
@@ -3993,6 +4718,8 @@ def claude_legacy_main(args: list[str]) -> int:
             print(f"CLAUDE_CONFIG_DIR={claude_node_home(current, node)} (isolated)")
         else:
             print(f"Config dir: {HOME / '.claude'} (shared)")
+        proxy_status = "enabled" if claude_node_proxy_enabled(node) else "disabled"
+        print(f"Proxy: {proxy_status} ({claude_node_proxy_url(node)})")
         if is_claude_codex_bridge(node):
             print("ANTHROPIC_AUTH_TOKEN=<ephemeral local bridge token>")
         else:
@@ -4003,6 +4730,12 @@ def claude_legacy_main(args: list[str]) -> int:
             show_claude_nodes(config)
             return 0
         return set_claude_node_mode(config, args[1], args[2] if len(args) > 2 else None)
+    if command == "proxy":
+        if len(args) > 2:
+            print("Error: usage: apiclaude proxy [NAME].", file=sys.stderr)
+            return 1
+        selected = args[1] if len(args) == 2 else select_claude_node(config)
+        return set_claude_node_proxy(config, selected) if selected else 1
     if command == "remove":
         return remove_claude_node(config, args[1] if len(args) > 1 else None)
     # command == "run"
@@ -4016,6 +4749,8 @@ def claude_legacy_main(args: list[str]) -> int:
 def claude_main(args: list[str]) -> int:
     if args and args[0] == "--desktop-worker":
         return claude_desktop_worker_main(args[1:])
+    if args and args[0] == "shared":
+        return claude_shared_main(args[1:])
     if args and args[0] in ("--up", "update"):
         if len(args) != 1:
             print("Error: the update command does not accept arguments.", file=sys.stderr)
@@ -4034,13 +4769,22 @@ def claude_main(args: list[str]) -> int:
             load_claude_config(),
             args[1] if len(args) == 2 else None,
         )
-    if args and args[0] in ("add", "list", "current", "mode", "remove", "run", "vscode"):
+    if args and args[0] in (
+        "add",
+        "list",
+        "current",
+        "mode",
+        "proxy",
+        "remove",
+        "run",
+        "vscode",
+    ):
         return claude_legacy_main(args)
 
     # Codex-style flag parsing, mirroring codex_main.
     pass_through: list[str] = []
     requested: str | None = None
-    do_add = do_list = do_remove = do_vscode = do_desktop = do_json = False
+    do_add = do_list = do_remove = do_proxy = do_vscode = do_desktop = do_json = False
     do_desktop_foreground = do_desktop_status = do_desktop_stop = False
     desktop_port: int | None = None
     i = 0
@@ -4052,6 +4796,8 @@ def claude_main(args: list[str]) -> int:
             do_list = True
         elif arg == "--api-remove":
             do_remove = True
+        elif arg == "--proxy":
+            do_proxy = True
         elif arg == "--vscode":
             do_vscode = True
         elif arg == "--desktop":
@@ -4111,7 +4857,7 @@ def claude_main(args: list[str]) -> int:
 
     config = load_claude_config()
     if do_desktop or do_desktop_foreground:
-        if do_vscode or do_add or do_list or do_remove or do_json or pass_through:
+        if do_vscode or do_add or do_list or do_remove or do_proxy or do_json or pass_through:
             print(
                 "Error: a Desktop launch cannot be combined with other actions or "
                 "Claude Code arguments.",
@@ -4134,15 +4880,21 @@ def claude_main(args: list[str]) -> int:
             port=desktop_port,
         )
     if do_desktop_status:
-        if do_vscode or do_add or do_list or do_remove or do_json or pass_through:
+        if do_vscode or do_add or do_list or do_remove or do_proxy or do_json or pass_through:
             print("Error: --desktop-status cannot be combined with other actions.", file=sys.stderr)
             return 1
         return show_claude_desktop_status(config, requested)
     if do_desktop_stop:
-        if do_vscode or do_add or do_list or do_remove or do_json or pass_through:
+        if do_vscode or do_add or do_list or do_remove or do_proxy or do_json or pass_through:
             print("Error: --desktop-stop cannot be combined with other actions.", file=sys.stderr)
             return 1
         return stop_claude_desktop(config, requested)
+    if do_proxy:
+        if do_vscode or do_add or do_list or do_remove or do_json or pass_through:
+            print("Error: --proxy cannot be combined with other actions.", file=sys.stderr)
+            return 1
+        selected = requested or select_claude_node(config)
+        return set_claude_node_proxy(config, selected) if selected else 1
     if do_vscode:
         if pass_through:
             print(

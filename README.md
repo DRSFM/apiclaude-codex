@@ -148,17 +148,45 @@ apicodex --desktop --api-profile muyuanpub
 
 Desktop profiles use separate browser/app data under
 `~/.apicodex-desktop/<profile>` and the same profile-scoped `CODEX_HOME` used by
-the CLI and VS Code extension. The launcher does not read or modify the normal
-ChatGPT account-backed Codex home at `~/.codex`. The API key is passed only in
-the child process environment or login stdin and is not placed on the command
-line. Desktop launch is currently supported on Windows with the official
-ChatGPT app.
+the CLI and VS Code extension. By default, the launcher does not read or modify
+the normal ChatGPT account-backed Codex home at `~/.codex`. The opt-in shared MCP
+commands documented below read only its `config.toml`; they never copy account
+authentication or conversation state. The API key is passed only in the child
+process environment or login stdin and is not placed on the command line.
+Desktop launch is currently supported on Windows with the official ChatGPT app.
 The launcher also keeps the API desktop in Codex coding mode, so the project
 menu includes local folders instead of falling back to ChatGPT cloud projects.
 The API profile's master key remains DPAPI-encrypted by this launcher. When the
 desktop starts, it is synchronized through stdin into the official Codex
 Windows keyring for that isolated `CODEX_HOME`; no API key is placed on the
 command line or written to plaintext `auth.json`.
+
+### Shared Skills And MCP Servers
+
+Codex discovers user-wide skills from `~/.agents/skills`. Put custom skills in
+that directory when they should be available to both the account-backed Codex
+home and every isolated ApiCodex profile. Do not install custom skills into a
+profile's managed `.system` directory.
+
+MCP configuration normally follows `CODEX_HOME`, so isolated API profiles do
+not inherit `~/.codex/config.toml` automatically. Enable an explicit managed
+copy from the account config:
+
+```powershell
+apicodex shared enable --account --dry-run
+apicodex shared enable --account
+apicodex shared status
+apicodex shared sync
+apicodex shared disable
+```
+
+After enablement, every CLI, VS Code, or Desktop launch refreshes all registered
+API profiles from the account config. ApiCodex copies only `[mcp_servers.*]`
+tables. Runtime-owned `node_repl`, `cua_repl`, and `apicodex_*` servers remain
+profile-local. If a copied server is later edited inside one API profile,
+ApiCodex reports a conflict and preserves that local version instead of
+overwriting it. Changed files are backed up under
+`~/.codex-api/shared-mcp-backups` before atomic replacement.
 
 ### Experimental Per-Profile Vision Fallback
 
@@ -421,14 +449,33 @@ Codex CLI. On Windows, PowerShell (`pwsh` or `powershell`) must be available.
 ## Claude Usage
 
 `apiclaude` accepts the same command style as `apicodex` — only the tool name
-differs. The original subcommands (`add`, `list`, `current`, `remove`, `run`,
-`vscode`, `update`, `help`) remain available as aliases.
+differs. The original subcommands (`add`, `list`, `current`, `remove`, `proxy`,
+`run`, `vscode`, `update`, `help`) remain available as aliases.
 
 Add or update a Claude API node:
 
 ```bash
 apiclaude --api-add
 ```
+
+New nodes use `http://127.0.0.1:7897` by default. The add prompt offers a
+`[Y/n]` proxy choice, so pressing Enter keeps the proxy enabled. For normal
+Anthropic nodes, the launcher sets both `HTTP_PROXY` and `HTTPS_PROXY` in the
+Claude CLI or VS Code child environment. For Codex bridge nodes, the same
+setting controls the upstream connection in the local authentication shim and
+does not proxy the loopback Claude-to-CPA connection.
+
+Choose a saved node and enable or disable its proxy at any time:
+
+```bash
+apiclaude --proxy
+apiclaude --proxy --api-profile anyrouter
+```
+
+Disabling a proxy preserves its configured URL for the next enable action and
+removes inherited `HTTP_PROXY` / `HTTPS_PROXY` values from the launched child.
+Existing nodes without proxy settings are migrated once to the enabled default
+when ApiClaude next loads its node registry.
 
 New nodes default to an isolated per-node config directory: Claude Code runs
 with `CLAUDE_CONFIG_DIR` pointing at `~/.apiclaude/nodes/<slug>`, so sessions,
@@ -454,6 +501,34 @@ a node archives its isolated directory under `~/.apiclaude/archived-nodes`.
 The isolated directory follows the node name, not the base URL or token, so
 editing a node's credentials — or changing the upstream behind a local proxy —
 never affects its local workspace.
+
+### Shared Claude MCP Servers
+
+Claude Code stores user-scoped MCP definitions in `~/.claude.json`. Shared-mode
+ApiClaude nodes already read that file directly, while isolated nodes use their
+own `.claude.json`. Enable managed synchronization so both modes receive the
+same user MCP servers:
+
+```powershell
+apiclaude shared enable --account --dry-run
+apiclaude shared enable --account
+apiclaude shared status
+apiclaude shared sync
+apiclaude shared disable
+```
+
+The explicit `--account` flag authorizes the initial read of the account user
+configuration. ApiClaude copies only `mcpServers`; account identity, sessions,
+projects, cached state, and credentials outside MCP definitions are never
+copied. Existing isolated CLI nodes are updated immediately, and future node,
+VS Code, bridge, and Desktop launches refresh the managed copies automatically.
+Locally edited definitions win on a name conflict. Changed files are backed up
+under `~/.apiclaude/shared-mcp-backups` before atomic replacement.
+
+This machine registers `SDW_Search` in both the ApiCodex account MCP source and
+the Claude user MCP source. Its Codex definition is synchronized to every
+ApiCodex profile, and its Claude definition is synchronized to every isolated
+ApiClaude node.
 
 ### Experimental Codex Profile bridge
 
@@ -482,6 +557,10 @@ apiclaude bridge anyrouter --name gpt-shell --model gpt-5.6-sol \
   --cpa-exe "F:/path/to/cli-proxy-api.exe"
 apiclaude --api-profile gpt-shell
 ```
+
+Bridge nodes also default to the local proxy. Pass `--proxy-url direct` to
+create or update one with the proxy disabled, or use `apiclaude --proxy`
+afterward.
 
 New bridge nodes use CPA. Existing bridge nodes without a `gateway` field retain
 the previous LiteLLM path for compatibility; recreating them with
