@@ -3026,11 +3026,7 @@ def show_claude_nodes(config: dict[str, Any]) -> None:
         if is_claude_codex_bridge(node):
             print("    Token: managed by the referenced Codex profile")
         else:
-            try:
-                token = get_claude_secret(name, node)
-            except (KeyError, SecureStoreError):
-                token = ""
-            print(f"    Token: {mask_secret(token)}")
+            print("    Token: stored")
 
 
 def add_claude_node(config: dict[str, Any], requested: str | None = None) -> int:
@@ -3931,6 +3927,7 @@ def claude_help() -> None:
   apiclaude --api-list             List saved API nodes
   apiclaude --api-list --json      List non-sensitive node metadata as JSON
   apiclaude --api-profile <name>   Start a specific API node
+  apiclaude --yolo                 Start with all permission checks bypassed
   apiclaude --api-remove           Unregister/archive a saved API node
   apiclaude --vscode               Choose a node and open VS Code here
   apiclaude --vscode --api-profile <name>
@@ -3943,7 +3940,7 @@ def claude_help() -> None:
                                    Show isolated Desktop instance status
   apiclaude --desktop-stop [--api-profile <bridge-node>]
                                    Stop one isolated Desktop instance
-  apiclaude desktop-token [NODE]   Print the DPAPI-backed local gateway token
+  apiclaude desktop-token [NODE]   Print the securely stored local gateway token
   apiclaude --up                   Update Claude Code
   apiclaude --api-help             Show this help
   apiclaude mode NAME [MODE]       Show or switch a node between isolated/shared
@@ -4091,11 +4088,7 @@ def claude_legacy_main(args: list[str]) -> int:
         if is_claude_codex_bridge(node):
             print("ANTHROPIC_AUTH_TOKEN=<ephemeral local bridge token>")
         else:
-            try:
-                token = get_claude_secret(current, node)
-            except (KeyError, SecureStoreError):
-                token = ""
-            print(f"ANTHROPIC_AUTH_TOKEN={mask_secret(token)}")
+            print("ANTHROPIC_AUTH_TOKEN=<stored>")
         return 0
     if command == "mode":
         if len(args) < 2:
@@ -4179,6 +4172,8 @@ def claude_main(args: list[str]) -> int:
                 return 1
             requested = args[i + 1]
             i += 1
+        elif arg == "--yolo":
+            pass_through.extend(["--permission-mode", "bypassPermissions"])
         else:
             pass_through.append(arg)
         i += 1

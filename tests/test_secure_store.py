@@ -1,14 +1,31 @@
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 import tempfile
 import unittest
+import uuid
 from pathlib import Path
+from unittest.mock import call, patch
 
+import secure_store
 from secure_store import SecureStore
 
 
-@unittest.skipUnless(__import__("os").name == "nt", "Windows DPAPI test")
-class SecureStoreTests(unittest.TestCase):
+class SecureStoreValidationTests(unittest.TestCase):
+    def test_rejects_empty_credential_id_and_secret(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SecureStore(Path(tmp))
+
+            with self.assertRaises(ValueError):
+                store.set("", "secret")
+            with self.assertRaises(ValueError):
+                store.set("claude:test", "")
+
+
+@unittest.skipUnless(os.name == "nt", "Windows DPAPI test")
+class WindowsSecureStoreTests(unittest.TestCase):
     def test_round_trip_uses_encrypted_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = SecureStore(Path(tmp))
@@ -40,6 +57,211 @@ class SecureStoreTests(unittest.TestCase):
 
             with self.assertRaises(KeyError):
                 store.get("claude:removed")
+
+
+@unittest.skipUnless(sys.platform == "darwin", "macOS Keychain test")
+class MacOSSecureStoreTests(unittest.TestCase):
+    def test_production_and_temporary_roots_use_separate_services(self) -> None:
+        production = secure_store._macos_keychain_service(
+            Path.home() / ".apiagent-secrets"
+        )
+        temporary = secure_store._macos_keychain_service(
+            Path(tempfile.gettempdir()) / "apiagent-test-secrets"
+        )
+
+        self.assertEqual(production, secure_store.MACOS_KEYCHAIN_SERVICE)
+        self.assertNotEqual(temporary, production)
+        self.assertTrue(temporary.startswith(production + b"."))
+
+    def test_round_trip_routes_through_keychain_without_creating_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "secrets"
+            store = SecureStore(root)
+            credential_id = "claude:test-node"
+            secret = "sk-test-secret-value"
+
+            with (
+                patch.object(secure_store, "_macos_security_tool_set") as set_secret,
+                patch.object(
+                    secure_store,
+                    "_macos_security_tool_get",
+                    return_value=secret,
+                ) as get_secret,
+                patch.object(
+                    secure_store, "_macos_security_tool_clear"
+                ) as clear_secret,
+            ):
+                store.set(credential_id, secret)
+                self.assertEqual(store.get(credential_id), secret)
+
+            service = secure_store._macos_keychain_service(root)
+            legacy = secure_store._macos_legacy_keychain_service(root)
+            set_secret.assert_called_once_with(service, credential_id, secret)
+            get_secret.assert_called_once_with(service, credential_id)
+            clear_secret.assert_called_once_with(legacy, credential_id)
+            self.assertFalse(root.exists())
+
+    def test_clear_routes_through_keychain(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SecureStore(Path(tmp))
+
+            with patch.object(secure_store, "_macos_security_tool_clear") as clear_secret:
+                store.clear("claude:removed")
+
+            self.assertEqual(
+                clear_secret.call_args_list,
+                [
+                    call(
+                        secure_store._macos_keychain_service(Path(tmp)),
+                        "claude:removed",
+                    ),
+                    call(
+                        secure_store._macos_legacy_keychain_service(Path(tmp)),
+                        "claude:removed",
+                    ),
+                ],
+            )
+
+    def test_legacy_item_is_copied_to_noninteractive_service_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "secrets"
+            store = SecureStore(root)
+            credential_id = "claude:legacy"
+            secret = "sk-test-legacy"
+            current = secure_store._macos_keychain_service(root)
+            legacy = secure_store._macos_legacy_keychain_service(root)
+
+            with (
+                patch.object(
+                    secure_store,
+                    "_macos_security_tool_get",
+                    side_effect=[KeyError(credential_id), secret, secret],
+                ) as get_secret,
+                patch.object(secure_store, "_macos_security_tool_set") as set_secret,
+                patch.object(
+                    secure_store, "_macos_security_tool_clear"
+                ) as clear_secret,
+            ):
+                self.assertEqual(store.get(credential_id), secret)
+                self.assertEqual(store.get(credential_id), secret)
+
+            self.assertEqual(
+                get_secret.call_args_list,
+                [
+                    call(current, credential_id),
+                    call(legacy, credential_id),
+                    call(current, credential_id),
+                ],
+            )
+            set_secret.assert_called_once_with(current, credential_id, secret)
+            clear_secret.assert_called_once_with(legacy, credential_id)
+
+    def test_matching_legacy_item_is_removed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "secrets"
+            store = SecureStore(root)
+            credential_id = "codex:matching"
+            secret = "sk-test-matching"
+            current = secure_store._macos_keychain_service(root)
+            legacy = secure_store._macos_legacy_keychain_service(root)
+
+            with (
+                patch.object(
+                    secure_store,
+                    "_macos_security_tool_get",
+                    side_effect=[secret, secret],
+                ) as get_secret,
+                patch.object(
+                    secure_store, "_macos_security_tool_clear"
+                ) as clear_secret,
+            ):
+                self.assertEqual(store.get(credential_id), secret)
+
+            self.assertEqual(
+                get_secret.call_args_list,
+                [call(current, credential_id), call(legacy, credential_id)],
+            )
+            clear_secret.assert_called_once_with(legacy, credential_id)
+
+    def test_conflicting_current_and_legacy_items_are_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "secrets"
+            store = SecureStore(root)
+            credential_id = "codex:conflict"
+
+            with (
+                patch.object(
+                    secure_store,
+                    "_macos_security_tool_get",
+                    side_effect=["wrong-v2", "correct-v1"],
+                ),
+                patch.object(
+                    secure_store, "_macos_security_tool_clear"
+                ) as clear_secret,
+            ):
+                with self.assertRaisesRegex(
+                    secure_store.SecureStoreError,
+                    "Conflicting macOS Keychain credentials",
+                ):
+                    store.get(credential_id)
+
+            clear_secret.assert_not_called()
+
+    def test_new_item_allows_noninteractive_access_without_command_line_secret(self) -> None:
+        missing = subprocess.CompletedProcess([], 44, "", "not found")
+        created = subprocess.CompletedProcess([], 0, "", "")
+        secret = "sk-test-not-on-command-line"
+
+        with patch.object(
+            secure_store.subprocess,
+            "run",
+            side_effect=[missing, created],
+        ) as run:
+            secure_store._macos_security_tool_set(
+                b"apiagent.credentials.v2", "claude:test", secret
+            )
+
+        command = run.call_args_list[1].args[0]
+        self.assertIn("-A", command)
+        self.assertNotIn(secret, command)
+        self.assertEqual(
+            run.call_args_list[1].kwargs["input"], f"{secret}\n{secret}\n"
+        )
+
+
+@unittest.skipUnless(sys.platform == "darwin", "macOS Keychain test")
+class MacOSKeychainBackendTests(unittest.TestCase):
+    """Exercise the real macOS Keychain calls, cleaning up after itself.
+
+    Every other suite routes ``SecureStore`` through the in-memory fake in
+    ``tests.support``, so this is the only place the live keychain backend is
+    covered. The cleanup hook runs even when an assertion fails, which keeps
+    throwaway generic passwords out of the developer's login keychain.
+    """
+
+    def test_real_keychain_round_trip_and_clear(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SecureStore(Path(tmp) / "secrets")
+            credential_id = f"apiagent-test:{uuid.uuid4().hex}"
+            secret = "sk-live-keychain-round-trip"
+            self.addCleanup(store.clear, credential_id)
+
+            store.set(credential_id, secret)
+            self.assertEqual(store.get(credential_id), secret)
+
+            store.set(credential_id, "sk-live-keychain-updated")
+            self.assertEqual(store.get(credential_id), "sk-live-keychain-updated")
+
+            store.clear(credential_id)
+            with self.assertRaises(KeyError):
+                store.get(credential_id)
+            self.assertFalse((Path(tmp) / "secrets").exists())
+
+    def test_clear_is_idempotent_for_unknown_credentials(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SecureStore(Path(tmp))
+
+            store.clear(f"apiagent-test:{uuid.uuid4().hex}")
 
 
 if __name__ == "__main__":

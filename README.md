@@ -6,8 +6,8 @@ Cross-platform API profile launchers for Codex CLI and Claude Code.
 - `apiclaude` manages Claude Code API nodes in `~/.apiclaude_config.json`.
 - `apiagent` is a shared entrypoint for both.
 
-On Windows, API keys and tokens are encrypted with DPAPI under
-`~/.apiagent-secrets`. The JSON/TOML config files contain only profile metadata
+The Python CLI launchers protect API keys and tokens with Windows DPAPI or the
+macOS login Keychain. Their JSON/TOML config files contain only profile metadata
 and credential references.
 
 ## Requirements
@@ -469,7 +469,7 @@ apiclaude --api-profile codex-muyuan
 
 The first command creates an isolated Claude node that references the Codex
 Profile; it does not copy its API key. At launch, `apiclaude` reads the key from
-the existing DPAPI-backed credential store, starts CPA and a minimal in-memory
+the existing platform secure credential store, starts CPA and a minimal in-memory
 authentication shim bound only to `127.0.0.1`, and keeps them alive for the
 Claude Code process. CPA performs the Anthropic Messages → OpenAI Responses
 translation. The shim injects the upstream key without placing it in CPA's
@@ -633,10 +633,16 @@ apiclaude --api-profile mysub2api resume
 Pass Claude Code arguments after `apiclaude`:
 
 ```bash
+apiclaude --yolo
 apiclaude --permission-mode bypassPermissions
 apiclaude resume
 apiclaude -c
 ```
+
+`apiclaude --yolo` is a shortcut for
+`apiclaude --permission-mode bypassPermissions`, matching the convenience of
+`apicodex --yolo`. It can also be combined with `--api-profile` and other
+Claude Code arguments.
 
 Other management commands:
 
@@ -695,8 +701,16 @@ saved or passed to the underlying CLI.
 
 ## Credential Storage
 
-- Encryption is bound to the current Windows user through DPAPI. No master
-  password is required.
+- On Windows, encryption is bound to the current user through DPAPI. On macOS,
+  credentials are stored as generic passwords in the user's login Keychain.
+  ApiAgent v2 Keychain items allow non-interactive access within the logged-in
+  user session, so replacing or updating the Python interpreter does not trigger
+  repeated password dialogs. No application-specific master password is required.
+- Existing macOS v1 Keychain items are copied to v2 on first use, read back for
+  exact verification, and then removed. That one-time read may require a final
+  Keychain confirmation; subsequent loads use v2 without prompting. If both
+  versions exist with different values, ApiAgent rejects the conflict instead of
+  silently sending an ambiguous credential. Node listings never read values.
 - Existing plaintext Claude `token` fields and Codex `auth.json` API keys are
   migrated on the first `apiclaude` or `apicodex` load.
 - Migration writes and reads back the encrypted value before removing plaintext
@@ -705,5 +719,5 @@ saved or passed to the underlying CLI.
 - `apicodex` disables ChatGPT-hosted apps/plugins for API profiles so the CLI
   does not attempt unavailable `codex_apps` host authentication. This does not
   affect ordinary `codex` account sessions.
-- Secure credential storage is currently supported on Windows. macOS and Linux
-  secure backends are not implemented yet.
+- Python CLI secure credential storage is supported on Windows and macOS. A
+  Linux secure backend is not implemented yet.

@@ -8,13 +8,14 @@ from unittest.mock import patch
 
 import apiagent
 from codex_history_images import RepairReport
+from tests.support import KeychainIsolationMixin
 
 
 def clean_report(home: Path, dry_run: bool = False) -> RepairReport:
     return RepairReport(codex_home=str(home), dry_run=dry_run)
 
 
-class ApiAgentImageRepairTests(unittest.TestCase):
+class ApiAgentImageRepairTests(KeychainIsolationMixin):
     def test_account_repair_branches_before_profile_or_secret_operations(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

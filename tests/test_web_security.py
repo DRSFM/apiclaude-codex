@@ -8,10 +8,11 @@ from unittest.mock import patch
 
 import apiagent
 from secure_store import SecureStore
+from tests.support import KeychainIsolationMixin
 from web.backend import app as web_app
 
 
-class WebSecurityTests(unittest.TestCase):
+class WebSecurityTests(KeychainIsolationMixin):
     def test_share_api_lists_targets_and_copies_without_credentials(self) -> None:
         targets = [
             {

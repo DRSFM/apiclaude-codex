@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 import apiagent
 from secure_store import SecureStore
+from tests.support import KeychainIsolationMixin
 
 
 def _two_node_config() -> dict:
@@ -32,7 +33,7 @@ def _no_input(prompt: str = "") -> str:
     raise AssertionError(f"unexpected interactive prompt: {prompt!r}")
 
 
-class ApiClaudeCodexStyleCliTests(unittest.TestCase):
+class ApiClaudeCodexStyleCliTests(KeychainIsolationMixin):
     def test_api_list_json_flag_matches_legacy_contract(self) -> None:
         config = _two_node_config()
         output = io.StringIO()
@@ -261,6 +262,7 @@ class ApiClaudeCodexStyleCliTests(unittest.TestCase):
 
         self.assertEqual(code, 0)
         self.assertIn("--api-profile", output.getvalue())
+        self.assertIn("--yolo", output.getvalue())
         load.assert_not_called()
 
     def test_bare_args_still_pass_through_to_claude(self) -> None:
@@ -290,6 +292,30 @@ class ApiClaudeCodexStyleCliTests(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertEqual(
                 run.call_args.args[1], ["--permission-mode", "bypassPermissions"]
+            )
+
+    def test_yolo_expands_to_bypass_permissions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SecureStore(Path(tmp))
+            store.set("claude:relay", "sk-test-relay")
+            config = _two_node_config()
+
+            with (
+                patch.object(apiagent, "SECRET_STORE", store),
+                patch.object(apiagent, "load_claude_config", return_value=config),
+                patch.object(apiagent, "save_claude_config"),
+                patch.object(apiagent, "run_command", return_value=0) as run,
+                patch("builtins.input", _no_input),
+                redirect_stdout(io.StringIO()),
+            ):
+                code = apiagent.claude_main(
+                    ["--api-profile", "relay", "--yolo", "resume"]
+                )
+
+            self.assertEqual(code, 0)
+            self.assertEqual(
+                run.call_args.args[1],
+                ["--permission-mode", "bypassPermissions", "resume"],
             )
 
 

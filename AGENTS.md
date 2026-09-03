@@ -5,6 +5,57 @@
 
 ## 协作修改记录
 
+### 2026-08-27：macOS ApiClaude 钥匙串免重复授权
+
+- 修改简介：macOS 凭据新增免交互 v2 Keychain service，同一登录用户会话内不再按
+  可变的 Python 可执行文件身份重复弹窗；旧 v1 条目首次使用时读回并复制到 v2，
+  精确读回校验后删除旧副本；双版本值冲突时拒绝静默选择。SecureStore 增加
+  进程内缓存，ApiClaude 节点列表不再为了脱敏展示而读取 Token。
+- 修改原因：本机 `uv Python` 更新后代码身份变化，macOS 会重新要求授权；无参数
+  ApiClaude 又在节点列表和实际启动阶段各读取一次，导致同次加载连续输入两次密码。
+- 安全说明：Token 仍只存于登录钥匙串且不进入命令行或明文文件；v2 放宽为当前登录
+  用户会话内免确认访问，以匹配个人 Mac 的明确使用需求。旧 v1 条目暂留作回退。
+- 验证情况：ApiClaude CLI 17 项、macOS 路由 7 项与真实 Keychain 新增/更新/读取/
+  删除 2 项通过；新增回归覆盖迁移读回校验、同值旧副本清理与异值冲突拒绝。
+  本机 `qiandao`、`anyrouter` 已迁移并分别在约 0.12/0.08 秒内无弹窗
+  启动，节点列表无弹窗。`muyuan` 无活动会话，保留首次使用时的一次惰性迁移。
+  全量 `unittest` 199 项中 29 失败 / 4 错误 / 14 跳过，均为既有临时目录边界、
+  Windows 平台假设或 FastAPI 缺失；`pytest` 未安装。中止测试遗留的 1 个随机
+  `apiagent-test:` 钥匙串条目已精确删除；验证 v2 可用后，`qiandao`、`anyrouter`
+  的旧 v1 副本亦已删除，v2 生产凭据保持可用。
+
+### 2026-08-25：ApiClaude 完全权限快捷参数
+
+- 修改简介：新增 `apiclaude --yolo`，启动 Claude Code 时将其展开为
+  `--permission-mode bypassPermissions`，并补充帮助、README 与 CLI 回归测试。
+- 修改原因：让 ApiClaude 与现有 `apicodex --yolo` 保持一致的简便调用方式。
+- 验证情况：ApiClaude CLI 聚焦测试 17 项通过，`py_compile`、`git diff --check`
+  与已安装全局入口的帮助检查通过。全量 `unittest` 运行 195 项，其中本次新增
+  用例通过；其余 27 个失败和 23 个错误来自既有 macOS/Windows 平台假设、
+  Python 3.9 缺少新版标准库参数及 FastAPI 未安装。
+
+### 2026-08-25：macOS 凭据存储与新版 CLI 启动修复
+
+- 修改简介：`SecureStore` 新增 macOS 登录钥匙串后端，通过 Security
+  framework 在进程内完成凭据的新增、更新、读取和删除；Windows DPAPI
+  与现有凭据迁移格式保持不变，并补充 macOS 路由与参数校验回归测试。
+- 修改原因：macOS 安装路径会在首次读取 ApiCodex/ApiClaude 配置时
+  触发明文凭据迁移，原实现却仅支持 Windows DPAPI，导致两个 CLI 启动崩溃。
+- 安全说明：密钥直接经 Security framework 写入当前用户钥匙串，不进入
+  子进程命令行或明文文件；迁移仍在读回验证成功后才清理旧凭据。
+- 测试隔离：新增 `tests/support.py` 的 `KeychainIsolationMixin`，在 macOS 上把
+  `SecureStore` 的钥匙串调用替换为内存假实现，并应用到 6 个会写入凭据的测试类。
+  macOS 后端的 service 名由 store root 派生，临时目录每次运行都不同，若不隔离
+  会在开发者登录钥匙串里按次累积无法读回的 generic password。真实后端改由
+  `MacOSKeychainBackendTests` 覆盖，用 `addCleanup` 保证断言失败也会清理。
+- 验证情况：`tests/test_secure_store.py` 9 项（6 通过 + 3 项 Windows 用例按
+  平台跳过），含真实 Keychain 新增/更新/读取/删除闭环；从仓库外调用已安装
+  `apicodex` / `apiclaude` 的列表和版本链路均通过，迁移后明文字段、旧
+  `auth.json` 密钥与不可读凭据引用均为 0。全量 `unittest` 195 项，钥匙串条目
+  净增 0；与 `origin/main` 逐用例比对无回归，坏项由 64 项降至 50 项。
+  `pytest` 因本机未安装未运行；剩余失败来自既有 Python 3.9 标准库参数缺失、
+  Windows 专用用例与 FastAPI 未安装。
+
 ### 2026-08-07：ApiCodex 认证缓存自动自愈与终端临时认证
 
 - 修改简介：终端启动使用 `ephemeral` 认证并由 DPAPI SecureStore 经环境注入 API Key；Desktop 遇到明确解密失败时自动归档旧缓存并通过 stdin 重建。

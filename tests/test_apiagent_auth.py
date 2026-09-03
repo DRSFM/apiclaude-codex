@@ -12,9 +12,10 @@ from unittest.mock import patch
 
 import apiagent
 from secure_store import SecureStore
+from tests.support import KeychainIsolationMixin
 
 
-class ApiAgentAuthTests(unittest.TestCase):
+class ApiAgentAuthTests(KeychainIsolationMixin):
     @unittest.skipUnless(__import__("os").name == "nt", "Windows CLI resolution test")
     def test_codex_cli_prefers_apicodex_local_install_over_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

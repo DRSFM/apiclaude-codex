@@ -13,9 +13,10 @@ from unittest.mock import Mock, patch
 import apiagent
 import claude_codex_bridge
 from secure_store import SecureStore
+from tests.support import KeychainIsolationMixin
 
 
-class ClaudeCodexBridgeTests(unittest.TestCase):
+class ClaudeCodexBridgeTests(KeychainIsolationMixin):
     def test_mcp_tool_name_alias_is_restored_in_responses_output(self) -> None:
         request = json.dumps(
             {
@@ -467,24 +468,32 @@ class ClaudeCodexBridgeTests(unittest.TestCase):
         self.assertNotIn("sk-upstream-secret", config)
         self.assertNotIn("upstream_api_key", config)
 
-    def test_desktop_bridge_token_is_stable_and_dpapi_backed(self) -> None:
+    def test_desktop_bridge_token_is_stable_and_securely_stored(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = SecureStore(Path(tmp))
-            with patch.object(apiagent, "SECRET_STORE", store):
-                first = apiagent.get_or_create_claude_desktop_bridge_token(
-                    "gpt-shell"
-                )
-                second = apiagent.get_or_create_claude_desktop_bridge_token(
-                    "gpt-shell"
-                )
-                other = apiagent.get_or_create_claude_desktop_bridge_token(
-                    "other-shell"
-                )
+            try:
+                with patch.object(apiagent, "SECRET_STORE", store):
+                    first = apiagent.get_or_create_claude_desktop_bridge_token(
+                        "gpt-shell"
+                    )
+                    second = apiagent.get_or_create_claude_desktop_bridge_token(
+                        "gpt-shell"
+                    )
+                    other = apiagent.get_or_create_claude_desktop_bridge_token(
+                        "other-shell"
+                    )
 
-            self.assertEqual(first, second)
-            self.assertNotEqual(first, other)
-            self.assertGreaterEqual(len(first), 32)
-            self.assertNotIn(first.encode("utf-8"), next(Path(tmp).glob("*.bin")).read_bytes())
+                self.assertEqual(first, second)
+                self.assertNotEqual(first, other)
+                self.assertGreaterEqual(len(first), 32)
+                if os.name == "nt":
+                    stored = next(Path(tmp).glob("*.bin")).read_bytes()
+                    self.assertNotIn(first.encode("utf-8"), stored)
+                else:
+                    self.assertFalse(list(Path(tmp).glob("*.bin")))
+            finally:
+                store.clear("claude-desktop-bridge:gpt-shell")
+                store.clear("claude-desktop-bridge:other-shell")
 
     def test_desktop_launch_delegates_to_hidden_worker_without_loading_secrets(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
