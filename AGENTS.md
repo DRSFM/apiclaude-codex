@@ -5,6 +5,20 @@
 
 ## 协作修改记录
 
+### 2026-09-03：合并远端 Profile 代理与本地 Codex CLI 选择
+
+- 修改简介：将远端 `8385f3b` 的 ApiClaude Profile 代理和 Codex/Claude 共享 MCP
+  更新合并进本地 `main`，同时保留本地 `useCustomCodexCli` 迁移、`--cus` 开关及
+  认证自愈改动；16 个运行模块已同步到 `C:\tools`。
+- 修改原因：远端与本地从共同基线分别演进，功能不重复但在入口、文档和测试文件上
+  存在重叠，需要三方合并而不能覆盖任一侧。
+- 安全说明：合并前本地修改保存在 `stash@{0}`，原修改增删行数与恢复后完全一致；
+  部署及 ApiClaude 配置迁移前均创建时间戳备份，未自动启用账号 MCP 共享。
+- 验证情况：冲突区域 73 项、完整 `unittest` 232 项通过（12 项按平台跳过），
+  `py_compile`、`git diff --check` 和 16 个部署模块 SHA-256 校验通过；6 个 Claude
+  节点均迁移为 Profile 代理开启，当前 7897 端口可连接，9 个 Codex Profile 的
+  官方/订做 CLI 选择字段保持可读。当前 Python 环境未安装 `pytest`。
+
 ### 2026-09-03：合并远端 macOS 凭据支持与 ApiClaude 权限快捷参数
 
 - 修改简介：先将本地 MCP 全局共享与 ApiClaude 节点代理功能提交，再基于最新
@@ -63,6 +77,30 @@
   本机 14 个自定义 Skill 逐文件 SHA-256 校验后迁入共享目录，4 个用户 MCP 已同步
   到 13 个 Profile，二次 dry-run 无待更新项，账号态与 API Profile 列表均验证通过。
 
+### 2026-09-03：ApiCodex 默认使用官方 CLI 并支持按 Profile 切换
+
+- 修改简介：Codex CLI 解析改为默认选择官方独立安装版或 PATH 中的非订做版本；
+  Profile 新增非敏感的 `useCustomCodexCli` 布尔字段，旧 Profile 与新建 Profile
+  均默认为 `false`。新增 `apicodex --cus [--api-profile NAME]`，交互默认 `No`，
+  仅明确选择 `Yes` 时使用 `~/.codex-local/bin/codex` 订做版。
+- 修改原因：此前解析器会无条件优先订做版，无法让不同 Profile 稳定选择官方 CLI，
+  也会使 PATH 中的官方更新对 ApiCodex 启动路径不生效。
+- 安全说明：迁移只增加非敏感布尔元数据，不读取或复制 API Key；真实
+  `profiles.json` 与 `C:\tools` 运行模块覆盖前均已创建时间戳快照，显式
+  `APICODEX_CODEX_EXE` 诊断覆盖继续保持最高优先级。
+- 验证情况：本机 9 个 Profile 均读回 `useCustomCodexCli=false`，部署后的
+  `--cus` 默认 No 路径解析到官方 `codex-cli 0.153.0`；聚焦测试 52 项、完整
+  `unittest` 211 项通过（12 项按环境跳过），`py_compile`、`git diff --check`
+  与 14 个部署模块 SHA-256 校验通过。当前环境未安装 `pytest`。
+
+### 2026-09-03：恢复本机 ApiCodex 默认上下文配置
+
+- 修改简介：移除 `tiantiansub2api` Profile 中显式的 512k 上下文窗口与 456k
+  自动压缩阈值覆盖，恢复使用模型目录提供的 272k 上下文及 Codex 默认压缩策略。
+- 修改原因：本机临时放大的上下文配置不再需要，按用户要求恢复模型默认值。
+- 验证情况：读取配置确认两个覆盖字段已移除，模型目录中 `gpt-5.6-sol` 的
+  `context_window` 与 `max_context_window` 均为 272000，并通过 Codex 模型探测复核。
+
 ### 2026-08-27：macOS ApiClaude 钥匙串免重复授权
 
 - 修改简介：macOS 凭据新增免交互 v2 Keychain service，同一登录用户会话内不再按
@@ -113,7 +151,6 @@
   净增 0；与 `origin/main` 逐用例比对无回归，坏项由 64 项降至 50 项。
   `pytest` 因本机未安装未运行；剩余失败来自既有 Python 3.9 标准库参数缺失、
   Windows 专用用例与 FastAPI 未安装。
-
 ### 2026-08-07：ApiCodex 认证缓存自动自愈与终端临时认证
 
 - 修改简介：终端启动使用 `ephemeral` 认证并由 DPAPI SecureStore 经环境注入 API Key；Desktop 遇到明确解密失败时自动归档旧缓存并通过 stdin 重建。

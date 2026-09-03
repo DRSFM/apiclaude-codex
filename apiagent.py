@@ -274,8 +274,44 @@ def run_command(
         return 130
 
 
-def find_codex_cli_executable() -> str | None:
-    """Resolve the Codex CLI used by ApiCodex, preferring its local build."""
+def custom_codex_cli_path() -> Path:
+    executable = "codex.exe" if os.name == "nt" else "codex"
+    return HOME / ".codex-local" / "bin" / executable
+
+
+def find_official_codex_cli_executable() -> str | None:
+    """Resolve an official Codex CLI without selecting the ApiCodex local build."""
+    custom_path = custom_codex_cli_path()
+    if os.name == "nt":
+        local_app_data = clean_hidden_prefix(os.environ.get("LOCALAPPDATA", ""))
+        if local_app_data:
+            standalone = (
+                Path(local_app_data)
+                / "Programs"
+                / "OpenAI"
+                / "Codex"
+                / "bin"
+                / "codex.exe"
+            )
+            if standalone.is_file():
+                return str(standalone)
+
+    try:
+        custom_parent = custom_path.parent.resolve()
+        filtered_path = os.pathsep.join(
+            entry
+            for entry in os.get_exec_path()
+            if Path(entry).expanduser().resolve() != custom_parent
+        )
+    except (OSError, RuntimeError, ValueError):
+        filtered_path = os.environ.get("PATH", "")
+    return shutil.which("codex", path=filtered_path)
+
+
+def find_codex_cli_executable(
+    profile: dict[str, Any] | None = None,
+) -> str | None:
+    """Resolve the official CLI by default, with per-Profile custom opt-in."""
     override = clean_hidden_prefix(os.environ.get(APICODEX_CODEX_EXE_ENV, ""))
     if override:
         candidate = Path(override).expanduser()
@@ -287,12 +323,11 @@ def find_codex_cli_executable() -> str | None:
         )
         return None
 
-    if os.name == "nt":
-        local_cli = HOME / ".codex-local" / "bin" / "codex.exe"
-        if local_cli.is_file():
-            return str(local_cli)
+    if bool((profile or {}).get("useCustomCodexCli", False)):
+        local_cli = custom_codex_cli_path()
+        return str(local_cli) if local_cli.is_file() else None
 
-    return shutil.which("codex")
+    return find_official_codex_cli_executable()
 
 
 def start_detached_process(
@@ -570,8 +605,15 @@ def load_codex_profiles() -> list[dict[str, Any]]:
     initialize_codex_store()
     data = read_json(CODEX_PROFILES_PATH, {"version": 1, "profiles": []})
     profiles = list(data.get("profiles") or [])
-    if migrate_codex_secrets(profiles, SECRET_STORE):
+    migrated_secrets = migrate_codex_secrets(profiles, SECRET_STORE)
+    migrated_cli_preferences = False
+    for profile in profiles:
+        if not isinstance(profile.get("useCustomCodexCli"), bool):
+            profile["useCustomCodexCli"] = False
+            migrated_cli_preferences = True
+    if migrated_secrets or migrated_cli_preferences:
         save_codex_profiles(profiles)
+    if migrated_secrets:
         finalize_codex_migration(profiles, SECRET_STORE)
     return profiles
 
@@ -1069,8 +1111,10 @@ def merge_codex_builtin_model_metadata(
     return {**payload, "models": merged_models}
 
 
-def fetch_codex_builtin_model_catalog() -> dict[str, Any] | None:
-    exe = find_codex_cli_executable()
+def fetch_codex_builtin_model_catalog(
+    profile: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    exe = find_codex_cli_executable(profile)
     if not exe:
         return None
     if os.name == "nt" and Path(exe).suffix.lower() in {".bat", ".cmd"}:
@@ -2079,13 +2123,17 @@ def archive_unreadable_codex_auth(home: Path) -> Path | None:
     return target
 
 
-def ensure_codex_keyring_auth(home: Path, api_key: str) -> bool:
-    """Sync one API profile's key into the official Codex keyring."""
+def ensure_codex_keyring_auth(
+    home: Path,
+    api_key: str,
+    profile: dict[str, Any] | None = None,
+) -> bool:
+    """Sync one API profile's key into the selected Codex CLI keyring."""
     if os.name != "nt":
         print("Error: Codex keyring authentication requires Windows.", file=sys.stderr)
         return False
     prepare_codex_desktop_profile(home, {})
-    codex_exe = find_codex_cli_executable()
+    codex_exe = find_codex_cli_executable(profile)
     if not codex_exe:
         print("Error: Codex CLI was not found.", file=sys.stderr)
         return False
@@ -2151,6 +2199,7 @@ def show_codex_profiles(profiles: list[dict[str, Any]]) -> None:
     for index, profile in enumerate(profiles, 1):
         print(
             f"[{index}] {profile.get('name')}  {profile.get('baseUrl')}  "
+            f"cli={'custom' if profile.get('useCustomCodexCli') else 'official'}  "
             f"lastUsed={profile.get('lastUsedAt') or '-'}"
         )
 
@@ -2168,6 +2217,7 @@ def codex_profile_metadata(profile: dict[str, Any]) -> dict[str, Any]:
         "baseUrl": str(profile.get("baseUrl") or ""),
         "profileHome": str(codex_profile_home(profile).resolve()),
         "desktopData": str((CODEX_DESKTOP_DATA_ROOT / profile_id).resolve()),
+        "useCustomCodexCli": bool(profile.get("useCustomCodexCli", False)),
         "createdAt": profile.get("createdAt"),
         "lastUsedAt": profile.get("lastUsedAt"),
     }
@@ -2284,6 +2334,7 @@ def add_codex_profile(
             "home": home_rel,
             "createdAt": now_iso(),
             "lastUsedAt": None,
+            "useCustomCodexCli": False,
         }
         home = codex_profile_home(profile)
 
@@ -2325,7 +2376,7 @@ def add_codex_profile(
             )
             catalog_payload = merge_codex_builtin_model_metadata(
                 catalog_payload,
-                fetch_codex_builtin_model_catalog(),
+                fetch_codex_builtin_model_catalog(profile),
             )
         except ValueError as exc:
             print(f"Error: {exc}", file=sys.stderr)
@@ -2439,6 +2490,44 @@ def update_codex_last_used(selected: dict[str, Any]) -> None:
         if profile.get("id") == selected.get("id"):
             profile["lastUsedAt"] = now_iso()
     save_codex_profiles(profiles)
+
+
+def configure_codex_custom_cli(requested: str | None = None) -> int:
+    profiles = load_codex_profiles()
+    selected = select_codex_profile(profiles, requested)
+    if not selected:
+        return 1
+    choice = input(
+        f"Use custom Codex CLI for '{selected.get('name')}'? [y/N]: "
+    ).strip().casefold()
+    if choice not in {"", "n", "no", "y", "yes"}:
+        print("Error: enter yes or no.", file=sys.stderr)
+        return 1
+    use_custom = choice in {"y", "yes"}
+    if use_custom:
+        custom_cli = custom_codex_cli_path()
+        executable = str(custom_cli) if custom_cli.is_file() else None
+    else:
+        executable = find_official_codex_cli_executable()
+    if not executable:
+        label = "custom" if use_custom else "official"
+        print(
+            f"Error: the {label} Codex CLI was not found.",
+            file=sys.stderr,
+        )
+        return 1
+    selected["useCustomCodexCli"] = use_custom
+    save_codex_profiles(profiles)
+    saved = find_profile(load_codex_profiles(), str(selected.get("id") or ""))
+    if saved is None or bool(saved.get("useCustomCodexCli")) != use_custom:
+        print("Error: failed to verify the Codex CLI preference.", file=sys.stderr)
+        return 1
+    label = "custom" if use_custom else "official"
+    print(
+        f"Profile '{selected.get('name')}' now uses the {label} Codex CLI: "
+        f"{executable}."
+    )
+    return 0
 
 
 def upgrade_codex() -> int:
@@ -2574,7 +2663,7 @@ def launch_codex_desktop(
     dream_skin_id = dream_skin_instance_id(selected)
     desktop_data = CODEX_DESKTOP_DATA_ROOT / profile_id
     desktop_data.mkdir(parents=True, exist_ok=True)
-    if not ensure_codex_keyring_auth(home, api_key):
+    if not ensure_codex_keyring_auth(home, api_key, selected):
         return 1
     add_current_project_trust(home)
     update_codex_last_used(selected)
@@ -2747,6 +2836,7 @@ def codex_help() -> None:
   apicodex shared sync             Refresh shared MCP config now
   apicodex shared status           Show account MCP sharing status
   apicodex shared disable          Remove managed MCP copies from API profiles
+  apicodex --cus                   Choose a Profile and toggle custom Codex CLI use
   apicodex --vscode                Choose a profile and open VS Code here
   apicodex --desktop               Choose a profile and open an isolated desktop app
   apicodex --repair-images         Repair one API profile's missing history images
@@ -2823,6 +2913,7 @@ def codex_main(args: list[str]) -> int:
     add_reasoning_effort: str | None = None
     add_model_catalog: Path | None = None
     do_add = do_list = do_remove = do_help = do_upgrade = do_vscode = False
+    do_custom_cli = False
     do_desktop = do_json = False
     add_mode = any(arg in ("--api-add", "--setup") for arg in args)
     repair_mode = "--repair-images" in args
@@ -2837,6 +2928,8 @@ def codex_main(args: list[str]) -> int:
             do_list = True
         elif arg == "--api-remove":
             do_remove = True
+        elif arg == "--cus":
+            do_custom_cli = True
         elif arg == "--up":
             do_upgrade = True
         elif arg == "--vscode":
@@ -2892,7 +2985,17 @@ def codex_main(args: list[str]) -> int:
         i += 1
 
     if do_repair:
-        if do_help or do_add or do_list or do_remove or do_upgrade or do_vscode or do_desktop or do_json:
+        if (
+            do_help
+            or do_add
+            or do_list
+            or do_remove
+            or do_upgrade
+            or do_vscode
+            or do_desktop
+            or do_custom_cli
+            or do_json
+        ):
             print(
                 "Error: --repair-images cannot be combined with another management command.",
                 file=sys.stderr,
@@ -2987,6 +3090,24 @@ def codex_main(args: list[str]) -> int:
         # arguments, preserving the launcher contract.
         pass
 
+    if do_custom_cli:
+        if (
+            do_add
+            or do_list
+            or do_remove
+            or do_help
+            or do_upgrade
+            or do_vscode
+            or do_desktop
+            or do_json
+            or pass_through
+        ):
+            print(
+                "Error: --cus cannot be combined with another command.",
+                file=sys.stderr,
+            )
+            return 1
+        return configure_codex_custom_cli(requested)
     if do_help:
         codex_help()
         return 0
@@ -3080,7 +3201,7 @@ def codex_main(args: list[str]) -> int:
 
     add_current_project_trust(home)
     update_codex_last_used(selected)
-    codex_exe = find_codex_cli_executable()
+    codex_exe = find_codex_cli_executable(selected)
     if not codex_exe:
         print("Error: Codex CLI was not found.", file=sys.stderr)
         return 1

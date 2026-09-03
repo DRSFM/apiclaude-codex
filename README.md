@@ -113,9 +113,15 @@ apicodex --api-list --json
 
 The JSON envelope has `schemaVersion` and `profiles`. Each profile exposes only
 non-sensitive metadata: `id`, `instanceId`, `name`, `baseUrl`, `profileHome`,
-`desktopData`, and `lastUsedAt`. It never includes API keys, tokens, cookies,
-`auth.json` contents, or keyring values. Consumers should reject unsupported
-schema versions and treat profile IDs as opaque validated identifiers.
+`desktopData`, `useCustomCodexCli`, and `lastUsedAt`. It never includes API keys,
+tokens, cookies, `auth.json` contents, or keyring values. Consumers should reject
+unsupported schema versions and treat profile IDs as opaque validated identifiers.
+
+ApiCodex uses the official Codex CLI by default for every existing and newly
+created Profile. To opt one Profile into the local custom build, run
+`apicodex --cus` (or add `--api-profile NAME`) and answer `yes`. Pressing Enter
+accepts the default `no` and switches the selected Profile back to the official
+CLI.
 
 Choose a profile and start Codex:
 

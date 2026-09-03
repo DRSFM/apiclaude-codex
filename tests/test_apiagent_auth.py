@@ -17,22 +17,58 @@ from tests.support import KeychainIsolationMixin
 
 class ApiAgentAuthTests(KeychainIsolationMixin):
     @unittest.skipUnless(__import__("os").name == "nt", "Windows CLI resolution test")
-    def test_codex_cli_prefers_apicodex_local_install_over_path(self) -> None:
+    def test_codex_cli_defaults_to_official_standalone_install(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
-            local_cli = home / ".codex-local" / "bin" / "codex.exe"
-            local_cli.parent.mkdir(parents=True)
-            local_cli.write_bytes(b"local-cli")
+            custom_cli = home / ".codex-local" / "bin" / "codex.exe"
+            custom_cli.parent.mkdir(parents=True)
+            custom_cli.write_bytes(b"custom-cli")
+            local_app_data = home / "AppData" / "Local"
+            official_cli = (
+                local_app_data / "Programs" / "OpenAI" / "Codex" / "bin" / "codex.exe"
+            )
+            official_cli.parent.mkdir(parents=True)
+            official_cli.write_bytes(b"official-cli")
 
             with (
                 patch.object(apiagent, "HOME", home),
-                patch.dict(os.environ, {}, clear=False),
-                patch.object(apiagent.shutil, "which", return_value="C:/official/codex.exe"),
+                patch.dict(
+                    os.environ,
+                    {
+                        apiagent.APICODEX_CODEX_EXE_ENV: "",
+                        "LOCALAPPDATA": str(local_app_data),
+                    },
+                    clear=False,
+                ),
             ):
-                os.environ.pop(apiagent.APICODEX_CODEX_EXE_ENV, None)
-                resolved = apiagent.find_codex_cli_executable()
+                resolved = apiagent.find_codex_cli_executable(
+                    {"useCustomCodexCli": False}
+                )
 
-            self.assertEqual(resolved, str(local_cli))
+            self.assertEqual(resolved, str(official_cli))
+
+    def test_codex_cli_uses_local_build_only_for_custom_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            custom_cli = home / ".codex-local" / "bin" / (
+                "codex.exe" if os.name == "nt" else "codex"
+            )
+            custom_cli.parent.mkdir(parents=True)
+            custom_cli.write_bytes(b"custom-cli")
+
+            with (
+                patch.object(apiagent, "HOME", home),
+                patch.dict(
+                    os.environ,
+                    {apiagent.APICODEX_CODEX_EXE_ENV: ""},
+                    clear=False,
+                ),
+            ):
+                resolved = apiagent.find_codex_cli_executable(
+                    {"useCustomCodexCli": True}
+                )
+
+            self.assertEqual(resolved, str(custom_cli))
 
     def test_codex_cli_explicit_override_has_highest_priority(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -105,6 +141,7 @@ class ApiAgentAuthTests(KeychainIsolationMixin):
             self.assertRegex(metadata["instanceId"], r"^relay-profile-[a-f0-9]{8}$")
             self.assertEqual(metadata["name"], "中继配置")
             self.assertEqual(metadata["baseUrl"], "https://example.test/v1")
+            self.assertFalse(metadata["useCustomCodexCli"])
             self.assertEqual(
                 metadata["desktopData"],
                 str((root / ".desktop" / "relay_profile").resolve()),
@@ -112,6 +149,106 @@ class ApiAgentAuthTests(KeychainIsolationMixin):
             self.assertNotIn("credentialId", metadata)
             self.assertNotIn("apiKey", metadata)
             self.assertNotIn("must-not-leak", output.getvalue())
+
+    def test_existing_profiles_migrate_to_official_codex_cli(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            profiles_path = Path(tmp) / "profiles.json"
+            profiles_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "profiles": [
+                            {"id": "relay", "name": "relay", "home": "profiles/relay"}
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with (
+                patch.object(apiagent, "CODEX_PROFILES_PATH", profiles_path),
+                patch.object(apiagent, "initialize_codex_store"),
+                patch.object(apiagent, "migrate_codex_secrets", return_value=False),
+            ):
+                profiles = apiagent.load_codex_profiles()
+
+            self.assertFalse(profiles[0]["useCustomCodexCli"])
+            saved = json.loads(profiles_path.read_text(encoding="utf-8"))
+            self.assertFalse(saved["profiles"][0]["useCustomCodexCli"])
+
+    def test_cus_can_opt_in_then_defaults_back_to_official(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            profiles_path = root / "profiles.json"
+            profile = {
+                "id": "relay",
+                "name": "relay",
+                "home": "profiles/relay",
+                "useCustomCodexCli": False,
+            }
+            profiles_path.write_text(
+                json.dumps({"version": 1, "profiles": [profile]}),
+                encoding="utf-8",
+            )
+            custom_cli = root / ("codex.exe" if os.name == "nt" else "codex")
+            custom_cli.write_bytes(b"custom-cli")
+
+            with (
+                patch.object(apiagent, "CODEX_PROFILES_PATH", profiles_path),
+                patch.object(apiagent, "initialize_codex_store"),
+                patch.object(apiagent, "migrate_codex_secrets", return_value=False),
+                patch.object(apiagent, "custom_codex_cli_path", return_value=custom_cli),
+                patch("builtins.input", return_value="yes"),
+            ):
+                self.assertEqual(apiagent.configure_codex_custom_cli("relay"), 0)
+            saved = json.loads(profiles_path.read_text(encoding="utf-8"))
+            self.assertTrue(saved["profiles"][0]["useCustomCodexCli"])
+
+            with (
+                patch.object(apiagent, "CODEX_PROFILES_PATH", profiles_path),
+                patch.object(apiagent, "initialize_codex_store"),
+                patch.object(apiagent, "migrate_codex_secrets", return_value=False),
+                patch.object(apiagent, "custom_codex_cli_path", return_value=custom_cli),
+                patch.object(
+                    apiagent,
+                    "find_official_codex_cli_executable",
+                    return_value="C:/official/codex.exe",
+                ),
+                patch("builtins.input", return_value=""),
+            ):
+                self.assertEqual(apiagent.configure_codex_custom_cli("relay"), 0)
+            saved = json.loads(profiles_path.read_text(encoding="utf-8"))
+            self.assertFalse(saved["profiles"][0]["useCustomCodexCli"])
+
+    def test_cus_cli_routes_profile_selection(self) -> None:
+        with patch.object(
+            apiagent, "configure_codex_custom_cli", return_value=0
+        ) as configure:
+            code = apiagent.codex_main(["--cus", "--api-profile", "relay"])
+
+        self.assertEqual(code, 0)
+        configure.assert_called_once_with("relay")
+
+    def test_cus_does_not_save_when_official_cli_is_missing(self) -> None:
+        profile = {
+            "id": "relay",
+            "name": "relay",
+            "home": "profiles/relay",
+            "useCustomCodexCli": True,
+        }
+        with (
+            patch.object(apiagent, "load_codex_profiles", return_value=[profile]),
+            patch.object(
+                apiagent, "find_official_codex_cli_executable", return_value=None
+            ),
+            patch.object(apiagent, "save_codex_profiles") as save,
+            patch("builtins.input", return_value=""),
+            redirect_stderr(io.StringIO()),
+        ):
+            code = apiagent.configure_codex_custom_cli("relay")
+
+        self.assertEqual(code, 1)
+        self.assertTrue(profile["useCustomCodexCli"])
+        save.assert_not_called()
 
     def test_api_profile_json_rejects_unsafe_home_without_exposing_it(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -167,14 +304,22 @@ class ApiAgentAuthTests(KeychainIsolationMixin):
                 encoding="utf-8",
             )
 
+            profile = {"useCustomCodexCli": True}
             with (
-                patch.object(apiagent, "find_codex_cli_executable", return_value="C:/custom/codex.exe"),
+                patch.object(
+                    apiagent,
+                    "find_codex_cli_executable",
+                    return_value="C:/custom/codex.exe",
+                ) as find_cli,
                 patch.object(apiagent, "codex_auth_decryption_failed", return_value=False),
                 patch.object(apiagent, "run_command", return_value=0) as run,
             ):
-                result = apiagent.ensure_codex_keyring_auth(home, "sk-test-secret")
+                result = apiagent.ensure_codex_keyring_auth(
+                    home, "sk-test-secret", profile
+                )
 
             self.assertTrue(result)
+            find_cli.assert_called_once_with(profile)
             self.assertEqual(
                 run.call_args.args,
                 ("C:/custom/codex.exe", ["login", "--with-api-key"]),
@@ -263,7 +408,7 @@ class ApiAgentAuthTests(KeychainIsolationMixin):
             )
             self.assertEqual(start.call_args.args[0], str(desktop_exe))
             keyring.assert_called_once_with(
-                codex_home / "profiles" / "relay", "sk-test-secret"
+                codex_home / "profiles" / "relay", "sk-test-secret", profile
             )
             self.assertEqual(
                 start.call_args.args[1],
@@ -850,12 +995,14 @@ class ApiAgentAuthTests(KeychainIsolationMixin):
                 apiagent,
                 "find_codex_cli_executable",
                 return_value="C:/tools/codex.exe",
-            ),
+            ) as find_cli,
             patch.object(apiagent.subprocess, "run", return_value=completed) as run,
         ):
-            payload = apiagent.fetch_codex_builtin_model_catalog()
+            profile = {"useCustomCodexCli": True}
+            payload = apiagent.fetch_codex_builtin_model_catalog(profile)
 
         self.assertEqual(payload, builtin)
+        find_cli.assert_called_once_with(profile)
         command = run.call_args.args[0]
         self.assertEqual(command, ["C:/tools/codex.exe", "debug", "models"])
         probe_env = run.call_args.kwargs["env"]
@@ -909,6 +1056,7 @@ class ApiAgentAuthTests(KeychainIsolationMixin):
             self.assertEqual(saved_profile["model"], "vendor-model")
             self.assertEqual(saved_profile["reasoningEffort"], "medium")
             self.assertEqual(saved_profile["modelCatalog"], "models.json")
+            self.assertFalse(saved_profile["useCustomCodexCli"])
 
     def test_api_add_rejects_catalog_without_selected_model_before_secret_write(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
