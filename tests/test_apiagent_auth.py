@@ -1332,7 +1332,10 @@ class ApiAgentAuthTests(KeychainIsolationMixin):
                 code = apiagent.run_claude_node(config, "relay", ["--version"])
 
             self.assertEqual(code, 0)
-            self.assertEqual(run.call_args.args[1], ["--version"])
+            self.assertEqual(
+                run.call_args.args[1],
+                ["--autocompact", "auto", "--model", "opus[1m]", "--version"],
+            )
             self.assertNotIn("sk-test-secret", " ".join(run.call_args.args[1]))
             self.assertEqual(
                 run.call_args.kwargs["env"]["ANTHROPIC_AUTH_TOKEN"],

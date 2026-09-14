@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import json
 import os
 import shutil
@@ -22,6 +23,8 @@ _ANTHROPIC_FAMILY_TIERS = ("haiku", "sonnet", "opus", "fable", "mythos")
 _CONFIG_NAMESPACE = uuid.UUID("7fb2e18b-0cf0-45ca-aeda-83d9db4248c2")
 _RUNTIME_DIR_NAME = ".apiclaude-runtime"
 _CLAUDE_CODE_CONFIG_DIR_NAME = "claude-code-config"
+_DESKTOP_LOCAL_APP_DATA_DIR_NAME = ".desktop-localappdata"
+_DESKTOP_3P_CONFIG_DIR_NAME = "Claude-3p"
 _GATEWAY_MCP_SERVER_NAME = "apiclaude-web"
 _WEB_SEARCH_BASE_URL_ENV = "APICLAUDE_WEB_SEARCH_BASE_URL"
 _WEB_SEARCH_TOKEN_ENV = "APICLAUDE_WEB_SEARCH_TOKEN"
@@ -61,7 +64,35 @@ def _desktop_inference_models(
     model: str,
     route_model: str,
     extra_models: Sequence[str] | None,
+    native_models: Sequence[str] | None = None,
+    native_models_support_1m: bool = False,
 ) -> list[dict[str, Any]]:
+    if native_models is not None:
+        entries: list[dict[str, Any]] = []
+        seen_names: set[str] = set()
+        default_tiers: set[str] = set()
+        for value in native_models:
+            name = str(value).strip()
+            if not name or name in seen_names:
+                continue
+            entry: dict[str, Any] = {
+                "name": name,
+                "labelOverride": name,
+            }
+            if native_models_support_1m:
+                entry["supports1m"] = True
+                if not entries:
+                    entry["prefer1m"] = True
+            tier = _anthropic_family_tier(name)
+            if tier:
+                entry["anthropicFamilyTier"] = tier
+                if tier not in default_tiers:
+                    entry["isFamilyDefault"] = True
+                    default_tiers.add(tier)
+            entries.append(entry)
+            seen_names.add(name)
+        return entries
+
     entries: list[dict[str, Any]] = [
         {
             "name": route_model,
@@ -300,48 +331,145 @@ def prepare_claude_gateway_mcp_config(config_dir: Path) -> None:
     _atomic_write_json(user_config_path, user_config)
 
 
-def prepare_claude_desktop_profile(
-    profile_dir: Path,
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _file_is_append_only_extension(candidate: Path, prefix: Path) -> bool:
+    prefix_before = prefix.stat()
+    if candidate.stat().st_size < prefix_before.st_size:
+        return False
+    remaining = prefix_before.st_size
+    with prefix.open("rb") as prefix_handle, candidate.open("rb") as candidate_handle:
+        while remaining:
+            chunk_size = min(1024 * 1024, remaining)
+            prefix_chunk = prefix_handle.read(chunk_size)
+            candidate_chunk = candidate_handle.read(chunk_size)
+            if len(prefix_chunk) != chunk_size or prefix_chunk != candidate_chunk:
+                return False
+            remaining -= chunk_size
+    prefix_after = prefix.stat()
+    return (
+        prefix_after.st_size == prefix_before.st_size
+        and prefix_after.st_mtime_ns == prefix_before.st_mtime_ns
+    )
+
+
+def migrate_claude_desktop_sessions(
+    legacy_config_dir: Path,
+    target_config_dir: Path,
+) -> list[Path]:
+    """Copy legacy Desktop transcripts into the node's canonical config home."""
+
+    legacy_config_dir = legacy_config_dir.expanduser().resolve()
+    target_config_dir = target_config_dir.expanduser().resolve()
+    if legacy_config_dir == target_config_dir:
+        return []
+    source_projects = legacy_config_dir / "projects"
+    if not source_projects.is_dir() or source_projects.is_symlink():
+        return []
+
+    migrated: list[Path] = []
+    for source_project in sorted(source_projects.iterdir(), key=lambda path: path.name):
+        if not source_project.is_dir() or source_project.is_symlink():
+            continue
+        for source in sorted(source_project.glob("*.jsonl"), key=lambda path: path.name):
+            if not source.is_file() or source.is_symlink():
+                continue
+            try:
+                session_id = str(uuid.UUID(source.stem))
+            except ValueError:
+                continue
+            if session_id != source.stem.lower():
+                continue
+
+            destination_dir = target_config_dir / "projects" / source_project.name
+            destination = destination_dir / source.name
+            if destination.exists():
+                if not destination.is_file() or destination.is_symlink():
+                    raise ClaudeDesktopError(
+                        f"Claude session migration target is unsafe: {destination}"
+                    )
+                if (
+                    _file_sha256(source) != _file_sha256(destination)
+                    and not _file_is_append_only_extension(destination, source)
+                ):
+                    raise ClaudeDesktopError(
+                        "Claude session migration found conflicting transcript "
+                        f"'{session_id}'; neither file was changed"
+                    )
+                continue
+
+            destination_dir.mkdir(parents=True, exist_ok=True)
+            temporary = destination.with_name(
+                f".{destination.name}.{uuid.uuid4().hex}.tmp"
+            )
+            try:
+                shutil.copy2(source, temporary)
+                if _file_sha256(source) != _file_sha256(temporary):
+                    raise ClaudeDesktopError(
+                        f"Claude session migration verification failed for '{session_id}'"
+                    )
+                try:
+                    os.link(temporary, destination)
+                except FileExistsError:
+                    if (
+                        not destination.is_file()
+                        or destination.is_symlink()
+                        or _file_sha256(source) != _file_sha256(destination)
+                    ):
+                        raise ClaudeDesktopError(
+                            "Claude session migration found conflicting transcript "
+                            f"'{session_id}'; neither file was changed"
+                        ) from None
+                else:
+                    migrated.append(destination)
+            finally:
+                temporary.unlink(missing_ok=True)
+    return migrated
+
+
+def claude_desktop_effective_user_data_dir(profile_dir: Path) -> Path:
+    """Return the user-data directory used by current Claude Desktop builds."""
+
+    return (
+        profile_dir.expanduser().resolve()
+        / _DESKTOP_LOCAL_APP_DATA_DIR_NAME
+        / _DESKTOP_3P_CONFIG_DIR_NAME
+    )
+
+
+def _desktop_local_app_data_dir(profile_dir: Path) -> Path:
+    return claude_desktop_effective_user_data_dir(profile_dir).parent
+
+
+def _write_claude_desktop_gateway_config(
+    config_dir: Path,
     *,
     node_name: str,
     gateway_base_url: str,
     local_token: str,
+    cowork_dir: Path,
     model: str,
-    route_model: str = CLAUDE_DESKTOP_ROUTE_MODEL,
-    extra_models: Sequence[str] | None = None,
+    route_model: str,
+    extra_models: Sequence[str] | None,
+    native_models: Sequence[str] | None,
+    native_models_support_1m: bool,
 ) -> None:
-    """Write the node-local Claude Desktop 3P gateway configuration."""
-
-    parsed = urlparse(gateway_base_url)
-    if (
-        parsed.scheme != "http"
-        or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
-        or parsed.port is None
-    ):
-        raise ClaudeDesktopError("Desktop gateway must be an explicit loopback URL")
-    if not local_token:
-        raise ClaudeDesktopError("Desktop gateway token cannot be empty")
-    if not model or not route_model:
-        raise ClaudeDesktopError("Desktop gateway model cannot be empty")
-
-    profile_dir = profile_dir.expanduser().resolve()
-    ensure_private_desktop_directory(profile_dir)
-    cowork_dir = profile_dir / "cowork-files"
-    cowork_dir.mkdir(parents=True, exist_ok=True)
-
-    desktop_config_path = profile_dir / "claude_desktop_config.json"
+    desktop_config_path = config_dir / "claude_desktop_config.json"
     desktop_config = _read_json_object(desktop_config_path)
     desktop_config["deploymentMode"] = "3p"
     desktop_config["coworkUserFilesPath"] = str(cowork_dir)
     _atomic_write_json(desktop_config_path, desktop_config)
 
-    claude_code_config_dir = profile_dir / _CLAUDE_CODE_CONFIG_DIR_NAME
-    prepare_claude_gateway_mcp_config(claude_code_config_dir)
-
     config_id = str(
         uuid.uuid5(_CONFIG_NAMESPACE, f"apiclaude-desktop:{node_name}")
     )
-    library_dir = profile_dir / "configLibrary"
+    library_dir = config_dir / "configLibrary"
     library_dir.mkdir(parents=True, exist_ok=True)
     _atomic_write_json(
         library_dir / f"{config_id}.json",
@@ -353,6 +481,8 @@ def prepare_claude_desktop_profile(
                 model=model,
                 route_model=route_model,
                 extra_models=extra_models,
+                native_models=native_models,
+                native_models_support_1m=native_models_support_1m,
             ),
             "inferenceProvider": "gateway",
             "inferenceCredentialKind": "static",
@@ -377,6 +507,65 @@ def prepare_claude_desktop_profile(
             "entries": retained,
         },
     )
+
+
+def prepare_claude_desktop_profile(
+    profile_dir: Path,
+    *,
+    node_name: str,
+    gateway_base_url: str,
+    local_token: str,
+    model: str,
+    route_model: str = CLAUDE_DESKTOP_ROUTE_MODEL,
+    extra_models: Sequence[str] | None = None,
+    native_models: Sequence[str] | None = None,
+    native_models_support_1m: bool = False,
+    claude_config_dir: Path | None = None,
+) -> None:
+    """Write the node-local Claude Desktop 3P gateway configuration."""
+
+    parsed = urlparse(gateway_base_url)
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
+        or parsed.port is None
+    ):
+        raise ClaudeDesktopError("Desktop gateway must be an explicit loopback URL")
+    if not local_token:
+        raise ClaudeDesktopError("Desktop gateway token cannot be empty")
+    if native_models is not None and not any(
+        str(value).strip() for value in native_models
+    ):
+        raise ClaudeDesktopError("Desktop native model list cannot be empty")
+    if native_models is None and (not model or not route_model):
+        raise ClaudeDesktopError("Desktop gateway model cannot be empty")
+
+    profile_dir = profile_dir.expanduser().resolve()
+    ensure_private_desktop_directory(profile_dir)
+    cowork_dir = profile_dir / "cowork-files"
+    cowork_dir.mkdir(parents=True, exist_ok=True)
+
+    claude_code_config_dir = (
+        claude_config_dir.expanduser().resolve()
+        if claude_config_dir is not None
+        else profile_dir / _CLAUDE_CODE_CONFIG_DIR_NAME
+    )
+    prepare_claude_gateway_mcp_config(claude_code_config_dir)
+
+    config_dirs = (profile_dir, claude_desktop_effective_user_data_dir(profile_dir))
+    for config_dir in config_dirs:
+        _write_claude_desktop_gateway_config(
+            config_dir,
+            node_name=node_name,
+            gateway_base_url=gateway_base_url,
+            local_token=local_token,
+            cowork_dir=cowork_dir,
+            model=model,
+            route_model=route_model,
+            extra_models=extra_models,
+            native_models=native_models,
+            native_models_support_1m=native_models_support_1m,
+        )
 
 
 def find_claude_desktop_executable() -> Path | None:
@@ -431,6 +620,7 @@ def launch_claude_desktop_process(
     web_search_base_url: str | None = None,
     web_search_token: str | None = None,
     web_search_model: str | None = None,
+    claude_config_dir: Path | None = None,
 ) -> subprocess.Popen[bytes]:
     executable = executable.expanduser().resolve()
     profile_dir = profile_dir.expanduser().resolve()
@@ -442,7 +632,14 @@ def launch_claude_desktop_process(
     for key in _SENSITIVE_ENV:
         environment.pop(key, None)
     environment["CLAUDE_USER_DATA_DIR"] = str(profile_dir)
-    claude_code_config_dir = profile_dir / _CLAUDE_CODE_CONFIG_DIR_NAME
+    local_app_data_dir = _desktop_local_app_data_dir(profile_dir)
+    local_app_data_dir.mkdir(parents=True, exist_ok=True)
+    environment["LOCALAPPDATA"] = str(local_app_data_dir)
+    claude_code_config_dir = (
+        claude_config_dir.expanduser().resolve()
+        if claude_config_dir is not None
+        else profile_dir / _CLAUDE_CODE_CONFIG_DIR_NAME
+    )
     claude_code_config_dir.mkdir(parents=True, exist_ok=True)
     environment["CLAUDE_CONFIG_DIR"] = str(claude_code_config_dir)
     search_values = (web_search_base_url, web_search_token, web_search_model)
@@ -462,7 +659,7 @@ def launch_claude_desktop_process(
     creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     try:
         return subprocess.Popen(
-            [str(executable)],
+            [str(executable), f"--user-data-dir={profile_dir}"],
             cwd=str(executable.parent),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,

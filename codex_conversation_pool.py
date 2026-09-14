@@ -15,6 +15,7 @@ import tempfile
 import urllib.parse
 import uuid
 from dataclasses import dataclass
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Protocol
@@ -266,6 +267,7 @@ def materialize_snapshot_for_target(
     model_provider: str,
     model: str | None,
     cwd: Path,
+    imported_thread_id: str | None = None,
 ) -> Path:
     """Build a temporary fork input containing only target runtime settings."""
 
@@ -318,12 +320,20 @@ def materialize_snapshot_for_target(
                     payload["cwd"] = target_cwd
                     if row_type == "session_meta":
                         payload["model_provider"] = provider
+                        if imported_thread_id:
+                            payload.update(id=imported_thread_id, session_id=imported_thread_id,
+                                           history_mode="paginated", timestamp=now_iso())
+                            payload.pop("history_base", None)
                     elif target_model:
                         payload["model"] = target_model
                     else:
                         payload.pop("model", None)
                     row = dict(row)
                     row["payload"] = payload
+                if imported_thread_id:
+                    row["ordinal"] = line_number - 1
+                    if row_type == "event_msg" and "thread_id" in row.get("payload", {}):
+                        row["payload"]["thread_id"] = imported_thread_id
                 if _contains_forbidden_key(row):
                     raise PoolIntegrityError(
                         f"forbidden content in portable row {line_number}"
@@ -347,6 +357,40 @@ def materialize_snapshot_for_target(
     except BaseException:
         destination_path.unlink(missing_ok=True)
         raise
+
+
+def paginated_replay_items(path: Path) -> list[dict[str, Any]] | None:
+    """Recognize both new snapshots and older snapshots missing history_mode."""
+    modern = False
+    items: list[dict[str, Any]] = []
+    with path.open(encoding="utf-8") as source:
+        for line in source:
+            row = json.loads(line)
+            payload = row.get("payload", {})
+            if row.get("type") == "session_meta" and payload.get("history_mode") == "paginated":
+                modern = True
+            if row.get("type") == "event_msg" and payload.get("type") == "item_completed":
+                item = payload.get("item", {})
+                modern |= item.get("type") not in {"Plan", "Sleep"}
+                items.append(payload)
+    return items if modern else None
+
+
+def audit_paginated_replay(source: Path, target: Path, thread: dict[str, Any]) -> int:
+    """Require persisted item payloads and UI item identities to survive import."""
+    expected = paginated_replay_items(source)
+    if expected is None:
+        return 0
+    actual = paginated_replay_items(target) or []
+    def signatures(events: list[dict[str, Any]]) -> Counter:
+        return Counter((e.get("turn_id"), json.dumps(e["item"], sort_keys=True, ensure_ascii=False)) for e in events)
+    if signatures(expected) != signatures(actual):
+        raise PoolIntegrityError("imported display event payloads differ from the snapshot")
+    visible = Counter((turn["id"], item["id"]) for turn in thread.get("turns", []) for item in turn.get("items", []))
+    wanted = Counter((e.get("turn_id"), e["item"]["id"]) for e in expected)
+    if visible != wanted:
+        raise PoolIntegrityError("imported thread display items are incomplete")
+    return sum(visible.values())
 
 
 def audit_target_runtime_context(
@@ -417,10 +461,14 @@ def semantic_snapshot_hash(path: Path) -> str:
                 payload = dict(payload)
                 if normalized.get("type") == "session_meta":
                     payload.pop("git", None)
+                    payload.pop("history_mode", None)
                 if normalized.get("type") == "turn_context":
                     payload.pop("cwd", None)
                     payload.pop("model", None)
                 if normalized.get("type") == "event_msg":
+                    # Completion envelopes are rebound to the new thread on import.
+                    if payload.get("type") in {"item_started", "item_completed"}:
+                        payload.pop("thread_id", None)
                     for key in (
                         "started_at",
                         "completed_at",
@@ -582,6 +630,8 @@ def _sanitize_session_meta(
         "model_provider": "openai",
     }
     git = _sanitized_git(payload.get("git"))
+    if payload.get("history_mode") == "paginated":
+        cleaned["history_mode"] = "paginated"
     if git:
         cleaned["git"] = git
     if _contains_forbidden_key(cleaned):

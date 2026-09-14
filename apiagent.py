@@ -23,10 +23,11 @@ import subprocess
 import sys
 import tempfile
 import time
+from contextlib import ExitStack, contextmanager, suppress
 from datetime import datetime, timezone
 from getpass import getpass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
@@ -52,7 +53,9 @@ from codex_shared_config import (
 from claude_codex_bridge import (
     BridgeEndpoint,
     BridgeStartupError,
+    anthropic_passthrough_bridge,
     cpa_bridge,
+    discover_anthropic_models,
     litellm_bridge,
 )
 from claude_desktop_windows import (
@@ -62,11 +65,13 @@ from claude_desktop_windows import (
     clear_desktop_stop_request,
     clear_runtime_state,
     clear_startup_error,
+    claude_desktop_effective_user_data_dir,
     close_claude_desktop_process,
     desktop_instance_lock,
     ensure_private_desktop_directory,
     find_claude_desktop_executable,
     launch_claude_desktop_process,
+    migrate_claude_desktop_sessions,
     monitor_claude_desktop_process,
     prepare_claude_gateway_mcp_config,
     prepare_claude_desktop_profile,
@@ -96,6 +101,7 @@ CLAUDE_VSCODE_DATA_ROOT = HOME / ".apiclaude-vscode"
 CLAUDE_DESKTOP_DATA_ROOT = HOME / ".apiclaude-desktop" / "nodes"
 CLAUDE_DESKTOP_GATEWAY_MODEL = CLAUDE_DESKTOP_ROUTE_MODEL
 CLAUDE_DESKTOP_MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,191}$")
+CLAUDE_1M_MODEL_SUFFIX = "[1m]"
 SECRET_STORE = SecureStore(HOME / ".apiagent-secrets")
 DEFAULT_CODEX_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_CODEX_MODEL = "gpt-5.6-sol"
@@ -142,6 +148,7 @@ CLAUDE_PROFILE_ENV = (
     "ANTHROPIC_BASE_URL",
     "ANTHROPIC_MODEL",
     "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_DEFAULT_FABLE_MODEL",
     "ANTHROPIC_DEFAULT_SONNET_MODEL",
     "ANTHROPIC_DEFAULT_HAIKU_MODEL",
     "CLAUDE_CODE_SUBAGENT_MODEL",
@@ -1113,6 +1120,7 @@ def merge_codex_builtin_model_metadata(
 
 def fetch_codex_builtin_model_catalog(
     profile: dict[str, Any] | None = None,
+    *, timeout: float = 20,
 ) -> dict[str, Any] | None:
     exe = find_codex_cli_executable(profile)
     if not exe:
@@ -1144,7 +1152,7 @@ def fetch_codex_builtin_model_catalog(
                 encoding="utf-8",
                 errors="replace",
                 env=probe_env,
-                timeout=20,
+                timeout=timeout,
             )
     except (OSError, subprocess.TimeoutExpired):
         return None
@@ -1821,7 +1829,9 @@ def codex_vision_main(args: list[str]) -> int:
     return 1
 
 
-def fetch_codex_provider_models(base_url: str, api_key: str) -> list[str]:
+def fetch_codex_provider_models(
+    base_url: str, api_key: str, *, timeout: float = 20,
+) -> list[str]:
     parsed = urlparse(base_url)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise ValueError("API base URL must be an absolute HTTP or HTTPS URL")
@@ -1833,7 +1843,7 @@ def fetch_codex_provider_models(base_url: str, api_key: str) -> list[str]:
         },
     )
     try:
-        with urlopen(request, timeout=20) as response:
+        with urlopen(request, timeout=timeout) as response:
             raw = response.read(4 * 1024 * 1024 + 1)
     except HTTPError as exc:
         raise ValueError(f"model discovery returned HTTP {exc.code}") from exc
@@ -1877,6 +1887,7 @@ def is_codex_text_model(model: str) -> bool:
         "whisper",
         "text-to-speech",
         "dall-e",
+        "gpt-image",
         "flux",
         "sora",
     )
@@ -1900,6 +1911,7 @@ def build_codex_provider_catalog(
     openai_reasoning_markers = (
         "codex",
         "gpt-5",
+        "gpt-6",
         "o1",
         "o3",
         "o4",
@@ -1976,6 +1988,249 @@ def build_codex_provider_catalog(
             }
         )
     return {"models": catalog}
+
+
+CODEX_MODEL_REFRESH_INTERVAL = 6 * 60 * 60
+
+
+@contextmanager
+def codex_model_refresh_lock(home: Path) -> Iterator[None]:
+    """Nonblocking OS lock, released even when a refresh process exits."""
+    path = home / ".models-refresh.lock"
+    if path.resolve() != path.absolute():
+        raise ValueError("linked model refresh lock")
+    with path.open("a+b") as handle:
+        if os.name == "nt":
+            import msvcrt
+
+            if handle.tell() == 0:
+                handle.write(b"0")
+                handle.flush()
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            yield
+        finally:
+            with suppress(OSError):
+                if os.name == "nt":
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def refresh_codex_models(
+    profile: dict[str, Any], *, force: bool = False, dry_run: bool = False,
+) -> dict[str, Any]:
+    """Add discovered models to a profile-local override, preserving existing entries.
+
+    Never rewrite config.toml or change the selected model. Profiles using the
+    built-in catalog or an external override keep that source. A successful
+    catalog hash is cached separately; failed attempts are not cached.
+    """
+    result: dict[str, Any] = {"status": "skipped", "added": 0}
+    if not force and os.environ.get("APICODEX_AUTO_REFRESH_MODELS", "").lower() in {
+        "0", "false", "off",
+    }:
+        return {**result, "reason": "automatic refresh disabled"}
+    stack = ExitStack()
+    try:
+        if not is_safe_api_profile_home(profile):
+            raise ValueError("unsafe profile path")
+        home = codex_profile_home(profile)
+        config_path = home / "config.toml"
+        catalog_path = home / "models.json"
+        state_path = home / "models-refresh.json"
+        # Do not read or write through links, including a linked catalog file.
+        for path in (config_path, catalog_path, state_path):
+            if path.resolve() != path.absolute():
+                raise ValueError("linked model refresh file")
+        if not config_path.is_file():
+            return {**result, "reason": "no local model catalog override"}
+        config_bytes = config_path.read_bytes()
+        top_level = re.split(r"(?m)^\s*\[", config_bytes.decode("utf-8-sig"), maxsplit=1)[0]
+        matches = re.findall(r"(?m)^\s*model_catalog_json\s*=\s*(.+)$", top_level)
+        if not matches:
+            return {**result, "reason": "using the built-in model catalog"}
+        if len(matches) != 1:
+            raise ValueError("ambiguous model catalog override")
+        # Generated configs use a single quoted string. Refuse unsupported forms
+        # rather than guess a custom TOML expression or change its source.
+        source = ast.literal_eval(matches[0])
+        if not isinstance(source, str):
+            raise ValueError("invalid model catalog override")
+        source_path = Path(source).expanduser()
+        if not source_path.is_absolute():
+            source_path = home / source_path
+        if source_path.resolve() != catalog_path.resolve():
+            return {**result, "reason": "external model catalog preserved"}
+        original = catalog_path.read_bytes()
+        payload = json.loads(original.decode("utf-8-sig"))
+        if not isinstance(payload, dict) or not isinstance(payload.get("models"), list):
+            raise ValueError("invalid model catalog")
+        existing = payload["models"]
+        if not existing or any(
+            not isinstance(item, dict) or not isinstance(item.get("slug"), str)
+            or not item["slug"] for item in existing
+        ):
+            raise ValueError("invalid model catalog entries")
+        known = {item["slug"].casefold() for item in existing}
+        if len(known) != len(existing):
+            raise ValueError("duplicate model catalog entries")
+        base_url = str(profile.get("baseUrl") or DEFAULT_CODEX_BASE_URL)
+        source_hash = hashlib.sha256(base_url.encode("utf-8")).hexdigest()
+        catalog_hash = hashlib.sha256(original).hexdigest()
+        if not force and not dry_run and state_path.is_file():
+            try:
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                age = time.time() - float(state.get("checkedAt", 0))
+                if (state.get("sourceSha256") == source_hash
+                        and state.get("catalogSha256") == catalog_hash
+                        and 0 <= age < CODEX_MODEL_REFRESH_INTERVAL):
+                    return {**result, "reason": "model catalog checked within 6 hours"}
+            except (ValueError, TypeError, AttributeError):
+                pass  # Corrupt cache metadata must not prevent a fresh check.
+        if not dry_run:
+            stack.enter_context(codex_model_refresh_lock(home))
+        api_key = get_codex_secret(profile)
+        discovered = fetch_codex_provider_models(base_url, api_key, timeout=5)
+        compatible = [item for item in discovered if is_codex_text_model(item)]
+        if not compatible:
+            raise ValueError("no compatible models discovered")
+        added = [item for item in compatible if item.casefold() not in known]
+        if added:
+            generated = merge_codex_builtin_model_metadata(
+                build_codex_provider_catalog(added, added[0]),
+                fetch_codex_builtin_model_catalog(profile, timeout=5),
+            )["models"]
+            priority = max(
+                (item.get("priority", 0) for item in existing
+                 if isinstance(item.get("priority", 0), int)), default=0,
+            )
+            for index, item in enumerate(generated, start=1):
+                item["priority"] = priority + index
+                if codex_vision_config(profile) is not None:
+                    item["input_modalities"] = ["text", "image"]
+            payload = {**payload, "models": [*existing, *generated]}
+        result = {"status": "preview" if dry_run else "unchanged", "added": len(added)}
+        if dry_run:
+            return result
+        # Recheck after network/probe latency so a concurrent manual edit wins.
+        if (config_path.read_bytes() != config_bytes
+                or catalog_path.read_bytes() != original):
+            raise ValueError("model configuration changed during refresh")
+        if added:
+            backup_path = home / (
+                f"models.json.backup-{datetime.now().strftime('%Y%m%d-%H%M%S')}-"
+                f"{secrets.token_hex(4)}"
+            )
+            with backup_path.open("xb") as backup:
+                backup.write(original)
+            if backup_path.read_bytes() != original:
+                raise OSError("model catalog backup verification failed")
+            install_codex_model_catalog(home, payload)
+            result["status"] = "updated"
+        current = catalog_path.read_bytes()
+        expected = payload if added else json.loads(original.decode("utf-8-sig"))
+        if json.loads(current.decode("utf-8-sig")) != expected:
+            raise OSError("model catalog readback failed")
+        try:
+            write_json_atomic(state_path, {
+                "schemaVersion": 1, "checkedAt": time.time(),
+                "sourceSha256": source_hash,
+                "catalogSha256": hashlib.sha256(current).hexdigest(),
+            })
+        except OSError:
+            result["warning"] = "refresh cache could not be saved; next launch will retry"
+        return result
+    except (OSError, ValueError, SyntaxError, KeyError, RuntimeError, SecureStoreError) as exc:
+        # Do not print upstream bodies, keys, URLs, or JSON parser excerpts.
+        http_status = re.search(r"model discovery returned HTTP (\d{3})", str(exc))
+        safe_reasons = {
+            "model discovery returned invalid JSON",
+            "model discovery returned no usable model IDs",
+            "model discovery response must contain a 'data' list",
+            "model discovery response exceeded 4 MiB",
+            "no compatible models discovered",
+            "model configuration changed during refresh",
+            "invalid model catalog", "invalid model catalog entries",
+            "duplicate model catalog entries", "unsafe profile path",
+        }
+        reason = str(exc) if str(exc) in safe_reasons else type(exc).__name__
+        if http_status:
+            reason = f"HTTP {http_status[1]}"
+        return {"status": "failed", "added": 0, "reason": reason}
+    finally:
+        stack.close()
+
+
+def auto_refresh_codex_models(profile: dict[str, Any]) -> None:
+    result = refresh_codex_models(profile)
+    if result["status"] == "updated":
+        print(f"Model catalog refreshed: added {result['added']} model(s); default unchanged.", file=sys.stderr)
+    elif result["status"] == "failed":
+        print(f"Warning: model refresh failed ({result['reason']}); continuing with the existing catalog.", file=sys.stderr)
+    if result.get("warning"):
+        print(f"Warning: {result['warning']}.", file=sys.stderr)
+
+
+def codex_models_main(args: list[str]) -> int:
+    usage = "Usage: apicodex models refresh [--api-profile NAME | --all] [--dry-run]"
+    if args in ([], ["--help"], ["refresh", "--help"]):
+        print(usage)
+        return 0
+    requested = None
+    all_profiles = dry_run = False
+    if args[0] != "refresh":
+        print(usage, file=sys.stderr)
+        return 1
+    index = 1
+    while index < len(args):
+        arg = args[index]
+        if arg == "--api-profile" and index + 1 < len(args) and requested is None:
+            index += 1
+            requested = args[index]
+        elif arg == "--all" and not all_profiles:
+            all_profiles = True
+        elif arg == "--dry-run" and not dry_run:
+            dry_run = True
+        else:
+            print(usage, file=sys.stderr)
+            return 1
+        index += 1
+    if all_profiles and requested:
+        print(usage, file=sys.stderr)
+        return 1
+    # Read metadata without credential migration, especially for --dry-run.
+    try:
+        metadata = json.loads(CODEX_PROFILES_PATH.read_text(encoding="utf-8-sig"))
+        profiles = metadata["profiles"]
+        if not isinstance(profiles, list) or any(not isinstance(p, dict) for p in profiles):
+            raise ValueError("invalid profiles")
+    except (OSError, ValueError, KeyError, TypeError):
+        print("Error: could not read Codex profile metadata.", file=sys.stderr)
+        return 1
+    if all_profiles:
+        selected_profiles = profiles
+    else:
+        selected = select_codex_profile(profiles, requested)
+        if not selected:
+            return 1
+        selected_profiles = [selected]
+    code = 0
+    for profile in selected_profiles:
+        result = refresh_codex_models(profile, force=True, dry_run=dry_run)
+        label = profile.get("name") or profile.get("id") or "profile"
+        detail = result.get("reason") or f"{result['added']} new model(s); default unchanged"
+        print(f"{label}: {result['status']} ({detail})")
+        if result.get("warning"):
+            print(f"Warning: {result['warning']}.", file=sys.stderr)
+        code = max(code, int(result["status"] == "failed"))
+    return code
 
 
 def choose_codex_provider_model(models: list[str], default: str | None = None) -> str:
@@ -2655,6 +2910,7 @@ def launch_codex_desktop(
         selected["credentialId"] = credential_id
         save_codex_profiles(profiles)
 
+    auto_refresh_codex_models(selected)
     if not prepare_codex_vision_runtime(selected):
         return 1
     sync_codex_shared_mcp(profiles)
@@ -2793,6 +3049,7 @@ def launch_codex_vscode(
         selected["credentialId"] = credential_id
         save_codex_profiles(profiles)
 
+    auto_refresh_codex_models(selected)
     if not prepare_codex_vision_runtime(selected):
         return 1
     sync_codex_shared_mcp(profiles)
@@ -2832,6 +3089,10 @@ def codex_help() -> None:
   apicodex --api-list --json       List non-sensitive profile metadata as JSON
   apicodex --api-profile <name>    Start a specific API profile
   apicodex --api-remove            Unregister/archive a saved API profile
+  apicodex models refresh          Refresh local model catalogs with saved keys
+  apicodex models refresh --all    Refresh every profile's local catalog override
+  apicodex models refresh --api-profile NAME --dry-run
+                                   Preview additions without changing profile files
   apicodex shared enable --account Share account MCP config with API profiles
   apicodex shared sync             Refresh shared MCP config now
   apicodex shared status           Show account MCP sharing status
@@ -2891,6 +3152,8 @@ def codex_share_main(args: list[str]) -> int:
 
 
 def codex_main(args: list[str]) -> int:
+    if args and args[0] == "models":
+        return codex_models_main(args[1:])
     if args and args[0] == "vision":
         return codex_vision_main(args[1:])
     if args and args[0] == "--vision-worker":
@@ -3195,6 +3458,8 @@ def codex_main(args: list[str]) -> int:
         selected["credentialId"] = credential_id
         save_codex_profiles(profiles)
 
+    if not any(arg in {"--version", "-V", "--help", "-h"} for arg in pass_through):
+        auto_refresh_codex_models(selected)
     if not prepare_codex_vision_runtime(selected):
         return 1
     sync_codex_shared_mcp(profiles)
@@ -3354,6 +3619,120 @@ def normalize_claude_desktop_models(values: Any) -> list[str]:
     return normalized
 
 
+def claude_desktop_models_support_1m(node: dict[str, Any]) -> bool:
+    if is_claude_codex_bridge(node):
+        return False
+    configured = node.get("desktop_models_support_1m")
+    if isinstance(configured, bool):
+        return configured
+    return True
+
+
+def claude_model_with_1m(model: str) -> str:
+    normalized = clean_hidden_prefix(model)
+    if normalized.lower().endswith(CLAUDE_1M_MODEL_SUFFIX):
+        return normalized
+    if "[" in normalized or "]" in normalized:
+        return normalized
+    lowered = normalized.lower()
+    if lowered in {"opus", "fable", "sonnet", "haiku"} or lowered.startswith(
+        "claude-"
+    ):
+        return normalized + CLAUDE_1M_MODEL_SUFFIX
+    return normalized
+
+
+def claude_native_default_model(node: dict[str, Any]) -> str:
+    configured = normalize_claude_desktop_models(node.get("desktop_models"))
+    if configured:
+        return configured[0]
+    discovered = normalize_claude_desktop_models(
+        node.get("desktop_discovered_models")
+    )
+    if discovered:
+        return discovered[0]
+    model = clean_hidden_prefix(str(node.get("model") or ""))
+    return model or "opus"
+
+
+def prepare_native_claude_args(
+    node: dict[str, Any], claude_args: list[str]
+) -> tuple[list[str], str | None]:
+    prepared = list(claude_args)
+    option_end = prepared.index("--") if "--" in prepared else len(prepared)
+    model_index: int | None = None
+    model_value: str | None = None
+    has_autocompact = False
+    i = 0
+    while i < option_end:
+        value = prepared[i]
+        if value == "--model":
+            if i + 1 < option_end:
+                model_index = i + 1
+                model_value = prepared[i + 1]
+                i += 1
+        elif value.startswith("--model="):
+            model_index = i
+            model_value = value.split("=", 1)[1]
+        elif value == "--autocompact" or value.startswith("--autocompact="):
+            has_autocompact = True
+            if value == "--autocompact" and i + 1 < option_end:
+                i += 1
+        i += 1
+
+    selected_model: str | None = None
+    if claude_desktop_models_support_1m(node) and (
+        model_value is not None or node.get("cli_force_default_model", True)
+    ):
+        selected_model = claude_model_with_1m(
+            model_value or claude_native_default_model(node)
+        )
+        if model_index is None:
+            prepared[0:0] = ["--model", selected_model]
+        elif prepared[model_index].startswith("--model="):
+            prepared[model_index] = f"--model={selected_model}"
+        else:
+            prepared[model_index] = selected_model
+
+    if not has_autocompact:
+        prepared[0:0] = ["--autocompact", "auto"]
+    return prepared, selected_model
+
+
+def claude_native_model_environment(
+    node: dict[str, Any], selected_model: str | None
+) -> dict[str, str]:
+    if not selected_model and (
+        node.get("cli_force_default_model", True)
+        or not claude_desktop_models_support_1m(node)
+    ):
+        return {}
+    # Keep 1M family aliases without overriding Claude Code's saved model.
+    environment = {"ANTHROPIC_MODEL": selected_model} if selected_model else {}
+    candidates = normalize_claude_desktop_models(node.get("desktop_models"))
+    candidates += normalize_claude_desktop_models(
+        node.get("desktop_discovered_models")
+    )
+    if selected_model:
+        candidates.append(selected_model)
+    family_keys = {
+        "opus": "ANTHROPIC_DEFAULT_OPUS_MODEL",
+        "fable": "ANTHROPIC_DEFAULT_FABLE_MODEL",
+        "sonnet": "ANTHROPIC_DEFAULT_SONNET_MODEL",
+        "haiku": "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    }
+    for candidate in candidates:
+        normalized = claude_model_with_1m(candidate)
+        lowered = normalized.lower()
+        for family, key in family_keys.items():
+            if key not in environment and (
+                lowered == family + CLAUDE_1M_MODEL_SUFFIX
+                or f"-{family}-" in lowered
+            ):
+                environment[key] = normalized
+    return environment
+
+
 def claude_node_metadata(name: str, node: dict[str, Any]) -> dict[str, Any]:
     isolation = claude_node_isolation(node)
     if isolation == "isolated" and not is_safe_claude_node_home(name, node):
@@ -3373,6 +3752,7 @@ def claude_node_metadata(name: str, node: dict[str, Any]) -> dict[str, Any]:
         "desktopModels": normalize_claude_desktop_models(
             node.get("desktop_models")
         ),
+        "desktopModelsSupport1m": claude_desktop_models_support_1m(node),
         "proxyEnabled": claude_node_proxy_enabled(node),
         "proxyUrl": claude_node_proxy_url(node),
         "isolation": isolation,
@@ -3475,14 +3855,10 @@ def _claude_shared_mcp_targets(
                 targets.append((f"node:{name}", path))
                 seen.add(resolved)
 
-        desktop_home = claude_desktop_profile_home(name, node)
-        if desktop_home is None:
+        desktop_config_home = claude_desktop_config_home(name, node)
+        if desktop_config_home is None:
             continue
-        desktop_path = (
-            desktop_home
-            / CLAUDE_DESKTOP_CODE_CONFIG_DIR_NAME
-            / ".claude.json"
-        )
+        desktop_path = desktop_config_home / ".claude.json"
         if desktop_path.exists():
             resolved = desktop_path.resolve()
             if resolved not in seen:
@@ -3785,6 +4161,149 @@ def show_claude_nodes(config: dict[str, Any]) -> None:
             print("    Token: managed by the referenced Codex profile")
         else:
             print("    Token: stored")
+
+
+def claude_desktop_models_main(args: list[str]) -> int:
+    if not args or args[0] in {"-h", "--help"}:
+        print(
+            "Usage: apiclaude desktop-models NODE "
+            "[MODEL ... | --auto] [--1m | --standard]"
+        )
+        return 0 if args else 1
+    name = clean_hidden_prefix(args[0])
+    config = load_claude_config()
+    node = (config.get("nodes") or {}).get(name)
+    if not node:
+        print(f"Error: Claude node '{name}' was not found.", file=sys.stderr)
+        return 1
+
+    values = args[1:]
+    if not values:
+        try:
+            configured = normalize_claude_desktop_models(
+                node.get("desktop_models")
+            )
+            discovered = normalize_claude_desktop_models(
+                node.get("desktop_discovered_models")
+            )
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        if configured:
+            mode = "explicit override"
+        elif is_claude_codex_bridge(node):
+            mode = "compatibility route only"
+        else:
+            mode = "automatic discovery"
+        print(f"Claude Desktop models for '{name}'")
+        print(f"Mode: {mode}")
+        print(
+            "Configured: "
+            + (", ".join(configured) if configured else "(none)")
+        )
+        print(
+            "Last discovered: "
+            + (", ".join(discovered) if discovered else "(none)")
+        )
+        print(
+            "Discovered at: "
+            + str(node.get("desktop_models_discovered_at") or "-")
+        )
+        print(
+            "Context: "
+            + (
+                "prefer 1M (default for native nodes)"
+                if claude_desktop_models_support_1m(node)
+                else "standard"
+            )
+        )
+        return 0
+
+    unknown_options = [
+        value
+        for value in values
+        if value.startswith("--")
+        and value not in {"--auto", "--1m", "--standard"}
+    ]
+    if unknown_options:
+        print(
+            "Error: unknown desktop-models option: " + unknown_options[0],
+            file=sys.stderr,
+        )
+        return 1
+    if "--1m" in values and "--standard" in values:
+        print("Error: --1m and --standard are mutually exclusive.", file=sys.stderr)
+        return 1
+    if "--1m" in values and is_claude_codex_bridge(node):
+        print(
+            "Error: --1m is only supported for native Claude nodes; "
+            "Codex/CPA bridge nodes use standard context.",
+            file=sys.stderr,
+        )
+        return 1
+    use_auto = "--auto" in values
+    model_values = [value for value in values if not value.startswith("--")]
+    if use_auto and model_values:
+        print(
+            "Error: --auto cannot be combined with explicit model IDs.",
+            file=sys.stderr,
+        )
+        return 1
+    if use_auto:
+        node.pop("desktop_models", None)
+        if "--1m" in values:
+            node["desktop_models_support_1m"] = True
+        elif "--standard" in values:
+            node["desktop_models_support_1m"] = False
+        save_claude_config(config)
+        restored = (
+            "the compatibility route"
+            if is_claude_codex_bridge(node)
+            else "automatic discovery"
+        )
+        context = (
+            "1M context"
+            if claude_desktop_models_support_1m(node)
+            else "standard context"
+        )
+        print(f"Claude Desktop node '{name}' now uses {restored} with {context}.")
+        return 0
+    if not model_values:
+        if "--1m" in values:
+            node["desktop_models_support_1m"] = True
+        else:
+            node["desktop_models_support_1m"] = False
+        save_claude_config(config)
+        context = "1M" if claude_desktop_models_support_1m(node) else "standard"
+        print(f"Claude Desktop node '{name}' now uses {context} context.")
+        return 0
+    try:
+        configured = normalize_claude_desktop_models(model_values)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    if not configured:
+        print("Error: at least one Desktop model is required.", file=sys.stderr)
+        return 1
+    invalid = [model for model in configured if not model.startswith("claude-")]
+    if invalid:
+        print(
+            "Error: native Claude Desktop models must start with 'claude-': "
+            + ", ".join(invalid),
+            file=sys.stderr,
+        )
+        return 1
+    node["desktop_models"] = configured
+    if "--1m" in values:
+        node["desktop_models_support_1m"] = True
+    elif "--standard" in values:
+        node["desktop_models_support_1m"] = False
+    save_claude_config(config)
+    print(
+        f"Saved {len(configured)} Claude Desktop model(s) for '{name}': "
+        + ", ".join(configured)
+    )
+    return 0
 
 
 def add_claude_node(config: dict[str, Any], requested: str | None = None) -> int:
@@ -4204,6 +4723,17 @@ def claude_desktop_profile_home(name: str, node: dict[str, Any]) -> Path | None:
     return candidate
 
 
+def claude_desktop_config_home(name: str, node: dict[str, Any]) -> Path | None:
+    if (
+        not is_claude_codex_bridge(node)
+        and claude_node_isolation(node) != "isolated"
+    ):
+        return (HOME / ".claude").resolve()
+    if not is_safe_claude_node_home(name, node):
+        return None
+    return claude_node_home(name, node).resolve()
+
+
 def resolve_claude_desktop_bridge(
     config: dict[str, Any],
     name: str,
@@ -4237,6 +4767,27 @@ def resolve_claude_desktop_bridge(
     return node, profile, model, cpa_executable, upstream_base_url
 
 
+def resolve_claude_desktop_node(
+    config: dict[str, Any],
+    name: str,
+) -> dict[str, Any] | None:
+    node = (config.get("nodes") or {}).get(name)
+    if not node:
+        print(f"Error: Claude node '{name}' was not found.", file=sys.stderr)
+        return None
+    if is_claude_codex_bridge(node):
+        return node if resolve_claude_desktop_bridge(config, name) is not None else None
+    base_url = clean_hidden_prefix(str(node.get("base_url") or ""))
+    parsed = urlparse(base_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        print(
+            f"Error: Claude node '{name}' has an invalid Anthropic base URL.",
+            file=sys.stderr,
+        )
+        return None
+    return node
+
+
 def _redact_desktop_worker_error(message: str, *secrets_to_hide: str) -> str:
     safe = str(message)
     for value in secrets_to_hide:
@@ -4255,14 +4806,14 @@ def run_claude_desktop_worker(
         print("Error: Claude Desktop currently requires Windows.", file=sys.stderr)
         return 1
     profile_dir: Path | None = None
+    claude_config_dir: Path | None = None
     upstream_api_key = ""
     local_token = ""
     desktop_process: subprocess.Popen[bytes] | None = None
     try:
-        resolved = resolve_claude_desktop_bridge(config, name)
-        if resolved is None:
+        node = resolve_claude_desktop_node(config, name)
+        if node is None:
             return 1
-        node, profile, model, cpa_executable, upstream_base_url = resolved
         try:
             desktop_models = normalize_claude_desktop_models(
                 node.get("desktop_models")
@@ -4272,6 +4823,10 @@ def run_claude_desktop_worker(
         profile_dir = claude_desktop_profile_home(name, node)
         if profile_dir is None:
             raise ClaudeDesktopError("refusing an unsafe Claude Desktop profile path")
+        claude_config_dir = claude_desktop_config_home(name, node)
+        if claude_config_dir is None:
+            raise ClaudeDesktopError("refusing an unsafe Claude config path")
+        claude_config_dir.mkdir(parents=True, exist_ok=True)
         ensure_private_desktop_directory(profile_dir)
         executable = find_claude_desktop_executable()
         if executable is None:
@@ -4285,29 +4840,89 @@ def run_claude_desktop_worker(
             clear_startup_error(profile_dir)
             clear_desktop_stop_request(profile_dir)
             try:
-                upstream_api_key = clean_hidden_prefix(get_codex_secret(profile))
                 local_token = get_or_create_claude_desktop_bridge_token(name)
+                if is_claude_codex_bridge(node):
+                    resolved = resolve_claude_desktop_bridge(config, name)
+                    if resolved is None:
+                        return 1
+                    node, profile, model, cpa_executable, upstream_base_url = resolved
+                    upstream_api_key = clean_hidden_prefix(get_codex_secret(profile))
+                else:
+                    profile = None
+                    model = ""
+                    cpa_executable = ""
+                    upstream_base_url = clean_hidden_prefix(
+                        str(node.get("base_url") or "")
+                    ).rstrip("/")
+                    upstream_api_key = clean_hidden_prefix(
+                        get_claude_secret(name, node)
+                    )
             except (KeyError, SecureStoreError) as exc:
-                raise ClaudeDesktopError(f"failed to load bridge credentials: {exc}") from exc
-
-            if not ensure_codex_vision_worker(profile):
                 raise ClaudeDesktopError(
-                    f"vision worker for '{profile.get('name')}' is unavailable"
-                )
-            if codex_vision_config(profile) is not None:
-                upstream_base_url = codex_vision_proxy_base_url(profile).rstrip("/")
+                    f"failed to load Desktop gateway credentials: {exc}"
+                ) from exc
 
-            with cpa_bridge(
-                upstream_base_url=upstream_base_url,
-                upstream_api_key=upstream_api_key,
-                model=model,
-                cpa_executable=cpa_executable,
-                proxy_url=claude_node_effective_proxy(node),
-                listen_port=port,
-                local_token=local_token,
-                route_model=CLAUDE_DESKTOP_GATEWAY_MODEL,
-                extra_models=desktop_models,
-            ) as endpoint:
+            native = profile is None
+            if not native:
+                if not ensure_codex_vision_worker(profile):
+                    raise ClaudeDesktopError(
+                        f"vision worker for '{profile.get('name')}' is unavailable"
+                    )
+                if codex_vision_config(profile) is not None:
+                    upstream_base_url = codex_vision_proxy_base_url(profile).rstrip("/")
+                bridge_context = cpa_bridge(
+                    upstream_base_url=upstream_base_url,
+                    upstream_api_key=upstream_api_key,
+                    model=model,
+                    cpa_executable=cpa_executable,
+                    proxy_url=claude_node_effective_proxy(node),
+                    listen_port=port,
+                    local_token=local_token,
+                    route_model=CLAUDE_DESKTOP_GATEWAY_MODEL,
+                    extra_models=desktop_models,
+                )
+            else:
+                bridge_context = anthropic_passthrough_bridge(
+                    upstream_base_url=upstream_base_url,
+                    upstream_api_key=upstream_api_key,
+                    proxy_url=claude_node_effective_proxy(node),
+                    listen_port=port,
+                    local_token=local_token,
+                    enable_1m=claude_desktop_models_support_1m(node),
+                )
+
+            with bridge_context as endpoint:
+                if native:
+                    if desktop_models:
+                        active_models = desktop_models
+                    else:
+                        active_models = discover_anthropic_models(
+                            gateway_base_url=endpoint.base_url,
+                            local_token=local_token,
+                        )
+                        node["desktop_discovered_models"] = active_models
+                        node["desktop_models_discovered_at"] = now_iso()
+                        save_claude_config(config)
+                    invalid_native_models = [
+                        item
+                        for item in active_models
+                        if not item.startswith("claude-")
+                    ]
+                    if invalid_native_models:
+                        raise ClaudeDesktopError(
+                            "native Claude Desktop models must start with "
+                            "'claude-': " + ", ".join(invalid_native_models)
+                        )
+                    model = active_models[0]
+                    state_models = active_models
+                    gateway_kind = "anthropic"
+                else:
+                    active_models = desktop_models
+                    state_models = [
+                        CLAUDE_DESKTOP_GATEWAY_MODEL,
+                        *desktop_models,
+                    ]
+                    gateway_kind = "cpa"
                 prepare_claude_desktop_profile(
                     profile_dir,
                     node_name=name,
@@ -4316,41 +4931,55 @@ def run_claude_desktop_worker(
                     model=model,
                     route_model=CLAUDE_DESKTOP_GATEWAY_MODEL,
                     extra_models=desktop_models,
+                    native_models=active_models if native else None,
+                    native_models_support_1m=(
+                        native and claude_desktop_models_support_1m(node)
+                    ),
+                    claude_config_dir=claude_config_dir,
                 )
                 if not sync_claude_shared_mcp(config)[0]:
                     return 1
+                migrated_sessions = migrate_claude_desktop_sessions(
+                    profile_dir / CLAUDE_DESKTOP_CODE_CONFIG_DIR_NAME,
+                    claude_config_dir,
+                )
                 desktop_process = launch_claude_desktop_process(
                     executable,
                     profile_dir,
                     web_search_base_url=endpoint.hosted_search_url,
                     web_search_token=endpoint.hosted_search_token,
                     web_search_model=endpoint.hosted_search_model,
+                    claude_config_dir=claude_config_dir,
                 )
                 wait_for_claude_desktop_start(desktop_process)
                 endpoint_port = urlparse(endpoint.base_url).port
                 if endpoint_port is None:
-                    raise ClaudeDesktopError("CPA returned a gateway URL without a port")
+                    raise ClaudeDesktopError("Desktop gateway URL has no port")
                 write_runtime_state(
                     profile_dir,
                     {
                         "schemaVersion": 1,
                         "node": name,
                         "model": model,
-                        "models": [
-                            CLAUDE_DESKTOP_GATEWAY_MODEL,
-                            *desktop_models,
-                        ],
+                        "models": state_models,
+                        "gateway": gateway_kind,
                         "workerPid": os.getpid(),
                         "desktopPid": desktop_process.pid,
                         "port": endpoint_port,
                         "baseUrl": endpoint.base_url,
                         "userDataDir": str(profile_dir.resolve()),
+                        "effectiveUserDataDir": str(
+                            claude_desktop_effective_user_data_dir(profile_dir)
+                        ),
+                        "claudeConfigDir": str(claude_config_dir),
+                        "migratedSessions": len(migrated_sessions),
                         "startedAt": now_iso(),
                     },
                 )
                 print(
                     f"Claude Desktop worker ready for '{name}' "
-                    f"(model={model}, desktop_models={len(desktop_models)}, "
+                    f"(gateway={gateway_kind}, model={model}, "
+                    f"desktop_models={len(active_models)}, "
                     f"port={endpoint_port}, pid={desktop_process.pid}).",
                     flush=True,
                 )
@@ -4431,7 +5060,10 @@ def _spawn_claude_desktop_worker(
         f"(model={state.get('model')}, port={state.get('port')}, "
         f"pid={state.get('desktopPid')})."
     )
-    print(f"User data: {state.get('userDataDir')}")
+    print(
+        "User data: "
+        + str(state.get("effectiveUserDataDir") or state.get("userDataDir"))
+    )
     return 0
 
 
@@ -4448,10 +5080,9 @@ def launch_claude_desktop_bridge(
     if port is not None and not 1 <= port <= 65535:
         print("Error: --desktop-port must be between 1 and 65535.", file=sys.stderr)
         return 1
-    resolved = resolve_claude_desktop_bridge(config, name)
-    if resolved is None:
+    node = resolve_claude_desktop_node(config, name)
+    if node is None:
         return 1
-    node, _profile, _model, _cpa_executable, _upstream_base_url = resolved
     profile_dir = claude_desktop_profile_home(name, node)
     if profile_dir is None:
         print("Error: refusing an unsafe Claude Desktop profile path.", file=sys.stderr)
@@ -4494,23 +5125,11 @@ def show_claude_desktop_status(
     nodes = config.get("nodes") or {}
     selected = [name] if name else [
         node_name
-        for node_name, node in nodes.items()
-        if is_claude_codex_bridge(node) and node.get("gateway") == "cpa"
+        for node_name in nodes
     ]
     if name and name not in nodes:
         print(f"Error: Claude node '{name}' was not found.", file=sys.stderr)
         return 1
-    if name:
-        requested_node = nodes.get(name) or {}
-        if (
-            not is_claude_codex_bridge(requested_node)
-            or requested_node.get("gateway") != "cpa"
-        ):
-            print(
-                f"Error: Claude node '{name}' is not a CPA Desktop bridge node.",
-                file=sys.stderr,
-            )
-            return 1
     print("Claude Desktop instances")
     print("NAME                 STATE     MODEL                 PID      PORT")
     for node_name in selected:
@@ -4523,7 +5142,17 @@ def show_claude_desktop_status(
             status = "stale"
         else:
             status = "stopped"
-        model = str((state or {}).get("model") or node.get("model") or "-")
+        configured_models = node.get("desktop_models")
+        configured_model = (
+            str(configured_models[0])
+            if isinstance(configured_models, list) and configured_models
+            else "auto"
+        )
+        model = str(
+            (state or {}).get("model")
+            or node.get("model")
+            or configured_model
+        )
         pid = str((state or {}).get("desktopPid") or "-")
         runtime_port = str((state or {}).get("port") or "-")
         print(
@@ -4542,13 +5171,7 @@ def stop_claude_desktop(
     selected = name or config.get("current")
     node = (config.get("nodes") or {}).get(selected) if selected else None
     if not selected or not node:
-        print("Error: select a Claude Desktop bridge node.", file=sys.stderr)
-        return 1
-    if not is_claude_codex_bridge(node) or node.get("gateway") != "cpa":
-        print(
-            f"Error: Claude node '{selected}' is not a CPA Desktop bridge node.",
-            file=sys.stderr,
-        )
+        print("Error: select a Claude Desktop node.", file=sys.stderr)
         return 1
     profile_dir = claude_desktop_profile_home(str(selected), node)
     if profile_dir is None:
@@ -4577,8 +5200,8 @@ def stop_claude_desktop(
 def show_claude_desktop_bridge_token(config: dict[str, Any], name: str | None) -> int:
     selected = name or config.get("current")
     node = (config.get("nodes") or {}).get(selected) if selected else None
-    if not selected or not node or not is_claude_codex_bridge(node):
-        print("Error: select a Codex bridge node.", file=sys.stderr)
+    if not selected or not node:
+        print("Error: select a Claude Desktop node.", file=sys.stderr)
         return 1
     try:
         print(get_or_create_claude_desktop_bridge_token(str(selected)))
@@ -4597,10 +5220,12 @@ def run_claude_node(config: dict[str, Any], name: str, claude_args: list[str]) -
         return 1
     if is_claude_codex_bridge(node):
         return run_claude_codex_bridge_node(config, name, node, claude_args)
+    prepared_args, selected_model = prepare_native_claude_args(node, claude_args)
     env = {
         "ANTHROPIC_BASE_URL": clean_hidden_prefix(node.get("base_url", "")),
         "ANTHROPIC_AUTH_TOKEN": get_claude_secret(name, node),
     }
+    env.update(claude_native_model_environment(node, selected_model))
     add_claude_proxy_environment(env, node)
     if claude_node_isolation(node) == "isolated":
         home = ensure_claude_node_home(config, name, node)
@@ -4616,7 +5241,7 @@ def run_claude_node(config: dict[str, Any], name: str, claude_args: list[str]) -
     print(f"Using Claude node '{name}' ({env['ANTHROPIC_BASE_URL']}, {mode_label})")
     return run_command(
         "claude",
-        claude_args,
+        prepared_args,
         env=env,
         env_remove=CLAUDE_PROFILE_ENV,
     )
@@ -4774,14 +5399,16 @@ def claude_help() -> None:
   apiclaude --vscode               Choose a node and open VS Code here
   apiclaude --vscode --api-profile <name>
                                    Open VS Code with a specific node
-  apiclaude --desktop [--api-profile <bridge-node>]
+  apiclaude --desktop [--api-profile <node>]
              [--desktop-port PORT] Open an isolated Claude Desktop instance
-  apiclaude --desktop-foreground [--api-profile <bridge-node>]
+  apiclaude --desktop-foreground [--api-profile <node>]
              [--desktop-port PORT] Run the Desktop bridge visibly for debugging
-  apiclaude --desktop-status [--api-profile <bridge-node>]
+  apiclaude --desktop-status [--api-profile <node>]
                                    Show isolated Desktop instance status
-  apiclaude --desktop-stop [--api-profile <bridge-node>]
+  apiclaude --desktop-stop [--api-profile <node>]
                                    Stop one isolated Desktop instance
+  apiclaude desktop-models NODE [MODEL ... | --auto] [--1m | --standard]
+                                   Show/override models and their context mode
   apiclaude desktop-token [NODE]   Print the securely stored local gateway token
   apiclaude --up                   Update Claude Code
   apiclaude --api-help             Show this help
@@ -4797,6 +5424,10 @@ def claude_help() -> None:
                    [--desktop-model MODEL]...
                                    Create/update an isolated CLI prototype node
                                    backed by an existing Codex API profile via CPA
+
+Native Claude nodes default to the 1M model variant and --autocompact auto.
+Use 'desktop-models NODE --standard' to opt that node out of 1M context.
+Codex/CPA bridge nodes use standard context and reject '--1m'.
 
 Legacy subcommands remain available: add, list [--json], current,
 remove [NAME], proxy [NAME], run [ARGS], vscode [NAME], update, help.
@@ -4974,6 +5605,8 @@ def claude_main(args: list[str]) -> int:
         return 0
     if args and args[0] == "bridge":
         return claude_bridge_main(args[1:])
+    if args and args[0] == "desktop-models":
+        return claude_desktop_models_main(args[1:])
     if args and args[0] == "desktop-token":
         if len(args) > 2:
             print("Error: usage: apiclaude desktop-token [NODE].", file=sys.stderr)

@@ -10,7 +10,8 @@ import re
 import sys
 import tempfile
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
@@ -18,6 +19,7 @@ from codex_app_server import (
     AppServerError,
     CodexAppServer,
     detect_fork_path_capability,
+    resolve_share_codex_command,
 )
 from codex_conversation_pool import (
     CommitRecord,
@@ -29,6 +31,8 @@ from codex_conversation_pool import (
     SnapshotChangedError,
     audit_jsonl_no_encrypted_content,
     audit_target_runtime_context,
+    audit_paginated_replay,
+    paginated_replay_items,
     materialize_snapshot_for_target,
     sanitize_rollout,
     semantic_snapshot_hash,
@@ -61,7 +65,7 @@ class ShareContext:
     claude_account_home: Path | None = None
     claude_nodes_root: Path | None = None
     load_claude_nodes: Callable[[], dict[str, Any]] | None = None
-    codex_command: str = "codex"
+    codex_command: str = field(default_factory=resolve_share_codex_command)
     pool_security: PoolSecurity | None = None
     app_server_factory: Callable[..., CodexAppServer] = CodexAppServer
 
@@ -670,8 +674,13 @@ def _sanitize_thread(
     rollout_path = _validate_rollout_path(target, thread.get("path"))
     temporary = tempfile.TemporaryDirectory(prefix="apicodex-share-")
     try:
-        snapshot = sanitize_rollout(
+        source_path = _materialize_paginated_rollout(
             rollout_path,
+            roots=(target.home / "sessions", target.home / "archived_sessions"),
+            destination=Path(temporary.name) / "source.jsonl",
+        )
+        snapshot = sanitize_rollout(
+            source_path,
             Path(temporary.name) / "portable.jsonl",
             expected_thread_id=str(thread.get("id") or ""),
         )
@@ -679,6 +688,228 @@ def _sanitize_thread(
         temporary.cleanup()
         raise
     return thread, snapshot, temporary
+
+
+def _read_jsonl_rows_with_offsets(
+    path: Path,
+) -> tuple[list[tuple[dict[str, Any], int]], tuple[int, int, int, int]]:
+    before_stat = path.stat()
+    identity = (
+        before_stat.st_dev,
+        before_stat.st_ino,
+        before_stat.st_size,
+        before_stat.st_mtime_ns,
+    )
+    rows: list[tuple[dict[str, Any], int]] = []
+    offset = 0
+    with path.open("rb") as handle:
+        for line_number, raw_line in enumerate(handle, 1):
+            if not raw_line.endswith(b"\n"):
+                raise SnapshotChangedError(
+                    f"rollout ends with a partial line at {path}:{line_number}"
+                )
+            offset += len(raw_line)
+            try:
+                row = json.loads(raw_line.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ConversationPoolError(
+                    f"invalid rollout JSON at {path}:{line_number}: {exc}"
+                ) from exc
+            if not isinstance(row, dict):
+                raise ConversationPoolError(
+                    f"rollout row is not an object at {path}:{line_number}"
+                )
+            rows.append((row, offset))
+    after_stat = path.stat()
+    after_identity = (
+        after_stat.st_dev,
+        after_stat.st_ino,
+        after_stat.st_size,
+        after_stat.st_mtime_ns,
+    )
+    if identity != after_identity:
+        raise SnapshotChangedError(f"rollout changed while it was read: {path}")
+    return rows, identity
+
+
+def _segment_metadata(
+    path: Path,
+) -> tuple[dict[str, Any], list[tuple[dict[str, Any], int]]]:
+    rows, _ = _read_jsonl_rows_with_offsets(path)
+    if not rows or rows[0][0].get("type") != "session_meta":
+        raise ConversationPoolError(f"rollout is missing session metadata: {path}")
+    metadata = rows[0][0]
+    if not isinstance(metadata.get("ordinal"), int):
+        raise ConversationPoolError(
+            f"paginated rollout metadata has no ordinal: {path}"
+        )
+    return metadata, rows
+
+
+def _materialize_paginated_rollout(
+    rollout_path: Path,
+    *,
+    roots: tuple[Path, ...],
+    destination: Path,
+) -> Path:
+    """Flatten a paginated rollout chain before portable sanitization."""
+
+    rollout_path = rollout_path.resolve()
+    initial_rows, _ = _read_jsonl_rows_with_offsets(rollout_path)
+    if not initial_rows or initial_rows[0][0].get("type") != "session_meta":
+        raise ConversationPoolError(
+            f"rollout is missing session metadata: {rollout_path}"
+        )
+    metadata = initial_rows[0][0]
+    payload = metadata.get("payload")
+    history_base = payload.get("history_base") if isinstance(payload, dict) else None
+    if not isinstance(history_base, dict):
+        return rollout_path
+    root_session_id = str(
+        payload.get("session_id") or payload.get("id") or ""
+    ).strip()
+    if not root_session_id:
+        raise ConversationPoolError(
+            f"paginated rollout metadata has no session id: {rollout_path}"
+        )
+    if not isinstance(metadata.get("ordinal"), int):
+        raise ConversationPoolError(
+            f"paginated rollout metadata has no ordinal: {rollout_path}"
+        )
+
+    chain: list[Path] = [rollout_path]
+    seen = {os.path.normcase(str(rollout_path))}
+    current_metadata = metadata
+    while True:
+        current_payload = current_metadata.get("payload")
+        base = (
+            current_payload.get("history_base")
+            if isinstance(current_payload, dict)
+            else None
+        )
+        if not isinstance(base, dict):
+            break
+        base_thread_id = str(base.get("thread_id") or "").strip()
+        base_end_ordinal = base.get("end_ordinal_exclusive")
+        base_end_offset = base.get("end_byte_offset")
+        if (
+            not base_thread_id
+            or not isinstance(base_end_ordinal, int)
+            or not isinstance(base_end_offset, int)
+            or base_end_ordinal < 1
+            or base_end_offset < 1
+        ):
+            raise ConversationPoolError(
+                f"invalid paginated history base in {chain[-1]}"
+            )
+        if current_metadata.get("ordinal") != base_end_ordinal:
+            raise ConversationPoolError(
+                f"paginated history boundary does not match metadata ordinal in {chain[-1]}"
+            )
+
+        matches: list[tuple[Path, dict[str, Any]]] = []
+        for root in roots:
+            if not root.is_dir():
+                continue
+            for candidate in root.rglob(f"*{base_thread_id}*.jsonl"):
+                resolved = candidate.resolve()
+                key = os.path.normcase(str(resolved))
+                if key in seen or candidate.is_symlink() or not resolved.is_file():
+                    continue
+                candidate_rows, _ = _read_jsonl_rows_with_offsets(resolved)
+                prefix_rows = [
+                    row
+                    for row, end_offset in candidate_rows
+                    if end_offset <= base_end_offset
+                ]
+                if (
+                    not candidate_rows
+                    or not prefix_rows
+                    or candidate_rows[len(prefix_rows) - 1][1] != base_end_offset
+                    or prefix_rows[-1].get("ordinal") != base_end_ordinal - 1
+                ):
+                    continue
+                candidate_metadata = candidate_rows[0][0]
+                candidate_payload = candidate_metadata.get("payload")
+                candidate_session_id = (
+                    str(
+                        candidate_payload.get("session_id")
+                        or candidate_payload.get("id")
+                        or ""
+                    )
+                    if isinstance(candidate_payload, dict)
+                    else ""
+                )
+                if candidate_session_id != root_session_id:
+                    continue
+                matches.append((resolved, candidate_metadata))
+        if len(matches) != 1:
+            raise ConversationPoolError(
+                f"paginated history predecessor is {'missing' if not matches else 'ambiguous'} "
+                f"for ordinal {base_end_ordinal}"
+            )
+        predecessor, predecessor_metadata = matches[0]
+        chain.append(predecessor)
+        seen.add(os.path.normcase(str(predecessor)))
+        current_metadata = predecessor_metadata
+
+    chain.reverse()
+    flattened: list[dict[str, Any]] = []
+    previous_ordinal: int | None = None
+    for index, segment in enumerate(chain):
+        segment_metadata, segment_rows = _segment_metadata(segment)
+        upper_bound = (
+            chain[index + 1]
+            if index + 1 < len(chain)
+            else None
+        )
+        if upper_bound is not None:
+            next_metadata, _ = _segment_metadata(upper_bound)
+            next_payload = next_metadata.get("payload")
+            next_base = (
+                next_payload.get("history_base")
+                if isinstance(next_payload, dict)
+                else None
+            )
+            end_ordinal = (
+                next_base.get("end_ordinal_exclusive")
+                if isinstance(next_base, dict)
+                else None
+            )
+            if not isinstance(end_ordinal, int):
+                raise ConversationPoolError(
+                    f"paginated history boundary is missing in {upper_bound}"
+                )
+        else:
+            end_ordinal = None
+
+        for row, _ in segment_rows:
+            ordinal = row.get("ordinal")
+            if not isinstance(ordinal, int):
+                raise ConversationPoolError(
+                    f"paginated rollout row has no ordinal: {segment}"
+                )
+            if end_ordinal is not None and ordinal >= end_ordinal:
+                continue
+            if row.get("type") == "session_meta" and flattened:
+                continue
+            if previous_ordinal is not None and ordinal <= previous_ordinal:
+                raise ConversationPoolError(
+                    f"paginated rollout ordinals are not strictly increasing at {segment}"
+                )
+            flattened.append(row)
+            previous_ordinal = ordinal
+
+    destination = destination.resolve()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with destination.open("x", encoding="utf-8", newline="\n") as handle:
+        for row in flattened:
+            handle.write(
+                json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n"
+            )
+        handle.flush()
+        os.fsync(handle.fileno())
+    return destination
 
 
 def _handle_init(
@@ -778,7 +1009,11 @@ def _clone_commit(
             f"target working directory does not exist: {cwd}; use --cwd"
         )
     object_path = pool.verify_object(commit.snapshot_hash)
+    native_import = paginated_replay_items(object_path) is not None
+    if native_import and not capability.paginated_history:
+        raise ConversationPoolError("paginated history requires a current Desktop Codex runtime; import was not started")
     new_thread_id: str | None = None
+    imported_path: Path | None = None
     with tempfile.TemporaryDirectory(
         prefix="apicodex-target-snapshot-",
         ignore_cleanup_errors=True,
@@ -792,13 +1027,30 @@ def _clone_commit(
         )
         with _new_app_server(context, target) as client:
             try:
-                thread = client.fork_path(
-                    source_thread_id=commit.source_thread_id,
-                    rollout_path=target_snapshot,
-                    model_provider=target.model_provider,
-                    cwd=cwd,
-                    model=target.model,
-                )
+                if native_import:
+                    import_id = str(uuid.uuid4())
+                    stamp = datetime.now(timezone.utc)
+                    imported_path = target.home / "sessions" / stamp.strftime("%Y/%m/%d") / f"rollout-{stamp:%Y-%m-%dT%H-%M-%S}-{import_id}.jsonl"
+                    if not imported_path.resolve().is_relative_to((target.home / "sessions").resolve()):
+                        raise ConversationPoolError("import path escapes target sessions")
+                    materialize_snapshot_for_target(
+                        object_path, imported_path,
+                        model_provider=target.model_provider, model=target.model, cwd=cwd,
+                        imported_thread_id=import_id,
+                    )
+                    new_thread_id = import_id
+                    thread = client.resume_import(
+                        thread_id=new_thread_id, rollout_path=imported_path,
+                        model_provider=target.model_provider, model=target.model, cwd=cwd,
+                    )
+                else:
+                    thread = client.fork_path(
+                        source_thread_id=commit.source_thread_id,
+                        rollout_path=target_snapshot,
+                        model_provider=target.model_provider,
+                        cwd=cwd,
+                        model=target.model,
+                    )
                 new_thread_id = str(thread.get("id") or "")
                 if not new_thread_id or new_thread_id == commit.source_thread_id:
                     raise ConversationPoolError(
@@ -819,13 +1071,6 @@ def _clone_commit(
                     raise ConversationPoolError("cloned thread cwd verification failed")
                 if str(verified.get("name") or "") != title:
                     raise ConversationPoolError("cloned thread title verification failed")
-                if new_thread_id not in {
-                    str(item.get("id") or "")
-                    for item in client.list_threads(limit=100)
-                }:
-                    raise ConversationPoolError(
-                        "cloned thread was not returned by thread/list"
-                    )
                 rollout_path = _validate_rollout_path(target, verified.get("path"))
                 audit_jsonl_no_encrypted_content(rollout_path)
                 audit_target_runtime_context(
@@ -833,6 +1078,7 @@ def _clone_commit(
                     expected_model_provider=target.model_provider,
                     expected_model=target.model,
                 )
+                display_items = audit_paginated_replay(object_path, rollout_path, verified)
                 mapping = state.register(
                     pool_id=pool.pool_id(),
                     target_id=target.id,
@@ -853,12 +1099,15 @@ def _clone_commit(
                     "rolloutPath": str(rollout_path),
                     "mapping": _mapping_payload(mapping),
                     "capability": asdict(capability),
+                    "displayItemCount": display_items if native_import else None,
                 }
             except BaseException as exc:
                 if new_thread_id:
                     try:
                         client.delete_thread(new_thread_id)
                     except BaseException as rollback_exc:
+                        # A native import may fail before app-server registration.
+                        # Preserve that uniquely named file for diagnosis/recovery.
                         raise ConversationPoolError(
                             f"clone failed and rollback also failed: {exc}; "
                             f"rollback: {rollback_exc}"
@@ -888,13 +1137,17 @@ def _handle_clone(
             raise ConversationPoolError(
                 f"clone is disabled: {capability.detail}"
             )
-        pool.verify_object(commit.snapshot_hash)
+        object_path = pool.verify_object(commit.snapshot_hash)
+        native_import = paginated_replay_items(object_path) is not None
+        if native_import and not capability.paginated_history:
+            raise ConversationPoolError("paginated history requires a current Desktop Codex runtime")
         if not cwd.is_dir():
             raise ConversationPoolError(
                 f"target working directory does not exist: {cwd}; use --cwd"
             )
         clone = {
             "planned": True,
+            "importMode": "paginated" if native_import else "legacy-fork",
             "title": title,
             "cwd": str(cwd),
             "modelProvider": target.model_provider,

@@ -5,6 +5,146 @@
 
 ## 协作修改记录
 
+### 2026-09-15：收拢本机更新与 Claude 模型选择补丁
+
+- 修改简介：纳入安装版的 `cli_force_default_model` 开关；设为 `false` 时保留
+  Claude Code 已保存的模型选择，同时提供 1M 家族别名，显式 `--model` 继续优先。
+  补充配置说明和回归测试，并将此前 Desktop、模型刷新及分页迁移改动一并入库。
+- 修改原因：9 月 4–6 日的功能仍未提交，9 月 10 日的模型选择补丁仅存在于
+  `C:\tools`，需要统一仓库与安装版，避免后续部署覆盖已有行为。
+- 验证情况：新增用例先在旧代码复现模型覆盖，再随补丁通过；完整 `pytest`
+  278 passed、13 skipped、188 subtests passed，`git diff --check` 通过，
+  16 个运行模块与 `C:\tools` 的 SHA-256 全部一致。
+
+### 2026-09-06：ApiCodex 模型目录自动刷新
+
+- 修改简介：CLI、VS Code、Desktop 启动前每 6 小时检查本地覆盖模型目录；新增
+  `apicodex models refresh [--api-profile NAME | --all] [--dry-run]`，复用保存的 Key。
+- 修改原因：旧 `models.json` 不随 Desktop 更新，导致上游新增 Astra 后仍无法选择。
+  刷新只追加新模型并补入官方元数据，保留旧模型、定制参数、默认项和原配置。
+- 安全说明：覆盖前备份并校验，文件锁及原子替换保护并发；失败保留旧目录，错误
+  只输出安全类别；不读取账号态、不输出 Key。内置/外部目录跳过，可用环境变量停用。
+- 验证情况：完整 pytest 275 passed、13 skipped、184 subtests；编译与 diff 检查通过。
+  安装版经本地 HTTP 上游添加 Astra 后由真实 0.153.4 引擎读回，6 档推理及缓存通过。
+  `C:\tools` 已备份部署并核对哈希；tiantiansub2api 当前目录已含 Astra、刷新无变更；
+  zzzcoding 当前上游返回无效 JSON，保留旧目录，待上游恢复后自动重试。见工作记录。
+
+### 2026-09-05：ApiCodex 分页会话迁移及显示修复
+
+- 修改简介：展平 7 段分页历史；历史操作选择最新本机运行时，分页快照以独立 UUID
+  新建自包含 rollout 后由 `thread/resume` 索引，旧会话继续使用 fork。
+- 修改原因：初次验收只核对模型历史，漏掉了 UI 条目；缺失 history_mode 的快照
+  经 legacy fork 会过滤除 Plan 外的 item_completed。单独升级运行时不能修复此问题。
+- 安全说明：只独占创建新文件，不覆盖原会话或写 SQLite；保持清洗规则，登记前
+  核对全部完成事件载荷及 UI 条目 ID，失败拒绝登记。详情见 `.work-progress/state.md`。
+- 验证情况：257 项测试及 168 subtest 通过（12 skipped），真实副本
+  `91bb06eb-6385-4234-a6fd-8ffd621fb779` 的 429 条 UI 记录已由 Desktop 读回，状态 clean。
+
+### 2026-09-04：Claude Desktop 1M 请求与流式转发修复
+
+- 修改简介：原生 Desktop 代理会把 `[1m]` 模型规范化为裸上游 ID 并合并 1M
+  beta，SSE 改为逐行即时转发，普通响应使用单次底层读取；新增模型详情 GET、有效
+  `Claude-3p` 数据目录状态，并拒绝 CPA 节点的无效 `--1m`。已迁移会话在 canonical
+  副本仅追加时不再被误判为冲突，真正分叉仍拒绝覆盖。
+- 修改原因：Desktop 主进程不会自行构造 Claude Code 的 1M 请求，旧代理又会把
+  小型 SSE 缓冲至 EOF；状态显示的根目录也不是新版实际 userData。实机复核时另发现
+  合法追加的共享 transcript 会阻断后续 Desktop 启动。
+- 安全说明：1M 改写仅发生在已认证的回环 worker；上游 Token 仍不进入配置、命令行、
+  runtime 或日志。会话兼容判断只逐块比较字节前缀，不输出或覆盖内容。
+- 验证情况：聚焦 69 项、完整 `pytest` 252 项和 `unittest` 264 项通过（12 项按平台
+  跳过），根模块 `py_compile` 与 `git diff --check` 通过。部署后 16 个模块哈希一致；
+  AnyRouter 模型详情真实返回 200，健康状态由模型拒绝变为上游 `provider_error`，两次
+  1M 回复探测均因上游 503 未完成，待服务恢复后复核最终回复与标题。
+
+### 2026-09-04：ApiClaude 原生节点默认 1M 与自动压缩
+
+- 修改简介：普通 Anthropic 节点的 Claude Code 与 Desktop 现在默认使用 1M
+  上下文；CLI 会把默认或显式 Claude 模型切换到 `[1m]` 变体，并在用户未指定时
+  注入 `--autocompact auto`。`desktop-models NODE --standard` 可持久关闭 1M。
+- 修改原因：同一 Desktop 会话恢复到普通 CLI 时，裸模型会把可用窗口重新限制为
+  200k，导致超过 200k 的 1M 会话在自动压缩前直接溢出；AnyRouter 又要求 1M
+  请求变体才能服务 Opus 5 / Fable 5.1。
+- 安全说明：上下文和压缩设置均为非敏感参数；上游 Token 仍只经 SecureStore
+  注入进程环境。Codex/CPA 桥接节点默认保持标准上下文，避免误用 Anthropic 语义。
+- 验证情况：聚焦 123 项、完整 `pytest` 245 项和 `unittest` 257 项通过（12 项按
+  平台跳过），根模块 `py_compile` 与 `git diff --check` 通过。已安装版 AnyRouter
+  实际生成 Opus 5 / Fable 5.1 的 `[1m]` 参数及 `--autocompact auto`，Claude Code
+  2.1.260 确认支持该选项；部署备份后 16 个运行模块 SHA-256 全部一致。
+
+### 2026-09-04：ApiClaude CLI 与 Desktop 共用节点会话目录
+
+- 修改简介：Claude Desktop 的 Code/Cowork 改为复用同节点 CLI、VS Code 的
+  canonical `CLAUDE_CONFIG_DIR`，只继续隔离 Electron、普通聊天库、3P 配置和本地
+  令牌；首次启动会把旧 Desktop 目录中的合法 JSONL transcript 复制到共享目录。
+- 修改原因：此前同一个 ApiClaude 节点在 CLI 与 Desktop 中使用不同会话根，导致
+  Desktop 产生的 Claude Code session 无法在 CLI 原生 `/resume` 搜索器中出现，
+  与 ApiCodex 复用 Profile `CODEX_HOME` 的行为不一致。
+- 安全说明：迁移仅接受 UUID 命名的直接 JSONL，复制后校验 SHA-256 且保留源文件；
+  已存在的相同文件跳过，异内容冲突拒绝覆盖。Desktop 上游 Token 与本地令牌的
+  隔离方式不变，普通 Desktop chat 数据不会混入 Claude Code session。
+- 验证情况：聚焦 51 项（含 5 个 subtest）、完整 `pytest` 242 项和
+  `unittest` 254 项通过（12 项按平台跳过），`py_compile` 与 `git diff --check`
+  通过。anyrouter 旧会话 `5b89d641-4840-4f82-8237-08461ab2c023` 已保留源
+  文件并同哈希复制到 `~/.claude`，普通 `apiclaude --resume` 选择器实际
+  显示标题“你好”。备份部署后 16 个运行模块哈希一致，728 个文件及
+  进程命令行审计无上游 Token 命中。
+
+### 2026-09-04：Claude Desktop 节点级 1M 上下文模式
+
+- 修改简介：`apiclaude desktop-models` 新增 `--1m` / `--standard`，以节点级
+  非敏感配置控制上下文模式；1M 模式为所有原生模型写入 `supports1m`，并为列表
+  第一项写入 `prefer1m`。模型显式排序、自动发现和 JSON 状态输出均支持该开关。
+- 修改原因：AnyRouter 已全量切换到 1M 上下文，标准 `claude-opus-5` 探测返回
+  HTTP 400 并明确要求启用 1M；仅调整模型顺序不能改变 Desktop 请求变体。
+- 安全说明：开关只声明模型能力，不涉及凭据；上游 Token 仍不进入节点配置、
+  Desktop 命令行、运行状态或日志，其他上游默认保持标准上下文。
+- 验证情况：聚焦 60 项、完整 `pytest` 238 项和 `unittest` 250 项通过（12 项按
+  平台跳过），`py_compile` 与 `git diff --check` 通过。anyrouter 已配置 Opus 5 /
+  Fable 5.1 且两项均启用 `supports1m`，Opus 5 启用 `prefer1m`；标准请求的 1M 400
+  在加入 1M beta 后消失。运行模块备份部署后哈希一致，等待实际 Desktop 回复确认。
+
+### 2026-09-04：修复 Claude Desktop 1.44121.4 的 3P 配置发现
+
+- 修改简介：每个 Desktop 节点新增私有 `.desktop-localappdata`，将 3P 配置同时
+  写入旧根目录与新版实际读取的 `Claude-3p` 子目录；启动时显式设置节点级
+  `LOCALAPPDATA`，并继续使用 Electron `--user-data-dir` 隔离进程与会话。
+- 修改原因：上一轮只恢复了独立窗口，新版 packaged build 会删除
+  `CLAUDE_USER_DATA_DIR` 并从 `%LOCALAPPDATA%\Claude-3p` 解析网关配置，导致窗口
+  实际仍以 `deploymentMode=1p` 打开官方 Sign In 页面。
+- 安全说明：新增目录仍位于节点私有 ACL 下，只保存 Desktop 必需的随机回环令牌；
+  上游 Token 继续仅由 worker 从 `SecureStore` 读取，普通账号态未读写。
+- 验证情况：专项 45 项、完整 `pytest` 237 项和 `unittest` 249 项通过（12 项按
+  平台跳过），`py_compile` 与 `git diff --check` 通过；部署备份后仓库与
+  `C:\tools` SHA-256 一致。anyrouter 实机渲染进程为 `deploymentMode=3p`、非 `1p`，
+  14 个模型、Anthropic worker、无 CPA、官方账号实例并存及无认证头日志均通过。
+
+### 2026-09-04：适配 Claude Desktop 1.44121.4 启动隔离
+
+- 修改简介：Claude Desktop 启动时除保留 `CLAUDE_USER_DATA_DIR` 外，显式传入
+  Electron `--user-data-dir`，使新版 MSIX 继续创建并维持每节点独立进程和窗口。
+- 修改原因：自动更新到 `1.44121.4.0` 后环境变量不再决定 Chromium 用户目录；
+  新启动器会激活已有账号实例后以退出码 0 结束，被 worker 误判为启动失败。
+- 验证情况：专项 27 项、完整 `pytest` 237 项及 `unittest` 249 项通过（12 项按
+  平台跳过），`py_compile`、`git diff --check` 通过。运行模块备份并同步到
+  `C:\tools` 后，anyrouter 真实隔离窗口保持运行，命令行目录、可见窗口、14 个模型、
+  Anthropic worker 状态及官方账号实例并存均验证通过。
+
+### 2026-09-04：ApiClaude Desktop 原生 Claude 上游
+
+- 修改简介：普通 `apiclaude --api-add` 节点现可直接通过回环 Anthropic 透传代理
+  启动隔离 Claude Desktop；新增 `desktop-models` 自动发现/显式覆盖命令，并保留
+  Codex Profile + CPA 桥接路径、Desktop 生命周期和共享 MCP 行为。
+- 修改原因：原 Desktop 入口只接受 Codex 桥节点，原生 Claude Messages 上游也被
+  强制转换成 Responses，无法获得与 `apicodex --desktop` 对等的直接节点体验。
+- 安全说明：上游 Token 仅由隐藏 worker 从 `SecureStore` 读取；父进程、命令行、
+  Desktop 配置、运行状态和日志均不含真实 Token。代理只监听 `127.0.0.1`，校验
+  节点本地令牌，替换客户端认证头，并对上游错误中的 Token 做有界脱敏。
+- 验证情况：聚焦 62 项及完整 `unittest` 249 项通过（12 项按平台跳过），
+  `py_compile`、`git diff --check` 通过；`pytest` 未安装。`anyrouter` 经 7897 自动
+  发现 14 个模型并通过新代理返回原生 `NATIVE_OK`；`zzzcoding` direct worker 发现
+  `claude-opus-5`，其真实回复因上游 504 未完成。两节点均无 CPA 或凭据泄漏，测试
+  实例已停止；3 个运行模块已备份后部署到 `C:\tools`，16 个模块哈希全部一致。
+
 ### 2026-09-03：合并远端 Profile 代理与本地 Codex CLI 选择
 
 - 修改简介：将远端 `8385f3b` 的 ApiClaude Profile 代理和 Codex/Claude 共享 MCP

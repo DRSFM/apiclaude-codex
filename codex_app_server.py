@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import re
 import shutil
 import subprocess
 import tempfile
@@ -25,6 +26,39 @@ class AppServerCapability:
     available: bool
     codex_version: str
     detail: str
+    paginated_history: bool = False
+
+
+def resolve_share_codex_command() -> str:
+    """Use a current Desktop runtime for history IO, independently of CLI profiles."""
+    candidates: list[str] = []
+    local = os.environ.get("LOCALAPPDATA")
+    if os.name == "nt" and local:
+        root = Path(local)
+        runtime_root = root / "OpenAI" / "Codex" / "bin"
+        candidates.extend(str(p) for p in runtime_root.glob("*/codex.exe"))
+        candidates.extend([
+            str(runtime_root / "codex.exe"),
+            str(root / "Programs" / "OpenAI" / "Codex" / "bin" / "codex.exe"),
+        ])
+    fallback = shutil.which("codex")
+    if fallback:
+        candidates.append(fallback)
+    versions: list[tuple[tuple[int, int, int, int], str]] = []
+    for executable in dict.fromkeys(candidates):
+        if not Path(executable).is_file():
+            continue
+        try:
+            result = subprocess.run([executable, "--version"], capture_output=True,
+                                    text=True, encoding="utf-8", errors="replace", timeout=5,
+                                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            match = re.search(r"codex-cli (\d+)\.(\d+)\.(\d+)(\S*)", result.stdout)
+            if result.returncode == 0 and match:
+                version = tuple(int(match[i]) for i in (1, 2, 3)) + (int(not match[4]),)
+                versions.append((version, executable))
+        except (OSError, subprocess.SubprocessError):
+            continue
+    return max(versions, key=lambda pair: pair[0])[1] if versions else (fallback or "codex")
 
 
 def _clean_process_environment(
@@ -125,6 +159,9 @@ def detect_fork_path_capability(
                 True,
                 version,
                 "thread/fork.path is supported by the installed schema",
+                "historyMode" in json.loads(
+                    (Path(directory) / "v2" / "ThreadStartParams.json").read_text(encoding="utf-8")
+                ).get("properties", {}),
             )
     except (OSError, subprocess.SubprocessError, ValueError, json.JSONDecodeError) as exc:
         return AppServerCapability(False, "", str(exc))
@@ -382,6 +419,24 @@ class CodexAppServer:
         thread = result.get("thread")
         if not isinstance(thread, dict):
             raise AppServerError("thread/fork returned an invalid thread")
+        return thread
+
+    def resume_import(
+        self, *, thread_id: str, rollout_path: Path, model_provider: str,
+        model: str | None, cwd: Path,
+    ) -> dict[str, Any]:
+        """Index a newly materialized standalone thread without starting a turn."""
+        params: dict[str, Any] = {
+            "threadId": thread_id, "path": str(rollout_path.resolve()),
+            "modelProvider": model_provider, "cwd": str(cwd.resolve()),
+            "excludeTurns": False, "deferGoalContinuation": True,
+        }
+        if model:
+            params["model"] = model
+        result = self.request("thread/resume", params)
+        thread = result.get("thread")
+        if not isinstance(thread, dict):
+            raise AppServerError("thread/resume returned an invalid imported thread")
         return thread
 
     def set_thread_name(self, thread_id: str, name: str) -> None:

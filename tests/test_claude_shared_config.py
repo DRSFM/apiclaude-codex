@@ -70,7 +70,7 @@ class ClaudeSharedConfigTests(unittest.TestCase):
         )
         self.assertNotIn("search", removed.payload.get("mcpServers", {}))
 
-    def test_enable_syncs_account_user_mcp_to_isolated_and_desktop_configs(self) -> None:
+    def test_enable_syncs_account_mcp_to_canonical_node_configs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             nodes_root = root / ".apiclaude"
@@ -94,7 +94,18 @@ class ClaudeSharedConfigTests(unittest.TestCase):
             isolated_path = nodes_root / "nodes" / "relay" / ".claude.json"
             isolated_path.parent.mkdir(parents=True)
             isolated_path.write_text(
-                json.dumps({"theme": "dark"}),
+                json.dumps(
+                    {
+                        "theme": "dark",
+                        "mcpServers": {"apiclaude-web": {"command": "web"}},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            shared_path = root / ".claude" / ".claude.json"
+            shared_path.parent.mkdir(parents=True)
+            shared_path.write_text(
+                json.dumps({"mcpServers": {"apiclaude-web": {"command": "web"}}}),
                 encoding="utf-8",
             )
             desktop_root = root / ".apiclaude-desktop" / "nodes"
@@ -115,7 +126,8 @@ class ClaudeSharedConfigTests(unittest.TestCase):
                         "type": "codex_bridge",
                         "isolation": "isolated",
                         "home": "nodes/relay",
-                    }
+                    },
+                    "shared": {"type": "anthropic"},
                 },
                 "current": "relay",
             }
@@ -132,16 +144,18 @@ class ClaudeSharedConfigTests(unittest.TestCase):
                 code = apiagent.claude_shared_main(["enable", "--account"])
 
             self.assertEqual(code, 0)
-            for path in (isolated_path, desktop_path):
+            for path in (isolated_path, shared_path):
                 payload = json.loads(path.read_text(encoding="utf-8"))
                 self.assertIn("SDW_Search", payload["mcpServers"])
+                self.assertIn("apiclaude-web", payload["mcpServers"])
             self.assertEqual(
                 json.loads(isolated_path.read_text(encoding="utf-8"))["theme"],
                 "dark",
             )
-            self.assertIn(
-                "apiclaude-web",
-                json.loads(desktop_path.read_text(encoding="utf-8"))["mcpServers"],
+            legacy_payload = json.loads(desktop_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                list(legacy_payload["mcpServers"]),
+                ["apiclaude-web"],
             )
             state = json.loads(
                 (nodes_root / "shared-mcp.json").read_text(encoding="utf-8")

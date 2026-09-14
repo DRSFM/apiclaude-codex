@@ -99,6 +99,44 @@ argument; it is read through a hidden prompt, used in memory for discovery, and
 stored in the platform secure store. Normal Codex arguments such as
 `apicodex --model MODEL` continue to pass through to Codex.
 
+### Refresh Codex model catalogs
+
+CLI, VS Code, and Desktop launches automatically check the provider's model
+list when a profile uses its local `models.json` override. Successful checks
+are cached for six hours in `models-refresh.json`; changing the catalog or
+provider URL invalidates that cache. API keys are reused from the secure store,
+without a prompt. Help, version, and profile-list commands do not refresh.
+
+To refresh immediately, or preview the additions without changing profile files:
+
+```powershell
+apicodex models refresh --api-profile zzzcoding
+apicodex models refresh --all
+apicodex models refresh --api-profile zzzcoding --dry-run
+```
+
+Refresh appends newly discovered text models and uses installed Codex metadata
+for their reasoning levels, context limits, and capabilities where available.
+Existing model entries, their custom metadata, the default model, and
+`config.toml` remain unchanged. Models missing from a provider response are
+retained, since gateways can return incomplete lists. This does not guarantee
+that a retained model is still supported by the provider.
+
+Before replacement, the original catalog is saved beside it as
+`models.json.backup-<timestamp>-<suffix>`. Catalog writes are atomic, concurrent
+refreshes are locked, and failed discovery preserves the current catalog and
+does not prevent launch. Network requests use a five-second socket timeout;
+the optional local metadata probe has a five-second process timeout. Failed
+checks are retried on the next launch. The explicit command returns nonzero
+if any selected profile fails.
+
+Profiles using Codex's built-in catalog or an external catalog path are skipped.
+To temporarily disable startup refresh in PowerShell, set
+`$env:APICODEX_AUTO_REFRESH_MODELS = "0"`; an explicit `models refresh` still runs.
+An already running Desktop or VS Code Codex session needs to be closed and
+reopened to load an updated catalog. A listed model still requires working
+access through the selected provider.
+
 List profiles:
 
 ```bash
@@ -339,12 +377,22 @@ apicodex share publish antenna-notes --api-profile relay --thread <THREAD_ID>
 apicodex share publish account-task --account --thread <THREAD_ID>
 ```
 
-Clone it into a target Profile. The target app-server creates a new local
+Clone it into a target Profile. Each copy gets a new local
 thread ID, loads that Profile's current configuration, and names the task with
 `[shared]` by default. Before forking, ApiCodex builds a temporary target
 runtime copy whose `model`, provider, and working directory come from the
 target Profile; those settings are audited again in the generated rollout so
 portable placeholders cannot be sent to the upstream API:
+
+History operations select the newest locally installed Desktop/official runtime,
+independently of the ordinary CLI's per-Profile custom-build setting. Legacy
+history uses `thread/fork.path`. Paginated history is materialized as a new,
+exclusive standalone rollout with a fresh UUID, contiguous ordinals and no
+`history_base` dependency, then indexed using `thread/resume` without starting a
+model turn. This preserves modern `item_completed` records, including command
+and image-view cards. Every completion payload and UI item identity is read back
+and checked before a successful mapping is registered. `--dry-run` reports the
+selected import mode; unsupported runtimes fail before creating an import.
 
 ```powershell
 apicodex share clone antenna-notes --api-profile another-profile
@@ -387,8 +435,10 @@ Version 1 is local and manually synchronized. It does not provide in-place
 pull, automatic merge, background sync, repository copies, external tool-state
 copies, deletion/GC, or cross-machine transport. `thread/fork.path` is an
 experimental Codex capability; `share doctor` disables cloning safely if the
-installed Codex no longer exposes it. The implementation never falls back to
-editing Codex SQLite databases or target rollout JSONL directly.
+installed Codex no longer exposes it. The implementation does not edit Codex
+SQLite databases or overwrite existing conversations. Paginated imports create
+only a newly named rollout; app-server builds its indexes. Older incomplete
+copies and the original source remain available.
 
 ### Codex ↔ Claude Code conversation migration
 
@@ -577,28 +627,88 @@ managed persistent bridge lifecycle. Protocol translation can still behave
 differently from a native Anthropic model, particularly for extended thinking
 and newly introduced beta features.
 
-### Experimental Claude Desktop 3P bridge
+### Claude Desktop native upstream and 3P bridge
 
 Current Claude Desktop releases can use an officially supported third-party
-inference gateway without an Anthropic account login. A CPA-backed Codex bridge
-node can open an isolated Claude Desktop window with that gateway:
+inference gateway without an Anthropic account login. `apiclaude --desktop`
+accepts both ordinary Claude API nodes created by `apiclaude --api-add` and
+CPA-backed Codex bridge nodes:
 
 ```bash
 apiclaude --desktop
+apiclaude --desktop --api-profile anyrouter
 apiclaude --desktop --api-profile codex-muyuan
 ```
 
-The normal command starts a hidden worker, assigns a free loopback port, writes
-the node-local 3P configuration, and returns after the CPA bridge and Claude
-main process are both ready. The bridge exits automatically when that Claude
-window closes. Claude normally hides to the tray on the window close action;
-the node worker detects that its main window stayed hidden, exits the owned
-Desktop process, and then removes the matching CPA bridge. No PowerShell or
-bridge console remains visible. Use a fixed port only for diagnostics:
+For an ordinary node, the worker starts a loopback-only authenticated proxy and
+forwards Anthropic Messages requests directly to that node's upstream. It does
+not start CPA and does not convert requests to OpenAI Responses. `/v1/messages`,
+streaming SSE, `/v1/messages/count_tokens`, `/v1/models`, and
+`GET /v1/models/{id}` are supported. SSE events are flushed incrementally. The
+configured node proxy setting is honored.
+
+For a Codex bridge node, the existing CPA Messages-to-Responses translation is
+unchanged. The normal command starts a hidden worker, assigns a free loopback
+port, writes the node-local 3P configuration, and returns after the selected
+gateway and Claude main process are both ready. The worker exits automatically
+when that Claude window closes. Claude normally hides to the tray on the window
+close action; the node worker detects that its main window stayed hidden, exits
+the owned Desktop process, and then removes the matching gateway. No PowerShell
+or bridge console remains visible. Use a fixed port only for diagnostics:
 
 ```bash
 apiclaude --desktop --api-profile codex-muyuan --desktop-port 18765
 ```
+
+Ordinary nodes discover their `claude-*` model IDs from `/v1/models` when the
+Desktop worker starts. Discovery is bounded, preserves upstream order, removes
+duplicates, and fails closed when the endpoint is unavailable or returns no
+Claude model. Native nodes default to the 1M-context variant. Inspect the last
+result, set an explicit model list, opt a node out of 1M, or restore automatic
+discovery with:
+
+```bash
+apiclaude desktop-models anyrouter
+apiclaude desktop-models anyrouter claude-sonnet-5 claude-haiku-4-5
+apiclaude desktop-models anyrouter --1m
+apiclaude desktop-models anyrouter --standard
+apiclaude desktop-models anyrouter --auto
+```
+
+An explicit list skips discovery. Native models use identity routes, so Desktop
+sends the selected `claude-*` ID unchanged; the GPT compatibility alias is not
+added to ordinary nodes. A manual override is useful when an Anthropic-compatible
+gateway implements Messages but does not expose `/v1/models`. Native nodes use
+1M context by default: every configured model advertises `supports1m`, and the
+first model also advertises `prefer1m`. For Messages and token-count requests,
+the local proxy strips a trailing `[1m]` model suffix and merges Anthropic's 1M
+beta header before forwarding upstream. `--standard` persists an explicit
+opt-out and leaves request bodies and beta headers unchanged; `--1m` restores
+the default. These flags do not change the model list and can also be combined
+with an explicit list or `--auto`. Codex/CPA bridge nodes use standard context;
+`desktop-models NODE --1m` is rejected because CPA does not implement this
+Anthropic request variant.
+
+The same node-level context mode applies to ordinary `apiclaude` / Claude Code
+launches. On native nodes, the first explicitly configured Desktop model, then
+the last discovered model list's first entry, becomes the CLI default and is
+launched with its `[1m]` variant. An explicit Claude `--model` is upgraded to the
+same variant. ApiClaude also supplies `--autocompact auto` unless the command
+already specifies `--autocompact`, so long sessions compact automatically before
+they reach the selected context limit. For example:
+
+```bash
+apiclaude --api-profile anyrouter --resume SESSION_ID
+apiclaude --api-profile anyrouter --model claude-fable-5-1 --resume SESSION_ID
+apiclaude --api-profile anyrouter --autocompact 180k --resume SESSION_ID
+```
+
+To let Claude Code reuse its saved model selection across launches, set
+`"cli_force_default_model": false` on that node under `nodes` in
+`~/.apiclaude_config.json`. When no `--model` is supplied, ApiClaude leaves model
+selection to Claude Code and still provides `[1m]` family aliases from the
+configured and discovered model lists. An explicit `--model` takes precedence,
+and automatic compaction remains enabled. This setting defaults to `true`.
 
 A CPA bridge node can also expose upstream Claude models by their native IDs.
 Repeat `--desktop-model` when creating or updating the node:
@@ -618,9 +728,10 @@ default in Desktop. Model IDs are metadata only; the worker still loads the
 upstream credential from the referenced Codex Profile at runtime.
 
 Claude Code disables its Anthropic-hosted `WebSearch` implementation when the
-inference provider is `gateway`. Both regular Claude Code bridge nodes and
-Desktop bridge nodes therefore receive an isolated `CLAUDE_CONFIG_DIR` with a
-bundled, dependency-free `apiclaude-web` MCP server. It exposes:
+inference provider is `gateway`. Both ordinary and CPA-backed Desktop nodes
+therefore receive the same node-scoped `CLAUDE_CONFIG_DIR` used by that node's
+CLI and VS Code launches, with a bundled, dependency-free `apiclaude-web` MCP
+server. It exposes:
 
 - `web_search`, which first asks the referenced Codex Profile's Responses
   endpoint to run its hosted `web_search` tool. A response counts as hosted
@@ -629,25 +740,45 @@ bundled, dependency-free `apiclaude-web` MCP server. It exposes:
   ordinary message fall back to Bing's public RSS search response.
 - `get_weather`, backed by Open-Meteo geocoding and daily forecasts.
 
-The hosted search request bypasses CPA's Responses tool conversion and uses a
-separate random token against the same in-memory loopback authentication shim;
-the MCP process never receives the upstream API key. The search token, shim
-address, and upstream model are inherited through the Claude process environment
-and are not written to `.claude.json`. The bridge also repairs two known
+On CPA-backed nodes, the hosted search request bypasses CPA's Responses tool
+conversion and uses a separate random token against the same in-memory loopback
+authentication shim; the MCP process never receives the upstream API key. The
+search token, shim address, and upstream model are inherited through the Claude
+process environment and are not written to `.claude.json`. Ordinary native
+nodes do not have a Responses search channel, so `web_search` uses the Bing RSS
+fallback while `get_weather` remains available. The CPA bridge also repairs two known
 Responses compatibility differences for native Claude models exposed by
 OpenAI-compatible gateways: shortened MCP function names are restored only when
 they map unambiguously to one declared tool, and CPA tool-result content-block
 arrays are flattened to the Responses function-output string expected by the
 upstream. Ambiguous tool names and ordinary function outputs are left unchanged.
 
-Each bridge node uses its own
-`~/.apiclaude-desktop/nodes/<node-slug>` as `CLAUDE_USER_DATA_DIR`. Desktop
-configuration, Recents, projects, session databases, logs, Cowork files, local
-gateway token, Claude Code configuration, MCP processes, and window state are
-therefore independent. The normal account state in `~/.claude` is not read or
-modified by these Desktop bridge nodes. Different nodes can run concurrently on
+Each bridge node keeps a compatibility root at
+`~/.apiclaude-desktop/nodes/<node-slug>`. Claude Desktop 1.44121.4 and newer
+resolve their effective user data and 3P configuration through the node-private
+`.desktop-localappdata\Claude-3p` directory. Runtime state preserves the
+compatibility root as `userDataDir` and reports the directory actually used by
+current builds as `effectiveUserDataDir`; startup output displays the latter.
+The gateway configuration is mirrored into both locations for older Desktop
+releases. Desktop configuration, Recents, ordinary chat databases, logs, Cowork
+files, local gateway token, MCP processes, and window state remain independent.
+Desktop Code/Cowork transcripts are different: they use the node's canonical
+Claude Code home, matching `apiclaude` and `apiclaude --vscode`. An isolated
+node shares `~/.apiclaude/nodes/<slug>` across those three clients; a shared node
+uses the normal `~/.claude` session home by design. Claude Code `/resume` can
+therefore find Desktop Code/Cowork sessions for the same node without a manual
+environment override. Ordinary Desktop chat records are not Claude Code JSONL
+sessions and do not appear in that picker.
+
+On the first Desktop start after upgrading, valid UUID-named JSONL transcripts
+from the former node-private `claude-code-config/projects` directory are copied
+into the canonical home. Existing identical files are left alone, conflicting
+same-ID files abort startup without overwriting either copy, while a canonical
+copy that only appended to the complete legacy transcript is recognized as the
+same migrated session. The legacy source remains available for rollback.
+Different nodes can run concurrently on
 different ports. Starting the same node again reports the existing PID and does
-not create a second process against the same data dir.
+not create a second process against the same Desktop data directory.
 
 Manage the workers without finding processes manually:
 
@@ -661,19 +792,20 @@ apiclaude --desktop-foreground --api-profile codex-muyuan
 Foreground mode keeps lifecycle output in the terminal for troubleshooting.
 Normal worker logs are stored under the node's `.apiclaude-runtime` directory
 and contain no API keys. The current signed Windows MSIX package is required:
-the launcher invokes its main executable directly so
-`CLAUDE_USER_DATA_DIR` is applied before Electron's single-instance lock.
-Shell activation and legacy EXE fallback are deliberately not used because
-they cannot guarantee profile isolation.
+the launcher invokes its main executable directly with `--user-data-dir` before
+Electron's single-instance lock and supplies the node-private `LOCALAPPDATA` for
+3P configuration discovery. Shell activation and legacy EXE fallback are
+deliberately not used because they cannot guarantee profile isolation.
 
-The upstream API key remains in the existing Codex Profile DPAPI store and is
-injected only by the in-memory authentication shim. It is never written to a
-command line, Desktop configuration, CPA YAML, or log. The random per-node
-loopback token is not an upstream credential: Desktop's static Gateway mode
-requires it in the node-local config, and CPA needs it in its short-lived YAML.
-The whole node directory is protected by a non-inherited ACL for the current
-user, Windows SYSTEM, and administrators. The DPAPI copy remains available for
-regeneration and manual diagnostics through `apiclaude desktop-token NODE`.
+The upstream API key remains in the ordinary Claude node or referenced Codex
+Profile `SecureStore` and is loaded only inside the hidden worker. It is never
+written to a command line, Desktop configuration, CPA YAML, runtime state, or
+log. The random per-node loopback token is not an upstream credential:
+Desktop's static Gateway mode requires it in the node-local config, and CPA
+needs it in its short-lived YAML. The whole node directory is protected by a
+non-inherited ACL for the current user, Windows SYSTEM, and administrators. The
+local token can be regenerated or inspected for diagnostics through
+`apiclaude desktop-token NODE`.
 
 Claude Desktop validates Gateway model routes against its Anthropic model
 catalog. The Desktop bridge therefore advertises the recognized local route
@@ -681,11 +813,13 @@ catalog. The Desktop bridge therefore advertises the recognized local route
 model. The display name should identify the actual GPT model. This compatibility
 alias is Desktop-only and does not change the regular Claude Code bridge route.
 
-Desktop third-party inference is an official Claude Desktop feature, but using
-a non-Anthropic model through CPA remains an experimental protocol translation
-and is not supported by Anthropic. Each worker serves one node-local gateway
-and its configured model routes for the lifetime of the corresponding Desktop
-process.
+Desktop third-party inference is an official Claude Desktop feature. Native
+ordinary nodes are limited to Anthropic Messages-compatible `claude-*` models;
+GLM, GPT, and other non-Claude routes continue to require a Codex bridge node.
+Using a non-Anthropic model through CPA remains an experimental protocol
+translation and is not supported by Anthropic. Each worker serves one node-local
+gateway and its configured model routes for the lifetime of the corresponding
+Desktop process.
 
 On first launch, a bridge node adds a node-local
 `skillOverrides.claude-api = "user-invocable-only"` default when that skill has

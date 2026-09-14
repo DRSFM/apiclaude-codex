@@ -34,6 +34,18 @@ def _no_input(prompt: str = "") -> str:
 
 
 class ApiClaudeCodexStyleCliTests(KeychainIsolationMixin):
+    def test_desktop_models_command_routes_before_claude_passthrough(self) -> None:
+        with patch.object(
+            apiagent,
+            "claude_desktop_models_main",
+            return_value=0,
+        ) as models:
+            code = apiagent.claude_main(
+                ["desktop-models", "relay", "claude-sonnet-5"]
+            )
+        self.assertEqual(code, 0)
+        models.assert_called_once_with(["relay", "claude-sonnet-5"])
+
     def test_api_list_json_flag_matches_legacy_contract(self) -> None:
         config = _two_node_config()
         output = io.StringIO()
@@ -77,11 +89,70 @@ class ApiClaudeCodexStyleCliTests(KeychainIsolationMixin):
                 code = apiagent.claude_main(["--api-profile", "relay", "resume"])
 
             self.assertEqual(code, 0)
-            self.assertEqual(run.call_args.args[1], ["resume"])
+            self.assertEqual(
+                run.call_args.args[1],
+                ["--autocompact", "auto", "--model", "opus[1m]", "resume"],
+            )
             env = run.call_args.kwargs["env"]
             self.assertEqual(env["ANTHROPIC_BASE_URL"], "https://relay.test")
             self.assertEqual(env["ANTHROPIC_AUTH_TOKEN"], "sk-test-relay")
+            self.assertEqual(env["ANTHROPIC_MODEL"], "opus[1m]")
             self.assertEqual(config["current"], "relay")
+
+    def test_api_profile_preserves_saved_model_when_default_override_disabled(self) -> None:
+        for model_settings, expected_aliases in (
+            ({}, {}),
+            (
+                {
+                    "desktop_models": ["claude-opus-5"],
+                    "desktop_discovered_models": [
+                        "claude-opus-4-6",
+                        "claude-fable-5-1",
+                    ],
+                },
+                {
+                    "ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus-5[1m]",
+                    "ANTHROPIC_DEFAULT_FABLE_MODEL": "claude-fable-5-1[1m]",
+                },
+            ),
+        ):
+            with self.subTest(model_settings=model_settings):
+                config = _two_node_config()
+                config["nodes"]["relay"].update(
+                    {"cli_force_default_model": False, **model_settings}
+                )
+                with (
+                    patch.object(apiagent, "load_claude_config", return_value=config),
+                    patch.object(apiagent, "save_claude_config"),
+                    patch.object(
+                        apiagent, "get_claude_secret", return_value="sk-test-relay"
+                    ),
+                    patch.object(apiagent, "run_command", return_value=0) as run,
+                    patch("builtins.input", _no_input),
+                    redirect_stdout(io.StringIO()),
+                ):
+                    code = apiagent.claude_main(
+                        ["--api-profile", "relay", "--resume", "session-id"]
+                    )
+
+                self.assertEqual(code, 0)
+                run.assert_called_once()
+                self.assertEqual(
+                    run.call_args.args[1],
+                    ["--autocompact", "auto", "--resume", "session-id"],
+                )
+                env = run.call_args.kwargs["env"]
+                self.assertNotIn("ANTHROPIC_MODEL", env)
+                self.assertEqual(
+                    {
+                        key: value
+                        for key, value in env.items()
+                        if key.startswith("ANTHROPIC_DEFAULT_")
+                    },
+                    expected_aliases,
+                )
+                self.assertIn("ANTHROPIC_MODEL", run.call_args.kwargs["env_remove"])
+                self.assertFalse(config["nodes"]["relay"]["cli_force_default_model"])
 
     def test_api_profile_requires_name(self) -> None:
         with redirect_stderr(io.StringIO()):
@@ -291,7 +362,15 @@ class ApiClaudeCodexStyleCliTests(KeychainIsolationMixin):
 
             self.assertEqual(code, 0)
             self.assertEqual(
-                run.call_args.args[1], ["--permission-mode", "bypassPermissions"]
+                run.call_args.args[1],
+                [
+                    "--autocompact",
+                    "auto",
+                    "--model",
+                    "opus[1m]",
+                    "--permission-mode",
+                    "bypassPermissions",
+                ],
             )
 
     def test_yolo_expands_to_bypass_permissions(self) -> None:
@@ -315,7 +394,15 @@ class ApiClaudeCodexStyleCliTests(KeychainIsolationMixin):
             self.assertEqual(code, 0)
             self.assertEqual(
                 run.call_args.args[1],
-                ["--permission-mode", "bypassPermissions", "resume"],
+                [
+                    "--autocompact",
+                    "auto",
+                    "--model",
+                    "opus[1m]",
+                    "--permission-mode",
+                    "bypassPermissions",
+                    "resume",
+                ],
             )
 
 

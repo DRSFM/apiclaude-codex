@@ -880,8 +880,9 @@ class _VisionProxyHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
             def response_chunks() -> Iterator[bytes]:
+                reader = getattr(response, "read1", response.read)
                 while True:
-                    chunk = response.read(64 * 1024)
+                    chunk = reader(64 * 1024)
                     if not chunk:
                         return
                     yield chunk

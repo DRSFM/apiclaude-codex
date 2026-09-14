@@ -12,6 +12,102 @@ import claude_desktop_windows
 
 
 class ClaudeDesktopWindowsTests(unittest.TestCase):
+    def test_effective_user_data_dir_is_the_private_claude_3p_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            profile = Path(tmp) / "profile"
+
+            effective = (
+                claude_desktop_windows.claude_desktop_effective_user_data_dir(
+                    profile
+                )
+            )
+
+            self.assertEqual(
+                effective,
+                (profile / ".desktop-localappdata" / "Claude-3p").resolve(),
+            )
+            self.assertNotEqual(effective, profile.resolve())
+
+    def test_legacy_desktop_sessions_are_copied_without_removing_source(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            legacy = root / "desktop" / "claude-code-config"
+            target = root / "canonical"
+            session_id = "11111111-1111-4111-8111-111111111111"
+            source = legacy / "projects" / "D--work" / f"{session_id}.jsonl"
+            source.parent.mkdir(parents=True)
+            source.write_text('{"type":"user"}\n', encoding="utf-8")
+
+            first = claude_desktop_windows.migrate_claude_desktop_sessions(
+                legacy,
+                target,
+            )
+            second = claude_desktop_windows.migrate_claude_desktop_sessions(
+                legacy,
+                target,
+            )
+
+            destination = target / "projects" / "D--work" / source.name
+            self.assertEqual(first, [destination])
+            self.assertEqual(second, [])
+            self.assertEqual(destination.read_bytes(), source.read_bytes())
+            self.assertTrue(source.exists())
+
+    def test_migrated_session_may_grow_in_canonical_home(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            legacy = root / "desktop" / "claude-code-config"
+            target = root / "canonical"
+            session_id = "11111111-1111-4111-8111-111111111111"
+            source = legacy / "projects" / "D--work" / f"{session_id}.jsonl"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b'{"type":"user"}\n')
+
+            migrated = claude_desktop_windows.migrate_claude_desktop_sessions(
+                legacy,
+                target,
+            )
+            destination = migrated[0]
+            with destination.open("ab") as handle:
+                handle.write(b'{"type":"assistant"}\n')
+
+            repeated = claude_desktop_windows.migrate_claude_desktop_sessions(
+                legacy,
+                target,
+            )
+
+            self.assertEqual(repeated, [])
+            self.assertEqual(source.read_bytes(), b'{"type":"user"}\n')
+            self.assertEqual(
+                destination.read_bytes(),
+                b'{"type":"user"}\n{"type":"assistant"}\n',
+            )
+
+    def test_legacy_desktop_session_conflict_is_not_overwritten(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            legacy = root / "legacy"
+            target = root / "target"
+            session_id = "22222222-2222-4222-8222-222222222222"
+            source = legacy / "projects" / "D--work" / f"{session_id}.jsonl"
+            destination = target / "projects" / "D--work" / source.name
+            source.parent.mkdir(parents=True)
+            destination.parent.mkdir(parents=True)
+            source.write_text("source\n", encoding="utf-8")
+            destination.write_text("target\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                claude_desktop_windows.ClaudeDesktopError,
+                "conflicting transcript",
+            ):
+                claude_desktop_windows.migrate_claude_desktop_sessions(
+                    legacy,
+                    target,
+                )
+
+            self.assertEqual(source.read_text(encoding="utf-8"), "source\n")
+            self.assertEqual(destination.read_text(encoding="utf-8"), "target\n")
+
     def test_private_acl_check_requires_exact_non_inherited_allow_list(self) -> None:
         current_sid = "S-1-5-21-test"
         report = {
@@ -159,6 +255,8 @@ class ClaudeDesktopWindowsTests(unittest.TestCase):
                     "claude-haiku-4-5",
                 ],
             )
+            self.assertNotIn("supports1m", gateway_a["inferenceModels"][0])
+            self.assertNotIn("prefer1m", gateway_a["inferenceModels"][0])
             self.assertEqual(
                 gateway_a["inferenceModels"][1]["anthropicFamilyTier"],
                 "sonnet",
@@ -177,6 +275,54 @@ class ClaudeDesktopWindowsTests(unittest.TestCase):
                 "haiku",
             )
             self.assertTrue(gateway_a["inferenceModels"][3]["isFamilyDefault"])
+            local_3p_a = (
+                claude_desktop_windows.claude_desktop_effective_user_data_dir(
+                    profile_a
+                )
+            )
+            local_3p_b = (
+                claude_desktop_windows.claude_desktop_effective_user_data_dir(
+                    profile_b
+                )
+            )
+            self.assertEqual(
+                json.loads(
+                    (local_3p_a / "claude_desktop_config.json").read_text(
+                        encoding="utf-8"
+                    )
+                )["deploymentMode"],
+                "3p",
+            )
+            local_meta_a = json.loads(
+                (local_3p_a / "configLibrary" / "_meta.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            local_meta_b = json.loads(
+                (local_3p_b / "configLibrary" / "_meta.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            local_gateway_a = json.loads(
+                (
+                    local_3p_a
+                    / "configLibrary"
+                    / f"{local_meta_a['appliedId']}.json"
+                ).read_text(encoding="utf-8")
+            )
+            local_gateway_b = json.loads(
+                (
+                    local_3p_b
+                    / "configLibrary"
+                    / f"{local_meta_b['appliedId']}.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(local_gateway_a, gateway_a)
+            self.assertEqual(local_gateway_b, gateway_b)
+            self.assertNotEqual(
+                local_gateway_a["inferenceGatewayApiKey"],
+                local_gateway_b["inferenceGatewayApiKey"],
+            )
             desktop_a = json.loads(
                 (profile_a / "claude_desktop_config.json").read_text(encoding="utf-8")
             )
@@ -213,6 +359,54 @@ class ClaudeDesktopWindowsTests(unittest.TestCase):
             )
             self.assertNotIn("token-a", json.dumps(claude_code_a))
             self.assertNotIn("token-b", json.dumps(claude_code_b))
+
+    def test_native_profile_uses_identity_model_routes_without_fable_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            profile = Path(tmp) / "native"
+            with patch.object(
+                claude_desktop_windows,
+                "ensure_private_desktop_directory",
+            ):
+                claude_desktop_windows.prepare_claude_desktop_profile(
+                    profile,
+                    node_name="native",
+                    gateway_base_url="http://127.0.0.1:41001",
+                    local_token="local-token",
+                    model="claude-sonnet-5",
+                    native_models=[
+                        "claude-sonnet-5",
+                        "claude-opus-5",
+                        "claude-sonnet-5",
+                    ],
+                    native_models_support_1m=True,
+                )
+
+            meta = json.loads(
+                (profile / "configLibrary" / "_meta.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            gateway = json.loads(
+                (
+                    profile
+                    / "configLibrary"
+                    / f"{meta['appliedId']}.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                [entry["name"] for entry in gateway["inferenceModels"]],
+                ["claude-sonnet-5", "claude-opus-5"],
+            )
+            self.assertNotIn(
+                claude_desktop_windows.CLAUDE_DESKTOP_ROUTE_MODEL,
+                [entry["name"] for entry in gateway["inferenceModels"]],
+            )
+            self.assertTrue(gateway["inferenceModels"][0]["isFamilyDefault"])
+            self.assertTrue(gateway["inferenceModels"][1]["isFamilyDefault"])
+            self.assertTrue(gateway["inferenceModels"][0]["supports1m"])
+            self.assertTrue(gateway["inferenceModels"][0]["prefer1m"])
+            self.assertTrue(gateway["inferenceModels"][1]["supports1m"])
+            self.assertNotIn("prefer1m", gateway["inferenceModels"][1])
 
     def test_profile_update_preserves_existing_preferences_and_library_entries(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -251,6 +445,31 @@ class ClaudeDesktopWindowsTests(unittest.TestCase):
             self.assertEqual(desktop["preferences"], {"theme": "dark"})
             self.assertIn("manual", {entry["id"] for entry in meta["entries"]})
             self.assertNotEqual(meta["appliedId"], "manual")
+
+    def test_profile_writes_gateway_mcp_to_canonical_claude_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            profile = root / "desktop"
+            canonical = root / "node-home"
+            with patch.object(
+                claude_desktop_windows,
+                "ensure_private_desktop_directory",
+            ):
+                claude_desktop_windows.prepare_claude_desktop_profile(
+                    profile,
+                    node_name="node",
+                    gateway_base_url="http://127.0.0.1:42001",
+                    local_token="local-token",
+                    model="claude-opus-5",
+                    native_models=["claude-opus-5"],
+                    claude_config_dir=canonical,
+                )
+
+            payload = json.loads(
+                (canonical / ".claude.json").read_text(encoding="utf-8")
+            )
+            self.assertIn("apiclaude-web", payload["mcpServers"])
+            self.assertFalse((profile / "claude-code-config").exists())
 
     def test_profile_rejects_non_loopback_gateway(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -296,16 +515,31 @@ class ClaudeDesktopWindowsTests(unittest.TestCase):
                     web_search_base_url="http://127.0.0.1:43101",
                     web_search_token="active-local-token",
                     web_search_model="claude-fable-5",
+                    claude_config_dir=root / "canonical-claude",
                 )
 
             self.assertIs(returned, fake_process)
             command = popen.call_args.args[0]
             environment = popen.call_args.kwargs["env"]
-            self.assertEqual(command, [str(executable.resolve())])
+            self.assertEqual(
+                command,
+                [
+                    str(executable.resolve()),
+                    f"--user-data-dir={profile.resolve()}",
+                ],
+            )
             self.assertEqual(environment["CLAUDE_USER_DATA_DIR"], str(profile.resolve()))
             self.assertEqual(
+                environment["LOCALAPPDATA"],
+                str(
+                    claude_desktop_windows.claude_desktop_effective_user_data_dir(
+                        profile
+                    ).parent
+                ),
+            )
+            self.assertEqual(
                 environment["CLAUDE_CONFIG_DIR"],
-                str((profile / "claude-code-config").resolve()),
+                str((root / "canonical-claude").resolve()),
             )
             self.assertNotIn("ANTHROPIC_API_KEY", environment)
             self.assertNotIn("OPENAI_API_KEY", environment)
@@ -422,6 +656,7 @@ class ClaudeDesktopWindowsTests(unittest.TestCase):
                 "port": 43001,
                 "desktopPid": 6789,
                 "userDataDir": str(profile),
+                "effectiveUserDataDir": str(profile / "effective"),
             }
             with (
                 patch.dict(
@@ -445,7 +680,7 @@ class ClaudeDesktopWindowsTests(unittest.TestCase):
                     "wait_for_worker_start",
                     return_value=(state, None),
                 ),
-                patch("builtins.print"),
+                patch("builtins.print") as print_output,
             ):
                 code = apiagent._spawn_claude_desktop_worker(
                     profile,
@@ -465,6 +700,12 @@ class ClaudeDesktopWindowsTests(unittest.TestCase):
             self.assertNotIn("ANTHROPIC_AUTH_TOKEN", environment)
             self.assertNotIn("OPENAI_API_KEY", environment)
             self.assertNotIn("APICODEX_API_KEY", environment)
+            self.assertTrue(
+                any(
+                    call.args == (f"User data: {profile / 'effective'}",)
+                    for call in print_output.call_args_list
+                )
+            )
 
 
 if __name__ == "__main__":

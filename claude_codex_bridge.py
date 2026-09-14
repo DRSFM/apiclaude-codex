@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Iterator, Sequence
 from urllib import error as urllib_error
 from urllib import request as urllib_request
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit, urlunsplit
 
 
 MIN_LITELLM_VERSION = (1, 93, 0)
@@ -47,7 +47,22 @@ _HOP_BY_HOP_HEADERS = {
     "trailer",
     "transfer-encoding",
     "upgrade",
+    "x-api-key",
 }
+_ANTHROPIC_PROXY_PATHS = {
+    "/v1/messages",
+    "/v1/messages/count_tokens",
+    "/v1/models",
+}
+_ANTHROPIC_MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,191}$")
+_ANTHROPIC_MODEL_PATH_RE = re.compile(
+    r"^/v1/models/[A-Za-z0-9][A-Za-z0-9._:@-]{0,191}$"
+)
+_ANTHROPIC_1M_MODEL_SUFFIX = "[1m]"
+_ANTHROPIC_1M_BETA = "context-1m-2025-08-07"
+_MAX_REQUEST_BODY_BYTES = 64 * 1024 * 1024
+_MAX_MODEL_RESPONSE_BYTES = 4 * 1024 * 1024
+_MAX_ERROR_RESPONSE_BYTES = 4 * 1024 * 1024
 
 
 class BridgeStartupError(RuntimeError):
@@ -61,6 +76,427 @@ class BridgeEndpoint:
     hosted_search_url: str | None = None
     hosted_search_token: str | None = None
     hosted_search_model: str | None = None
+
+
+def _anthropic_upstream_url(
+    base_url: str,
+    request_path: str,
+    query: str = "",
+) -> str:
+    parsed = urlsplit(base_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise BridgeStartupError("Anthropic upstream must be an HTTP(S) URL")
+    base_path = parsed.path.rstrip("/")
+    suffix = request_path
+    if base_path.endswith("/v1") and suffix.startswith("/v1/"):
+        suffix = suffix[3:]
+    target_path = f"{base_path}{suffix}"
+    return urlunsplit(
+        (parsed.scheme, parsed.netloc, target_path, query, "")
+    )
+
+
+def _proxy_opener(proxy_url: str | None) -> urllib_request.OpenerDirector:
+    configured = (proxy_url or "").strip()
+    proxies = (
+        {"http": configured, "https": configured}
+        if configured and configured.lower() != "direct"
+        else {}
+    )
+    return urllib_request.build_opener(urllib_request.ProxyHandler(proxies))
+
+
+def _anthropic_proxy_path_allowed(method: str, path: str) -> bool:
+    return path in _ANTHROPIC_PROXY_PATHS or (
+        method == "GET" and _ANTHROPIC_MODEL_PATH_RE.fullmatch(path) is not None
+    )
+
+
+def _merge_header_value(
+    headers: dict[str, str],
+    name: str,
+    value: str,
+) -> None:
+    existing_name = next(
+        (header for header in headers if header.lower() == name.lower()),
+        None,
+    )
+    if existing_name is None:
+        headers[name] = value
+        return
+    existing = headers[existing_name]
+    values = [item.strip().lower() for item in existing.split(",")]
+    if value.lower() not in values:
+        headers[existing_name] = f"{existing},{value}"
+
+
+def _prepare_anthropic_1m_request(
+    body: bytes | None,
+    headers: dict[str, str],
+    *,
+    path: str,
+    enabled: bool,
+) -> bytes | None:
+    if not enabled or path not in {
+        "/v1/messages",
+        "/v1/messages/count_tokens",
+    }:
+        return body
+    _merge_header_value(headers, "anthropic-beta", _ANTHROPIC_1M_BETA)
+    if body is None:
+        return None
+    try:
+        payload = json.loads(body)
+    except (UnicodeDecodeError, ValueError):
+        return body
+    if not isinstance(payload, dict):
+        return body
+    model = payload.get("model")
+    if not isinstance(model, str) or not model.lower().endswith(
+        _ANTHROPIC_1M_MODEL_SUFFIX
+    ):
+        return body
+    normalized_model = model[: -len(_ANTHROPIC_1M_MODEL_SUFFIX)]
+    if not normalized_model:
+        return body
+    payload["model"] = normalized_model
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _iter_upstream_chunks(response: Any) -> Iterator[bytes]:
+    content_type = str(response.headers.get("Content-Type", "")).lower()
+    reader = (
+        response.readline
+        if "text/event-stream" in content_type
+        else getattr(response, "read1", response.read)
+    )
+    while True:
+        chunk = reader(64 * 1024)
+        if not chunk:
+            return
+        yield chunk
+
+
+class _AnthropicProxyServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(
+        self,
+        server_address: tuple[str, int],
+        *,
+        upstream_base_url: str,
+        upstream_api_key: str,
+        local_token: str,
+        proxy_url: str | None,
+        enable_1m: bool,
+    ) -> None:
+        super().__init__(server_address, _AnthropicProxyRequestHandler)
+        self.upstream_base_url = upstream_base_url.rstrip("/")
+        self.upstream_api_key = upstream_api_key
+        self.local_token = local_token
+        self.proxy_url = proxy_url
+        self.enable_1m = enable_1m
+
+
+class _AnthropicProxyRequestHandler(BaseHTTPRequestHandler):
+    server: _AnthropicProxyServer
+    protocol_version = "HTTP/1.1"
+
+    def handle(self) -> None:
+        try:
+            super().handle()
+        except _CLIENT_DISCONNECT_ERRORS:
+            return
+
+    def log_message(self, _format: str, *args: object) -> None:
+        return
+
+    def do_HEAD(self) -> None:
+        self.send_response(200)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def do_GET(self) -> None:
+        self._proxy_request()
+
+    def do_POST(self) -> None:
+        self._proxy_request()
+
+    def _authorized(self) -> bool:
+        bearer = self.headers.get("Authorization", "")
+        api_key = self.headers.get("x-api-key", "")
+        candidates = [
+            bearer[7:] if bearer.startswith("Bearer ") else "",
+            api_key,
+        ]
+        return any(
+            candidate
+            and secrets.compare_digest(candidate, self.server.local_token)
+            for candidate in candidates
+        )
+
+    def _send_json(self, status: int, message: str) -> None:
+        raw = json.dumps(
+            {
+                "type": "error",
+                "error": {"type": "api_error", "message": message},
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(raw)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(raw)
+        self.close_connection = True
+
+    def _relay_upstream_error(self, response: urllib_error.HTTPError) -> None:
+        try:
+            raw = response.read(_MAX_ERROR_RESPONSE_BYTES + 1)
+            response_headers = list(response.headers.items())
+        except OSError:
+            raw = b""
+            response_headers = []
+        finally:
+            response.close()
+        if len(raw) > _MAX_ERROR_RESPONSE_BYTES:
+            self._send_json(
+                int(response.code),
+                "Anthropic upstream returned an oversized error response.",
+            )
+            return
+        secret = self.server.upstream_api_key
+        if secret:
+            raw = raw.replace(secret.encode("utf-8"), b"<redacted>")
+        self.send_response(int(response.code))
+        for name, value in response_headers:
+            if name.lower() not in _HOP_BY_HOP_HEADERS:
+                safe_value = value.replace(secret, "<redacted>") if secret else value
+                self.send_header(name, safe_value)
+        self.send_header("Content-Length", str(len(raw)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(raw)
+        self.close_connection = True
+
+    def _proxy_request(self) -> None:
+        request_path = urlsplit(self.path)
+        if not _anthropic_proxy_path_allowed(self.command, request_path.path):
+            self._send_json(404, "Unsupported Anthropic gateway path.")
+            return
+        if not self._authorized():
+            self._send_json(401, "Invalid local gateway token.")
+            return
+
+        body: bytes | None = None
+        if self.command == "POST":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if length <= 0 or length > _MAX_REQUEST_BODY_BYTES:
+                    raise ValueError("invalid request body length")
+                body = self.rfile.read(length)
+            except ValueError as exc:
+                self._send_json(400, str(exc))
+                return
+
+        try:
+            target_url = _anthropic_upstream_url(
+                self.server.upstream_base_url,
+                request_path.path,
+                request_path.query,
+            )
+        except BridgeStartupError as exc:
+            self._send_json(502, str(exc))
+            return
+        headers = {
+            name: value
+            for name, value in self.headers.items()
+            if name.lower() not in _HOP_BY_HOP_HEADERS
+        }
+        headers["Accept-Encoding"] = "identity"
+        headers["Authorization"] = f"Bearer {self.server.upstream_api_key}"
+        headers["x-api-key"] = self.server.upstream_api_key
+        body = _prepare_anthropic_1m_request(
+            body,
+            headers,
+            path=request_path.path,
+            enabled=self.server.enable_1m,
+        )
+        upstream_request = urllib_request.Request(
+            target_url,
+            data=body,
+            headers=headers,
+            method=self.command,
+        )
+        try:
+            upstream_response = _proxy_opener(self.server.proxy_url).open(
+                upstream_request,
+                timeout=600,
+            )
+        except urllib_error.HTTPError as exc:
+            self._relay_upstream_error(exc)
+            return
+        except (OSError, urllib_error.URLError) as exc:
+            message = str(exc).replace(
+                self.server.upstream_api_key,
+                "<redacted>",
+            )
+            self._send_json(502, f"Anthropic upstream request failed: {message}")
+            return
+
+        try:
+            self.send_response(upstream_response.status)
+            for name, value in upstream_response.headers.items():
+                if name.lower() not in _HOP_BY_HOP_HEADERS:
+                    self.send_header(name, value)
+            self.send_header("Connection", "close")
+            self.end_headers()
+            for chunk in _iter_upstream_chunks(upstream_response):
+                self.wfile.write(chunk)
+                self.wfile.flush()
+        except _CLIENT_DISCONNECT_ERRORS:
+            return
+        finally:
+            upstream_response.close()
+            self.close_connection = True
+
+
+@contextmanager
+def anthropic_passthrough_bridge(
+    *,
+    upstream_base_url: str,
+    upstream_api_key: str,
+    proxy_url: str | None = None,
+    listen_port: int | None = None,
+    local_token: str | None = None,
+    enable_1m: bool = False,
+) -> Iterator[BridgeEndpoint]:
+    if listen_port is not None and not 1 <= listen_port <= 65535:
+        raise BridgeStartupError("Anthropic gateway port must be between 1 and 65535")
+    if not upstream_api_key:
+        raise BridgeStartupError("Anthropic upstream API key cannot be empty")
+    bridge_token = local_token or secrets.token_urlsafe(32)
+    if not bridge_token:
+        raise BridgeStartupError("Anthropic gateway token cannot be empty")
+    _anthropic_upstream_url(upstream_base_url, "/v1/models")
+    try:
+        server = _AnthropicProxyServer(
+            ("127.0.0.1", listen_port or 0),
+            upstream_base_url=upstream_base_url,
+            upstream_api_key=upstream_api_key,
+            local_token=bridge_token,
+            proxy_url=proxy_url,
+            enable_1m=enable_1m,
+        )
+    except OSError as exc:
+        raise BridgeStartupError(
+            f"Failed to bind the Anthropic passthrough gateway: {exc}"
+        ) from exc
+
+    thread = threading.Thread(
+        target=server.serve_forever,
+        name="apiclaude-anthropic-passthrough",
+        daemon=True,
+    )
+    thread.start()
+    try:
+        yield BridgeEndpoint(
+            base_url=f"http://127.0.0.1:{server.server_port}",
+            token=bridge_token,
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def discover_anthropic_models(
+    *,
+    gateway_base_url: str,
+    local_token: str,
+    max_pages: int = 10,
+    max_models: int = 1000,
+) -> list[str]:
+    if max_pages < 1 or max_models < 1:
+        raise ValueError("model discovery limits must be positive")
+    models: list[str] = []
+    seen_models: set[str] = set()
+    seen_cursors: set[str] = set()
+    cursor = ""
+
+    for _page in range(max_pages):
+        query = urlencode({"after_id": cursor}) if cursor else ""
+        target_url = _anthropic_upstream_url(
+            gateway_base_url,
+            "/v1/models",
+            query,
+        )
+        request = urllib_request.Request(
+            target_url,
+            headers={
+                "Authorization": f"Bearer {local_token}",
+                "x-api-key": local_token,
+                "Accept": "application/json",
+            },
+        )
+        try:
+            with _proxy_opener("direct").open(request, timeout=30) as response:
+                raw = response.read(_MAX_MODEL_RESPONSE_BYTES + 1)
+        except urllib_error.HTTPError as exc:
+            exc.close()
+            raise BridgeStartupError(
+                f"Claude model discovery failed with HTTP {exc.code}."
+            ) from exc
+        except (OSError, urllib_error.URLError) as exc:
+            raise BridgeStartupError(
+                f"Claude model discovery request failed: {exc}"
+            ) from exc
+        if len(raw) > _MAX_MODEL_RESPONSE_BYTES:
+            raise BridgeStartupError("Claude model discovery response exceeded 4 MiB")
+        try:
+            payload = json.loads(raw)
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise BridgeStartupError(
+                "Claude model discovery returned invalid JSON"
+            ) from exc
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(data, list):
+            raise BridgeStartupError(
+                "Claude model discovery response must contain a data list"
+            )
+        for item in data:
+            model = str(item.get("id") or "").strip() if isinstance(item, dict) else ""
+            if (
+                model.startswith("claude-")
+                and _ANTHROPIC_MODEL_RE.fullmatch(model)
+                and model not in seen_models
+            ):
+                models.append(model)
+                seen_models.add(model)
+                if len(models) >= max_models:
+                    return models
+        if payload.get("has_more") is not True:
+            break
+        cursor = str(payload.get("last_id") or "").strip()
+        if not cursor or cursor in seen_cursors:
+            raise BridgeStartupError(
+                "Claude model discovery returned an invalid pagination cursor"
+            )
+        seen_cursors.add(cursor)
+    else:
+        raise BridgeStartupError("Claude model discovery exceeded the page limit")
+
+    if not models:
+        raise BridgeStartupError(
+            "Claude model discovery found no claude-* models; configure an "
+            "explicit list with 'apiclaude desktop-models NODE MODEL...'."
+        )
+    return models
 
 
 class _AuthShimServer(ThreadingHTTPServer):
@@ -201,10 +637,7 @@ class _AuthShimRequestHandler(BaseHTTPRequestHandler):
                     )
                 self.wfile.flush()
             else:
-                while True:
-                    chunk = upstream_response.read(64 * 1024)
-                    if not chunk:
-                        break
+                for chunk in _iter_upstream_chunks(upstream_response):
                     self.wfile.write(chunk)
                     self.wfile.flush()
         except _CLIENT_DISCONNECT_ERRORS:

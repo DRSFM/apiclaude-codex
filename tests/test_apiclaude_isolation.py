@@ -23,6 +23,38 @@ def _relay_config(**node_extra: object) -> dict:
 
 
 class ApiClaudeIsolationTests(KeychainIsolationMixin):
+    def test_desktop_config_home_matches_cli_node_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with (
+                patch.object(apiagent, "HOME", root),
+                patch.object(apiagent, "CLAUDE_NODES_ROOT", root / ".apiclaude"),
+            ):
+                self.assertEqual(
+                    apiagent.claude_desktop_config_home("shared", {}),
+                    (root / ".claude").resolve(),
+                )
+                self.assertEqual(
+                    apiagent.claude_desktop_config_home(
+                        "relay",
+                        {"isolation": "isolated", "home": "nodes/relay"},
+                    ),
+                    (root / ".apiclaude" / "nodes" / "relay").resolve(),
+                )
+                self.assertEqual(
+                    apiagent.claude_desktop_config_home(
+                        "bridge",
+                        {"type": "codex_bridge"},
+                    ),
+                    (root / ".apiclaude" / "nodes" / "bridge").resolve(),
+                )
+                self.assertIsNone(
+                    apiagent.claude_desktop_config_home(
+                        "unsafe",
+                        {"isolation": "isolated", "home": "../.claude"},
+                    )
+                )
+
     def test_shared_legacy_node_keeps_default_config_dir(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = SecureStore(Path(tmp))
@@ -86,6 +118,7 @@ class ApiClaudeIsolationTests(KeychainIsolationMixin):
                 isolation="isolated",
                 home="nodes/relay",
                 lastUsedAt="2026-07-26T12:00:00+08:00",
+                desktop_models_support_1m=True,
                 token="must-not-leak",
             )
             output = io.StringIO()
@@ -114,6 +147,7 @@ class ApiClaudeIsolationTests(KeychainIsolationMixin):
                 metadata["lastUsedAt"],
                 "2026-07-26T12:00:00+08:00",
             )
+            self.assertTrue(metadata["desktopModelsSupport1m"])
             self.assertNotIn("credential_id", metadata)
             self.assertNotIn("token", metadata)
             self.assertNotIn("must-not-leak", output.getvalue())

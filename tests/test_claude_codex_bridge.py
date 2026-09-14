@@ -192,7 +192,7 @@ class ClaudeCodexBridgeTests(KeychainIsolationMixin):
         upstream_response = Mock()
         upstream_response.status = 200
         upstream_response.headers = {}
-        upstream_response.read.side_effect = [b"data: test\n\n", b""]
+        upstream_response.read1.side_effect = [b"data: test\n\n", b""]
         opener = Mock()
         opener.open.return_value = upstream_response
 
@@ -637,6 +637,8 @@ class ClaudeCodexBridgeTests(KeychainIsolationMixin):
                             "claude-sonnet-4-6",
                             "claude-haiku-4-5",
                         ],
+                        "isolation": "isolated",
+                        "home": "nodes/gpt-shell",
                     }
                 },
                 "current": "gpt-shell",
@@ -665,6 +667,7 @@ class ClaudeCodexBridgeTests(KeychainIsolationMixin):
             with (
                 patch.object(apiagent, "SECRET_STORE", store),
                 patch.object(apiagent, "CODEX_HOME", root / ".codex-api"),
+                patch.object(apiagent, "CLAUDE_NODES_ROOT", root / ".apiclaude"),
                 patch.object(
                     apiagent,
                     "CLAUDE_DESKTOP_DATA_ROOT",
@@ -734,12 +737,19 @@ class ClaudeCodexBridgeTests(KeychainIsolationMixin):
                     "web_search_base_url": "http://127.0.0.1:45679/responses",
                     "web_search_token": "ephemeral-search-token",
                     "web_search_model": "gpt-test",
+                    "claude_config_dir": (
+                        root / ".apiclaude" / "nodes" / "gpt-shell"
+                    ).resolve(),
                 },
             )
             wait_for_start.assert_called_once_with(fake_process)
             monitor.assert_called_once_with(fake_process, root / ".apiclaude-desktop" / "nodes" / "gpt-shell")
             self.assertEqual(state_writes[0]["desktopPid"], 4242)
             self.assertEqual(state_writes[0]["port"], 45678)
+            self.assertEqual(
+                state_writes[0]["claudeConfigDir"],
+                str((root / ".apiclaude" / "nodes" / "gpt-shell").resolve()),
+            )
             self.assertEqual(
                 state_writes[0]["models"],
                 [

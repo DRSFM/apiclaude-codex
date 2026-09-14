@@ -412,6 +412,142 @@ class ShareCliTests(unittest.TestCase):
             )
             self.assertTrue(profile_home.is_dir())
 
+    def test_clone_uses_direct_read_when_import_is_absent_from_thread_list(self) -> None:
+        class UnlistedImportAppServer(FakeAppServer):
+            def list_threads(self, *, limit: int = 100):
+                del limit
+                raise AssertionError("clone verification must use thread/read")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            context, _, _, thread_id = self.make_context(root)
+            context.app_server_factory = UnlistedImportAppServer
+            pool_root = root / "pool"
+            run_cli(["init", "--pool", str(pool_root), "--json"], context)
+            code, _, stderr = run_cli(
+                [
+                    "publish",
+                    "deep-history",
+                    "--pool",
+                    str(pool_root),
+                    "--api-profile",
+                    "relay",
+                    "--thread",
+                    thread_id,
+                    "--json",
+                ],
+                context,
+            )
+            self.assertEqual(code, 0, stderr)
+
+            capability = AppServerCapability(True, "codex-cli test", "supported")
+            with patch.object(
+                codex_share_cli,
+                "detect_fork_path_capability",
+                return_value=capability,
+            ):
+                code, cloned, stderr = run_cli(
+                    [
+                        "clone",
+                        "deep-history",
+                        "--pool",
+                        str(pool_root),
+                        "--api-profile",
+                        "relay",
+                        "--cwd",
+                        str(root),
+                        "--title",
+                        "Deep history clone",
+                        "--json",
+                    ],
+                    context,
+                )
+
+            self.assertEqual(code, 0, stderr)
+            self.assertEqual(cloned["clone"]["title"], "Deep history clone")
+
+    def test_paginated_rollout_segments_are_flattened_in_ordinal_order(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sessions = root / "sessions"
+            thread_id = "01900000-0000-7000-8000-000000000777"
+            base_segment_id = "01900000-0000-7000-8000-000000000778"
+            base = sessions / f"rollout-{thread_id}-{base_segment_id}.jsonl"
+            base_rows = [
+                {
+                    "timestamp": "2026-01-01T00:00:00Z",
+                    "ordinal": 0,
+                    "type": "session_meta",
+                    "payload": {"id": thread_id, "session_id": thread_id},
+                },
+                response(
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "first"}],
+                    }
+                ),
+                response(
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "answer"}],
+                    }
+                ),
+            ]
+            for ordinal, row in enumerate(base_rows):
+                row["ordinal"] = ordinal
+            write_rollout(base, base_rows)
+            current = sessions / f"rollout-{thread_id}-current.jsonl"
+            current_rows = [
+                {
+                    "timestamp": "2026-01-01T00:00:03Z",
+                    "ordinal": 3,
+                    "type": "session_meta",
+                    "payload": {
+                        "id": thread_id,
+                        "session_id": thread_id,
+                        "history_mode": "paginated",
+                        "history_base": {
+                            "thread_id": base_segment_id,
+                            "end_ordinal_exclusive": 3,
+                            "end_byte_offset": base.stat().st_size,
+                        },
+                    },
+                },
+                {
+                    **response(
+                        {
+                            "type": "message",
+                            "role": "user",
+                            "content": [
+                                {"type": "input_text", "text": "continued"}
+                            ],
+                        }
+                    ),
+                    "ordinal": 4,
+                },
+            ]
+            write_rollout(current, current_rows)
+            flattened = root / "flattened.jsonl"
+
+            result = codex_share_cli._materialize_paginated_rollout(
+                current,
+                roots=(sessions,),
+                destination=flattened,
+            )
+
+            self.assertEqual(result, flattened.resolve())
+            rows = [
+                json.loads(line)
+                for line in flattened.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual([row["ordinal"] for row in rows], [0, 1, 2, 4])
+            self.assertEqual(
+                [row["type"] for row in rows],
+                ["session_meta", "response_item", "response_item", "response_item"],
+            )
+
     def test_service_lists_all_targets_and_copies_between_distinct_targets(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
