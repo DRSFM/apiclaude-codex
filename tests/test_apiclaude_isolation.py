@@ -23,6 +23,64 @@ def _relay_config(**node_extra: object) -> dict:
 
 
 class ApiClaudeIsolationTests(KeychainIsolationMixin):
+    def test_home_launch_keeps_account_settings_out_of_isolated_cli(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            node_home = root / ".apiclaude" / "nodes" / "relay"
+            args = ["--resume", "session-id"]
+            with (
+                patch.object(apiagent, "HOME", root),
+                patch.object(apiagent.Path, "cwd", return_value=root),
+                patch.object(apiagent.shutil, "which", return_value="claude.exe"),
+                patch.object(apiagent.subprocess, "run") as run,
+            ):
+                run.return_value.returncode = 0
+                self.assertEqual(apiagent.run_command(
+                    "claude", args, env={"CLAUDE_CONFIG_DIR": str(node_home)},
+                ), 0)
+            command = run.call_args.args[0]
+            self.assertEqual(command[1:3], ["--setting-sources", "user"])
+            self.assertEqual(command[3:], args)
+            self.assertEqual(args, ["--resume", "session-id"])
+            self.assertEqual(run.call_args.kwargs["env"]["CLAUDE_CONFIG_DIR"], str(node_home))
+
+    def test_home_settings_guard_preserves_project_and_explicit_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            node_home = root / ".apiclaude" / "nodes" / "relay"
+            for command, cwd, config_home, args, guarded in (
+                ("claude", root / "project", node_home, [], False),
+                ("claude", root, root / ".claude", [], False),
+                ("code", root, node_home, [], False),
+                ("claude", root, node_home, ["--setting-sources", "user,project,local"], False),
+                ("claude", root, node_home, ["--setting-sources=user,project"], False),
+                ("claude", root, node_home, ["--", "--setting-sources"], True),
+            ):
+                with self.subTest(command=command, cwd=cwd, args=args):
+                    with (
+                        patch.object(apiagent, "HOME", root),
+                        patch.object(apiagent.Path, "cwd", return_value=cwd),
+                        patch.object(apiagent.shutil, "which", return_value=f"{command}.exe"),
+                        patch.object(apiagent.subprocess, "run") as run,
+                    ):
+                        run.return_value.returncode = 0
+                        apiagent.run_command(command, args, env={"CLAUDE_CONFIG_DIR": str(config_home)})
+                    expected = ["--setting-sources", "user", *args] if guarded else args
+                    self.assertEqual(run.call_args.args[0][1:], expected)
+
+    def test_account_cli_without_config_override_keeps_default_setting_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with (
+                patch.object(apiagent, "HOME", root),
+                patch.object(apiagent.Path, "cwd", return_value=root),
+                patch.object(apiagent.shutil, "which", return_value="claude.exe"),
+                patch.object(apiagent.subprocess, "run") as run,
+            ):
+                run.return_value.returncode = 0
+                apiagent.run_command("claude", ["--version"], env_remove=["CLAUDE_CONFIG_DIR"])
+            self.assertEqual(run.call_args.args[0], ["claude.exe", "--version"])
+
     def test_desktop_config_home_matches_cli_node_mode(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -256,6 +256,23 @@ def run_command(
     if env:
         proc_env.update(env)
 
+    # At the OS home, Claude also treats ~/.claude/settings.json as project
+    # settings, overriding an isolated CLAUDE_CONFIG_DIR's saved /model choice.
+    # Keep normal project settings everywhere else and honor explicit sources.
+    config_dir = proc_env.get("CLAUDE_CONFIG_DIR")
+    if (
+        command == "claude"
+        and config_dir
+        and Path.cwd().resolve() == HOME.resolve()
+        and Path(config_dir).expanduser().resolve() != (HOME / ".claude").resolve()
+    ):
+        option_end = args.index("--") if "--" in args else len(args)
+        if not any(
+            value == "--setting-sources" or value.startswith("--setting-sources=")
+            for value in args[:option_end]
+        ):
+            args = ["--setting-sources", "user", *args]
+
     if os.name == "nt":
         if Path(exe).suffix.lower() in {".bat", ".cmd"}:
             comspec = os.environ.get("ComSpec", "cmd.exe")

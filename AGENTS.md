@@ -5,6 +5,33 @@
 
 ## 协作修改记录
 
+### 2026-09-16：阻断用户主目录项目设置覆盖隔离模型
+
+- 修改简介：隔离 Claude CLI 在 OS 用户主目录启动时默认加 `--setting-sources user`；
+  正常项目目录、账号 CLI 和用户显式指定的来源保持原有行为，原生与桥接 CLI 共用
+  启动边界保护。已备份并部署 `C:\tools\apiagent.py`，补充测试及 README。
+- 修改原因：上一轮仅在仓库目录验收；在 `C:\Users\SFM` 启动时，账号的
+  `.claude/settings.json` 又被当作项目设置读取，覆盖独立节点的 `/model` 默认值。
+- 验证情况：旧代码实机显示 Opus 来自项目设置，新用例先失败再通过；完整 pytest
+  281 passed、13 skipped、194 subtests，编译/diff 检查通过。部署后在用户主目录
+  验证 `/model fable` 无重启覆盖提示，退出再启动仍为 Fable 5.1 / API Usage Billing；
+  账号设置哈希、56 个迁移历史/附件文件哈希及安装模块一致性校验通过。
+
+### 2026-09-16：修复本机 AnyRouter 账号配置混用并完整迁移历史
+
+- 修改简介：将 anyrouter 显式设为 isolated，使用 `~/.apiclaude/nodes/anyrouter`，
+  独立保存 Fable 5.1 `[1m]`；复制共享历史、旧 Desktop 独有会话、工具输出、文件
+  修改历史及必要偏好/Skill，保留现有 MCP 共享。补充 README 的旧节点共用说明。
+- 修改原因：旧节点缺少 isolation 且沿用保存的模型选择，导致账号 `/model` 改动
+  影响 AnyRouter。旧历史没有可靠节点标记，采用全量共享历史副本避免漏迁，可能
+  包含其他共享节点或账号会话；未改变其他节点的隔离模式。
+- 安全说明：配置修改前备份，私有暂存目录逐文件 SHA-256 校验后切换；所有历史
+  原件保留，不复制账号 OAuth 或凭据文件。具体清单和备份路径见工作记录。
+- 验证情况：34 份会话文件及附件/Skill 等共 148 文件、52,535,444 字节校验通过；
+  Claude Code 2.1.272 原生 `/resume` 读到旧历史，实际启动显示 Fable 5.1 / API
+  Usage Billing，无连接器冲突提示；账号模型仍为 opus，CLI/Desktop 解析到同一
+  独立目录。此轮仅验证仓库目录；用户主目录下仍有项目设置覆盖，见上方后续修复。
+
 ### 2026-09-15：收拢本机更新与 Claude 模型选择补丁
 
 - 修改简介：纳入安装版的 `cli_force_default_model` 开关；设为 `false` 时保留

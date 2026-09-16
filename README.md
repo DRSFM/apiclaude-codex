@@ -539,6 +539,22 @@ project history, and settings do not mix between nodes or with the normal
 account state in `~/.claude`. Nodes saved by older versions keep the legacy
 shared behavior until switched.
 
+Legacy shared mode also shares the account's saved `/model` choice and login
+metadata. API authentication still takes precedence, but a node with
+`cli_force_default_model: false` will follow model changes made in the account
+CLI. Check `apiclaude mode NAME` before assuming an older node is isolated.
+To separate an existing node while retaining history, copy and verify its
+transcripts and related files before switching; do not copy account credentials
+or the entire account configuration. Shared transcripts may lack provider tags,
+so an exact historical split by API node is not always possible.
+
+When an isolated Claude CLI is launched from the OS user home itself (for
+example `C:\Users\SFM`), ApiClaude defaults to `--setting-sources user`. Otherwise
+Claude also reads the account's `.claude/settings.json` as project settings,
+which can override the isolated node's saved model. Other working directories
+keep normal project/local settings. An explicit `--setting-sources` takes
+precedence if you intentionally use the user home as a project.
+
 Show or switch a node's mode at any time:
 
 ```bash
