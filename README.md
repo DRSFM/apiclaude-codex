@@ -274,9 +274,18 @@ a full restart, both original process trees exited completely and new processes
 opened signed-in home screens with Astra/Sol and the corresponding identities.
 Other Desktop instances remained running; authentication/history hashes stayed
 unchanged. Skills/rules/prompts and both plugin caches now share the default source.
-Both windows still show a first-use Windows setup prompt; completing that setup
-and authorizing individual connectors have not been tested. The official app-list
-readback returned no connectors for either account. No login page was
+Both accounts have now completed official elevated Windows sandbox setup. The
+Desktop-bundled engine reports `ready` and successfully executes a sandboxed
+PowerShell command for each account; after restarting both windows, the Windows
+setup prompt is gone. Setup used a process-only workspace-write override, leaving
+saved permission preferences unchanged. One administrator-owned `.sandbox-bin`
+directory blocked subsequent ACL refresh; its original contents were preserved,
+the generated directory was recreated by the current user, and the official
+helper reapplied its permissions. This was a local installation repair, not an
+automatic launcher repair for future accounts. Per-account connector authorization
+has not been tested. The migration helper disables apps, so its empty app list is
+not valid connector evidence; a subsequent check without that override could not
+retrieve the app inventory. No login page was
 opened by the launcher, and default-account credentials were not read or written.
 No installed launcher is
 automatically updated: to review this checkout on Windows, replace `apicodex`
