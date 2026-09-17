@@ -194,6 +194,8 @@ enumerate file conflicts or detect live file locks.
 If an open Desktop locks `plugins/cache`, the existing cache stays in place and
 the command reports deferred sharing; close that account's Desktop and relaunch
 or run `account sync NAME` to retry. Other resource sharing still completes.
+Windows resource copying uses extended paths so moving a deeply nested plugin
+into the backup directory does not omit files or fail at the legacy path limit.
 A failed resource step retains originals/backups; previously completed steps
 are not rolled back as a global transaction. To recover a local variant, close
 the account's sessions and copy the desired backed-up files into the shared
@@ -267,10 +269,14 @@ A real A-to-B history copy resumed successfully with Sol and retained the source
 file's hash. Official Desktop 26.908.9136.0 opened both isolated windows at once:
 one reached the main interface with Sol, while the other reached the official
 first-use occupation/preferences screen after an initially blank window was
-closed and reopened. The user subsequently confirmed entering Desktop;
-full Desktop process-restart and per-account connector authorization acceptance
-remain pending. Plugin-cache sharing may be deferred while Desktop holds files
-open; a deferred result does not mean sharing has completed. No login page was
+closed and reopened. After the user confirmed entering Desktop and authorized
+a full restart, both original process trees exited completely and new processes
+opened signed-in home screens with Astra/Sol and the corresponding identities.
+Other Desktop instances remained running; authentication/history hashes stayed
+unchanged. Skills/rules/prompts and both plugin caches now share the default source.
+Both windows still show a first-use Windows setup prompt; completing that setup
+and authorizing individual connectors have not been tested. The official app-list
+readback returned no connectors for either account. No login page was
 opened by the launcher, and default-account credentials were not read or written.
 No installed launcher is
 automatically updated: to review this checkout on Windows, replace `apicodex`

@@ -243,6 +243,16 @@ def link_directory(target: Path, source: Path) -> None:
 
 def _copy_missing(source: Path, target: Path, conflicts: list[str], *, relative: str = "") -> None:
     """Preserve local-only user resources; default files win conflicts, originals stay backed up."""
+    if os.name == "nt":
+        # Adding the backup prefix can push otherwise valid plugin paths past
+        # MAX_PATH. Use extended absolute paths for traversal and file I/O;
+        # is_file/is_dir can otherwise silently treat deep entries as missing.
+        def extended(path: Path) -> Path:
+            value = str(path.absolute())
+            if value.startswith('\\\\?\\'):
+                return path
+            return Path('\\\\?\\UNC\\' + value[2:] if value.startswith('\\\\') else '\\\\?\\' + value)
+        source, target = extended(source), extended(target)
     for child in source.iterdir():
         if not relative and child.name == ".system":
             continue  # generated official skills follow the default runtime

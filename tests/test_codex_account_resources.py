@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
 from pathlib import Path
 import tempfile
@@ -221,6 +222,27 @@ description = """multi
                 resources.sync(self.home, self.source, apiagent)
         self.assertEqual((self.home / 'skills' / 'sentinel').read_text(), 'preserve')
         self.assertEqual((self.home / 'config.toml').read_text(), self.original)
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows backup path length regression')
+    def test_plugin_cache_backup_preserves_deep_package_paths(self):
+        self.assertEqual(self.root.parent.resolve(), Path(tempfile.gettempdir()).resolve())
+        self.addCleanup(shutil.rmtree, '\\\\?\\' + str(self.root))
+        cache = self.home / 'plugins' / 'cache'
+        folder = cache
+        while len(str(folder)) + 41 < 230:
+            folder = folder / ('a' * 40)
+        folder = folder / ('b' * (235 - len(str(folder)) - 1))
+        folder.mkdir(parents=True)
+        sentinel = folder / 'sentinel.txt'
+        sentinel.write_text('deep plugin content')
+        relative = sentinel.relative_to(cache)
+        report = resources.sync(self.home, self.source, apiagent)
+        self.assertEqual(report['deferredDirectories'], [])
+        self.assertTrue(cache.samefile(self.source / 'plugins/cache'))
+        saved = Path(report['backup']) / 'plugins/cache' / relative
+        self.assertGreater(len(str(saved)), 260)
+        self.assertEqual(Path('\\\\?\\' + str(saved)).read_text(), 'deep plugin content')
+        self.assertEqual((cache / relative).read_text(), 'deep plugin content')
 
     def test_live_plugin_cache_defers_only_its_link_and_keeps_other_sharing(self):
         cache = self.home / 'plugins' / 'cache'
