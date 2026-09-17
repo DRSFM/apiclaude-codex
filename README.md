@@ -90,6 +90,17 @@ overrides apply to this invocation without changing the saved account default.
 This launches one task and returns its output; it does not add an automatic
 cross-account scheduler or authorize third-party connectors.
 
+Background `exec` sessions are excluded from Desktop's default history list.
+For a delegated task that must also appear in Desktop, use the official
+app-server to create a persistent thread with its initial `cwd` equal to the
+Desktop project root and `projectId` set to that project's ID, then assign a title.
+Keep each task's inputs and outputs in a separate subdirectory. Assigning a
+project or changing the resume directory afterward is not sufficient evidence
+of Desktop grouping. Verify the directory-filtered thread list and the refreshed
+Desktop view. Local task records live under `子代理任务/`, which is ignored by
+Git; the official account
+home continues to manage the original session storage.
+
 `add NAME` creates metadata/configuration only; `add` without a name opens the
 guided login/import flow. Normal CLI/Desktop launches reuse
 the selected profile's stored authentication and let official Codex refresh it;
