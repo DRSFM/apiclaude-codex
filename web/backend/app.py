@@ -241,6 +241,9 @@ async def delete_codex_profile(name: str):
     if not match:
         raise HTTPException(status_code=404, detail=f"Profile '{name}' not found")
 
+    if match.get("type", "api_key") != "api_key":
+        raise HTTPException(status_code=400, detail="Use 'apicodex account archive NAME' for ChatGPT profiles.")
+
     profiles.remove(match)
     apiagent.save_codex_profiles(profiles)
     if match.get("credentialId"):

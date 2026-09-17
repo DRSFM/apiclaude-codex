@@ -112,6 +112,42 @@ def run_cli(arguments: list[str], context: ShareContext):
 
 
 class ShareCliTests(unittest.TestCase):
+    def test_named_chatgpt_round_trip_copy_uses_target_identity_and_preserves_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            context, _, source, thread_id = self.make_context(root)
+            original = source.read_bytes()
+            profiles = context.load_api_profiles()
+            home = context.api_root / 'accounts' / 'b'
+            home.mkdir(parents=True)
+            (home / 'config.toml').write_text('model_provider = "openai"\nmodel = "gpt-6-astra"\n')
+            profiles.append({'id': 'b', 'name': 'B', 'home': 'accounts/b', 'type': 'chatgpt', 'model': 'gpt-6-astra'})
+            context.load_api_profiles = lambda: profiles
+            reader = codex_share_cli._parse_config_value
+            def guard_default_home(path, *args):
+                self.assertNotEqual(path, context.account_home)
+                return reader(path, *args)
+            with patch.object(codex_share_cli, '_parse_config_value', side_effect=guard_default_home):
+                code, targets, _ = run_cli(['targets', '--json'], context)
+            self.assertEqual(code, 0)
+            target = next(t for t in targets['targets'] if t['id'] == 'chatgpt:b')
+            self.assertEqual(target['kind'], 'chatgpt')
+            self.assertEqual(target['modelProvider'], 'openai')
+            self.assertEqual(run_cli(['init', '--pool', str(root / 'pool'), '--json'], context)[0], 0)
+            with patch.object(codex_share_cli, 'detect_fork_path_capability', return_value=AppServerCapability(True, 'test', 'supported')):
+                code, copied, error = run_cli(['copy', '--from', 'api:relay', '--to', 'chatgpt:b', '--thread', thread_id, '--cwd', str(root), '--json'], context)
+                self.assertEqual(code, 0, (error, copied))
+                copied_id = copied['target']['threadId']
+                self.assertNotEqual(copied_id, thread_id)
+                self.assertEqual(copied['target']['modelProvider'], 'openai')
+                code, listed, error = run_cli(['threads', '--target', 'chatgpt:b', '--json'], context)
+                self.assertEqual(code, 0, error)
+                self.assertEqual(listed['threads'][0]['id'], copied_id)
+                code, returned, error = run_cli(['copy', '--from', 'chatgpt:b', '--to', 'api:relay', '--thread', copied_id, '--cwd', str(root), '--json'], context)
+                self.assertEqual(code, 0, (error, returned))
+                self.assertEqual(returned['target']['modelProvider'], 'apicodex')
+            self.assertEqual(source.read_bytes(), original)
+
     def setUp(self) -> None:
         FakeAppServer.threads_by_home = {}
         FakeAppServer.next_id = 1

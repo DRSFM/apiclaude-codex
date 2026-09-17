@@ -10,7 +10,7 @@ import re
 import sys
 import tempfile
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Sequence
@@ -135,12 +135,8 @@ def _targets(context: ShareContext, *, include_profiles: bool) -> list[ShareTarg
             id="account",
             label="Account Codex",
             home=account_home,
-            model_provider=_parse_config_value(
-                account_home,
-                "model_provider",
-                "openai",
-            ),
-            model=_parse_config_value(account_home, "model", "") or None,
+            model_provider="openai",
+            model=None,
             kind="account",
         )
     ]
@@ -151,23 +147,35 @@ def _targets(context: ShareContext, *, include_profiles: bool) -> list[ShareTarg
         if not profile_id:
             continue
         profile_home = _safe_api_home(context.api_root.resolve(), profile)
+        kind = "chatgpt" if profile.get("type") == "chatgpt" else "api"
+        label = "ChatGPT Profile" if kind == "chatgpt" else "API Profile"
         targets.append(
             ShareTarget(
-                id=f"api:{profile_id}",
-                label=f"API Profile: {profile.get('name') or profile_id}",
+                id=f"{kind}:{profile_id}",
+                label=f"{label}: {profile.get('name') or profile_id}",
                 home=profile_home,
                 model_provider=_parse_config_value(
                     profile_home,
                     "model_provider",
-                    "apicodex",
+                    "openai" if kind == "chatgpt" else "apicodex",
                 ),
                 model=str(profile.get("model") or "").strip()
                 or _parse_config_value(profile_home, "model", "")
                 or None,
-                kind="api",
+                kind=kind,
             )
         )
     return targets
+
+
+def _selected_account_settings(target: ShareTarget) -> ShareTarget:
+    # Resolve default-account config only after it was explicitly selected.
+    # Listing/using named profiles must not read ~/.codex as a side effect.
+    if target.kind != "account":
+        return target
+    return replace(target,
+        model_provider=_parse_config_value(target.home, "model_provider", "openai"),
+        model=_parse_config_value(target.home, "model", "") or None)
 
 
 def _slugify_target(value: str) -> str:
@@ -243,24 +251,27 @@ def _service_targets(context: ShareContext) -> list[ShareTarget]:
 
 
 def _select_target(args: argparse.Namespace, context: ShareContext) -> ShareTarget:
-    if args.account and args.api_profile:
+    account_profile = getattr(args, "account_profile", None)
+    if sum(bool(x) for x in (args.account, args.api_profile, account_profile)) > 1:
         raise ConversationPoolError(
-            "--account and --api-profile are mutually exclusive"
+            "--account, --account-profile and --api-profile are mutually exclusive"
         )
     if args.account:
-        target = _targets(context, include_profiles=False)[0]
+        target = _selected_account_settings(_targets(context, include_profiles=False)[0])
         if not target.home.is_dir():
             raise ConversationPoolError(
                 f"account CODEX_HOME does not exist: {target.home}"
             )
         return target
     targets = _targets(context, include_profiles=True)
-    if args.api_profile:
-        requested = args.api_profile.lower()
+    if args.api_profile or account_profile:
+        requested = (args.api_profile or account_profile).lower()
         for target in targets[1:]:
+            if account_profile and target.kind != "chatgpt":
+                continue
             if (
-                target.id.removeprefix("api:").lower() == requested
-                or target.label.removeprefix("API Profile: ").lower() == requested
+                target.id.split(":", 1)[-1].lower() == requested
+                or target.label.partition(": ")[2].lower() == requested
             ):
                 if not target.home.is_dir():
                     raise ConversationPoolError(
@@ -268,25 +279,25 @@ def _select_target(args: argparse.Namespace, context: ShareContext) -> ShareTarg
                     )
                 return target
         raise ConversationPoolError(
-            f"API Profile {args.api_profile!r} was not found"
+            f"Codex Profile {(args.api_profile or account_profile)!r} was not found"
         )
     available = [target for target in targets if target.home.is_dir()]
     if not available:
         raise ConversationPoolError("no account or API Profile CODEX_HOME is available")
     if len(available) == 1:
-        return available[0]
+        return _selected_account_settings(available[0])
     print("Choose source/target Codex Profile", file=sys.stderr)
     for index, target in enumerate(available, 1):
         print(f"[{index}] {target.label}  {target.home}", file=sys.stderr)
     choice = input("Choose number [1]: ").strip()
     if not choice:
-        return available[0]
+        return _selected_account_settings(available[0])
     if choice.isdigit() and 1 <= int(choice) <= len(available):
-        return available[int(choice) - 1]
+        return _selected_account_settings(available[int(choice) - 1])
     lowered = choice.lower()
     for target in available:
         if target.id.lower() == lowered or target.label.lower() == lowered:
-            return target
+            return _selected_account_settings(target)
     raise ConversationPoolError(f"Codex Profile {choice!r} was not found")
 
 
@@ -423,7 +434,7 @@ def _new_app_server(
     context: ShareContext,
     target: ShareTarget,
 ) -> CodexAppServer:
-    if target.kind not in {"account", "api"}:
+    if target.kind not in {"account", "api", "chatgpt"}:
         raise ConversationPoolError(
             f"{target.label} is not a Codex app-server target"
         )
@@ -441,7 +452,7 @@ def _target_by_id(context: ShareContext, target_id: str) -> ShareTarget:
                 raise ConversationPoolError(
                     f"{target.label} CODEX_HOME does not exist: {target.home}"
                 )
-            return target
+            return _selected_account_settings(target)
     raise ConversationPoolError(f"migration target {target_id!r} was not found")
 
 
@@ -454,6 +465,8 @@ def list_share_targets(context: ShareContext) -> list[dict[str, Any]]:
             name = "Account Codex"
         elif target.kind == "api":
             name = target.label.removeprefix("API Profile: ")
+        elif target.kind == "chatgpt":
+            name = target.label.removeprefix("ChatGPT Profile: ")
         else:
             name = target.node_name or target.label.removeprefix("Claude Code: ")
         targets.append(
@@ -1389,6 +1402,7 @@ def _add_common(
     if selectors:
         parser.add_argument("--account", action="store_true")
         parser.add_argument("--api-profile", metavar="NAME")
+        parser.add_argument("--account-profile", metavar="NAME")
         parser.add_argument("--thread", metavar="ID")
     if dry_run:
         parser.add_argument("--dry-run", action="store_true")
@@ -1401,6 +1415,19 @@ def build_parser() -> argparse.ArgumentParser:
         description="Portable local Codex conversation sharing",
     )
     commands = parser.add_subparsers(dest="command", required=True)
+
+    targets = commands.add_parser("targets", help="list account/API/Claude migration targets")
+    targets.add_argument("--json", action="store_true")
+    threads = commands.add_parser("threads", help="list conversations in one target")
+    threads.add_argument("--target", required=True, help="target ID from 'share targets'")
+    threads.add_argument("--json", action="store_true")
+    copy = commands.add_parser("copy", help="copy visible history into an independent target thread")
+    copy.add_argument("--from", dest="source", required=True)
+    copy.add_argument("--to", dest="target", required=True)
+    copy.add_argument("--thread", required=True)
+    copy.add_argument("--cwd")
+    copy.add_argument("--title")
+    copy.add_argument("--json", action="store_true")
 
     init = commands.add_parser("init", help="initialize the EFS-protected pool")
     _add_common(init, selectors=False)
@@ -1464,7 +1491,16 @@ def main(arguments: Sequence[str], context: ShareContext) -> int:
     parser = build_parser()
     try:
         args = parser.parse_args(list(arguments))
-        result = HANDLERS[args.command](args, context)
+        if args.command == "targets":
+            result = {"ok": True, "targets": list_share_targets(context)}
+        elif args.command == "threads":
+            result = {"ok": True, "threads": list_share_threads(context, args.target)}
+        elif args.command == "copy":
+            result = copy_share_thread(context, source_target_id=args.source,
+                target_target_id=args.target, thread_id=args.thread,
+                cwd=Path(args.cwd).resolve() if args.cwd else None, title=args.title)
+        else:
+            result = HANDLERS[args.command](args, context)
         _emit(result, as_json=args.json)
         if args.command == "doctor" and not result.get("ok"):
             return 1

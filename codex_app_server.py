@@ -66,6 +66,9 @@ def _clean_process_environment(
     extra_env: dict[str, str] | None,
 ) -> dict[str, str]:
     environment = os.environ.copy()
+    for name in list(environment):
+        if name.upper().startswith(("CODEX_", "APICODEX_", "OPENAI_")):
+            environment.pop(name, None)
     for name in (
         "CODEX_THREAD_ID",
         "CODEX_PERMISSION_PROFILE",
@@ -190,7 +193,11 @@ class CodexAppServer:
         self._reader_threads: list[threading.Thread] = []
 
     def __enter__(self) -> "CodexAppServer":
-        self.start()
+        try:
+            self.start()
+        except BaseException:
+            self.close()
+            raise
         return self
 
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:

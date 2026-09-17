@@ -2,7 +2,7 @@
 
 Cross-platform API profile launchers for Codex CLI and Claude Code.
 
-- `apicodex` manages Codex API profiles under `~/.codex-api`.
+- `apicodex` manages Codex API and named ChatGPT profiles under `~/.codex-api`.
 - `apiclaude` manages Claude Code API nodes in `~/.apiclaude_config.json`.
 - `apiagent` is a shared entrypoint for both.
 
@@ -17,6 +17,7 @@ and credential references.
 - Claude Code CLI available as `claude` for `apiclaude`
 - CLIProxyAPI (CPA) v7.2.101 or newer for new Codex-to-Claude bridge nodes
 - Optional: LiteLLM 1.93.0 or newer for legacy bridge nodes created before CPA
+- Optional: `cryptography` for Windows OAuth JSON import only (`python -m pip install cryptography`)
 
 Check:
 
@@ -33,6 +34,247 @@ python --version
 codex --version
 claude --version
 ```
+
+## Named ChatGPT subscription accounts
+
+Running `apicodex` always offers `[0] Account login`, followed by numbered API
+profiles. Account login opens a second menu: `[1] Official login`, named accounts,
+and `[a] Add profile`. The official entry launches ordinary Codex with `~/.codex`;
+it reuses the existing login and lets Codex handle authentication when needed.
+The same selection works with `apicodex --desktop`.
+
+Add profile offers browser login, device login, or an explicitly selected OAuth
+JSON file. It suggests the account email as the profile name; accept it or enter
+a short alias. Codex's account response exposes an email, not a separate public
+OpenAI username. Directory IDs stay stable when names change, and previous names
+remain usable as aliases:
+
+```powershell
+apicodex account add
+apicodex account import --file D:\private\account.json --dry-run
+apicodex account import --file D:\private\account.json
+apicodex account rename user@example.com short-name
+apicodex --account-profile short-name
+apicodex --desktop --account-profile short-name
+```
+
+Run ordinary `codex` to keep using the default official account. A named ChatGPT
+profile uses a separate `CODEX_HOME` under `~/.codex-api/accounts/<stable-id>`;
+its official Desktop window also uses a separate `~/.apicodex-desktop/<stable-id>`.
+The default account's credentials are never automatically copied or changed.
+This feature is managed through the CLI. The old Web/Tauri managers are not
+supported for subscription accounts; Tauri refuses a registry containing them
+before it can discard unfamiliar fields.
+
+```powershell
+apicodex account add planning --model gpt-6-astra
+apicodex account add execution --model gpt-5.6-sol
+apicodex account login planning
+apicodex account login execution
+apicodex account list
+apicodex --account-profile planning
+apicodex --account-profile execution --model gpt-5.6-sol
+apicodex --desktop --account-profile execution
+```
+
+`add NAME` creates metadata/configuration only; `add` without a name opens the
+guided login/import flow. Normal CLI/Desktop launches reuse
+the selected profile's stored authentication and let official Codex refresh it;
+they do not call login, inject API keys, or query an API provider's model list.
+The explicit `account login` command first asks official Codex to read/refresh
+cached authentication and opens the official login flow only when needed.
+For device authorization use `account login NAME --device-auth` (subject to
+account/workspace support). Temporary network errors do not clear stored auth
+or trigger a replacement login. Credentials use official `keyring` storage,
+without a plaintext fallback. The account must itself have access to the model
+you select; the example model names do not grant model access.
+
+To import an explicitly selected official `auth.json` export or Cockpit Tools
+OAuth export on Windows:
+
+```powershell
+apicodex account import execution --file D:\private\account.json --dry-run
+apicodex account import execution --file D:\private\account.json
+apicodex --desktop --account-profile execution
+```
+
+`import` creates a new profile; if you already used `account add`, pass `--update`
+to explicitly import into that existing profile. It accepts the official nested
+`tokens` object and Cockpit's flat token export (including single-entry arrays).
+For a multi-account array, choose one with `--index N`, starting at 1. Preview
+shows only masked identity, expiry, and whether a refresh token exists; decoded
+claims do not prove identity or service access. Both `id_token` and `access_token`
+are required. Without `refresh_token`, the imported login cannot renew itself.
+Access-only, API-key, and agent-identity exports are rejected; use official
+login for these subscription profiles instead.
+
+Only import loads the optional `cryptography` package. It writes the official
+age-encrypted `secrets/codex_auth.age` and stores its passphrase in the Windows
+credential manager under the official path-derived identity. It verifies local
+readback and official Codex recognition before recording success, preserving
+unrelated secrets and backing up previous ciphertext for an explicit update.
+Failed verification or registry persistence restores the prior auth. The source
+file is never changed, registered as a startup source, or copied into the profile.
+Subsequent launches use the official refreshed credentials.
+
+Reimporting an identity already recorded by this importer reuses its existing
+profile unless `--update` explicitly replaces that profile's login. Reuse does
+not check or restore authentication: after logout, use `account login NAME`, or
+explicitly import a current export into that existing profile with `--update`.
+Accounts
+created through browser login have no import identity marker; their existing
+profile also requires explicit `--update`. This is not live synchronization with
+Cockpit: refreshing the same copied account in both tools can invalidate an old
+refresh token. Use one active credential owner for that account; separate
+accounts remain independent. macOS supports official account login, while this
+file-import adapter and Desktop launch currently support Windows only.
+
+```powershell
+apicodex account status execution --json
+apicodex account status execution --refresh
+apicodex account model execution gpt-6-astra
+apicodex account logout execution --dry-run
+apicodex account logout execution
+apicodex account archive execution --dry-run
+apicodex account archive execution
+```
+
+Status reports official local authentication recognition, not a successful
+model request. Close that profile's CLI/Desktop sessions before logout or
+archive. Logout clears only its official login. Archive retains its credentials
+and history, moves its directories before unregistering it, and records the
+original paths in `archived-profiles/<id>/profile.json`. It does not sign out
+other accounts. To undo an archive, close its sessions, restore `home` and
+`desktop` to the manifest's original paths and restore the manifest's `profile`
+entry to `profiles.json`; the original path matters because official keyring
+storage is tied to `CODEX_HOME`. Do not overwrite an existing profile or restore
+while another profile-management operation is running.
+
+### Shared resources for named accounts
+
+Named accounts follow the official default account's resources automatically:
+
+- `skills`, `rules`, `prompts`, and `plugins/cache` link to the same paths under
+  `~/.codex`. Windows uses directory junctions without administrator privileges;
+  other platforms use directory symlinks. Adding a Skill through a named
+  account's `skills` directory therefore writes directly to the shared source.
+  User-wide `~/.agents/skills` and personal `~/.agents/plugins` remain shared too.
+- `AGENTS.md`, `AGENTS.override.md`, and `hooks.json` follow the default source
+  by atomic copy on each launch, including source deletions. Edit those files
+  in `~/.codex`. Hook review/trust state in each account's `config.toml` stays
+  independent; a changed hook definition requires review again.
+- MCP definitions, plugin/marketplace declarations, Skill enablement, feature
+  flags, interface settings and common permission settings follow the default
+  `config.toml` on launch. Account model choices, provider/authentication fields,
+  trust/history and runtime data remain separate. A shared feature setting
+  cannot disable named-account encrypted authentication.
+
+For a named profile, `mcp add/remove` and plugin/marketplace management commands
+update the default source, then synchronize that profile. Other accounts pick
+up the change at their next launch. MCP OAuth login/logout and connected-service
+authentication remain account-specific; sharing definitions does not share
+service credentials or account entitlements. Already open sessions may require
+restarting to read configuration changes.
+
+```powershell
+apicodex account sync --all --dry-run
+apicodex account sync --all
+apicodex account sync short-name
+apicodex --account-profile short-name mcp add example -- example-mcp
+```
+
+Before replacing local resources, synchronization retains originals under the
+named home's `.account-resource-backups/<id>`. Local-only user files are copied
+and checked into the default resource source; default files win same-path
+conflicts, with originals retained in the backup. Generated `.system` Skills
+follow the default runtime. Unknown local nested links stay in the backup for
+manual review. Dry-run previews directories and config changes; it does not
+enumerate file conflicts or detect live file locks.
+
+If an open Desktop locks `plugins/cache`, the existing cache stays in place and
+the command reports deferred sharing; close that account's Desktop and relaunch
+or run `account sync NAME` to retry. Other resource sharing still completes.
+A failed resource step retains originals/backups; previously completed steps
+are not rolled back as a global transaction. To recover a local variant, close
+the account's sessions and copy the desired backed-up files into the shared
+source. Do not recursively delete a junction or overwrite authentication data.
+Neither credentials, histories, databases nor plugin runtime/staging directories
+are linked to the default account.
+
+### Optional two-line usage display
+
+[Token Tracker](https://github.com/stormzhang/token-tracker) can display colored
+5-hour/week quota bars, reset countdowns, model and context usage after each
+completed reply. It uses the official Codex `Stop` hook; it does not replace
+the native footer or require a custom Codex binary. Its bars show **used**
+percentages, whereas the native footer normally shows percentages **left**.
+The hook output uses Codex's warning-message UI channel, so a warning label on
+this usage display does not mean the request failed. Account credit balance is
+not included in this renderer.
+
+The Windows installation verified on this machine pins Token Tracker 0.5.7 at
+commit `85a6b573bb53e8181772abd5f590e0383f1bb28a` in a separate Python environment
+under `C:\tools\token-tracker\venv`. Only its rendered Codex status hook is
+registered; its general setup wizard, sidebar and Claude/Kimi integrations are
+not run. The command in the default `~/.codex/hooks.json` is:
+
+```text
+C:/tools/token-tracker/venv/Scripts/python.exe -X utf8 C:/tools/token-tracker/codex-statusline.py
+```
+
+`features.hooks = true` enables execution. Named account launches synchronize
+the definition while keeping each account's hook trust local. Newly created
+accounts can review and trust this exact command via `/hooks`; existing local
+accounts were reviewed and verified during installation. Restart an already
+running CLI to load the hook, then complete one reply. The renderer follows
+the session transcript and its `CODEX_HOME`; it does not read login credentials
+or make requests to fetch quota. Until a session has quota data, some fields
+can be absent; values are snapshots from completed requests.
+
+Installation hashes and configuration backups are recorded in
+`C:\tools\token-tracker\installation.json`. To disable the display, remove
+only its command handler from the default `hooks.json`, then run
+`apicodex account sync --all` and restart the CLI. Preserve any other hooks.
+The package is optional and adds no dependency to ordinary ApiCodex startup.
+
+Use the existing protected conversation pool for explicit handoff. Initialize
+it once if necessary with `apicodex share init`, then list target IDs and copy
+one selected conversation:
+
+```powershell
+apicodex share targets
+apicodex share threads --target chatgpt:PROFILE_ID
+apicodex share copy --from chatgpt:SOURCE_ID --to api:TARGET_ID --thread THREAD_ID --cwd D:\work
+```
+
+`share copy` reuses visible-history cleaning and creates an independent target
+thread. It retains the source conversation and supports both directions between
+API and named ChatGPT profiles. Existing `share publish`/`clone` commands also
+accept `--account-profile NAME`. No automatic routing, account rotation, or
+live thread synchronization is added. VS Code and CPA bridging are not supported
+for subscription profiles.
+
+Current validation: official CLI 0.154.0 recognizes synthetic OAuth credentials
+larger than the Windows direct-credential limit in two isolated homes, including
+concurrent reads, fresh-process reads, and independent logout. Officially
+rewritten ciphertext is readable; temporary test keyring entries are removed.
+Automated tests also cover import preview, format rejection, encrypted rollback,
+launch routing, environment cleaning, and API/ChatGPT history handoff.
+On this Windows machine, two explicitly supplied OAuth exports were imported;
+both accounts answered real requests (Astra/Sol), rotated their access and
+refresh tokens through official Codex, and answered again in fresh processes.
+A real A-to-B history copy resumed successfully with Sol and retained the source
+file's hash. Official Desktop 26.908.9136.0 opened both isolated windows at once:
+one reached the main interface with Sol, while the other reached the official
+first-use occupation/preferences screen after an initially blank window was
+closed and reopened. The user subsequently confirmed entering Desktop;
+full Desktop process-restart and per-account connector authorization acceptance
+remain pending. Plugin-cache sharing may be deferred while Desktop holds files
+open; a deferred result does not mean sharing has completed. No login page was
+opened by the launcher, and default-account credentials were not read or written.
+No installed launcher is
+automatically updated: to review this checkout on Windows, replace `apicodex`
+in the examples with `python .\apiagent.py codex`.
 
 ## Install On macOS Or Linux
 

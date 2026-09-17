@@ -13,6 +13,13 @@ from web.backend import app as web_app
 
 
 class WebSecurityTests(KeychainIsolationMixin):
+    def test_legacy_web_cannot_delete_subscription_profile(self):
+        with patch.object(apiagent, 'load_codex_profiles', return_value=[{'name': 'account', 'type': 'chatgpt'}]), patch.object(apiagent, 'save_codex_profiles') as save:
+            with self.assertRaises(web_app.HTTPException) as raised:
+                asyncio.run(web_app.delete_codex_profile('account'))
+        self.assertEqual(raised.exception.status_code, 400)
+        save.assert_not_called()
+
     def test_share_api_lists_targets_and_copies_without_credentials(self) -> None:
         targets = [
             {

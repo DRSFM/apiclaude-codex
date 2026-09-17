@@ -643,7 +643,7 @@ def load_codex_profiles() -> list[dict[str, Any]]:
 
 
 def save_codex_profiles(profiles: list[dict[str, Any]]) -> None:
-    write_json(CODEX_PROFILES_PATH, {"version": 1, "profiles": profiles})
+    write_json_atomic(CODEX_PROFILES_PATH, {"version": 1, "profiles": profiles})
 
 
 def codex_credential_id(profile: dict[str, Any]) -> str:
@@ -652,6 +652,8 @@ def codex_credential_id(profile: dict[str, Any]) -> str:
 
 
 def get_codex_secret(profile: dict[str, Any]) -> str:
+    if profile.get("type", "api_key") != "api_key":
+        raise SecureStoreError("ChatGPT profiles do not contain an API key.")
     credential_id = profile.get("credentialId") or codex_credential_id(profile)
     value = clean_hidden_prefix(SECRET_STORE.get(credential_id))
     if not value or value == CODEX_API_AUTH_MARKER:
@@ -684,6 +686,8 @@ def migrate_codex_secrets(
 ) -> bool:
     changed = False
     for profile in profiles:
+        if profile.get("type", "api_key") != "api_key":
+            continue
         credential_id = profile.get("credentialId") or codex_credential_id(profile)
         if not is_safe_api_profile_home(profile):
             print(
@@ -726,6 +730,8 @@ def finalize_codex_migration(
     store: SecureStore,
 ) -> None:
     for profile in profiles:
+        if profile.get("type", "api_key") != "api_key":
+            continue
         credential_id = profile.get("credentialId")
         if not credential_id:
             continue
@@ -1667,6 +1673,9 @@ def setup_codex_vision(profiles: list[dict[str, Any]], names: list[str]) -> int:
         if not profile:
             print(f"Error: Codex profile '{name}' was not found.", file=sys.stderr)
             return 1
+        if profile.get("type", "api_key") != "api_key":
+            print("Error: Gemini vision fallback is only available for API profiles.", file=sys.stderr)
+            return 1
         if not is_safe_api_profile_home(profile):
             print(
                 f"Error: refusing to configure vision outside ~/.codex-api: {name}",
@@ -2050,6 +2059,8 @@ def refresh_codex_models(
     catalog hash is cached separately; failed attempts are not cached.
     """
     result: dict[str, Any] = {"status": "skipped", "added": 0}
+    if profile.get("type", "api_key") != "api_key":
+        return {**result, "reason": "ChatGPT uses the official account model catalog"}
     if not force and os.environ.get("APICODEX_AUTO_REFRESH_MODELS", "").lower() in {
         "0", "false", "off",
     }:
@@ -2461,6 +2472,10 @@ def find_profile(profiles: list[dict[str, Any]], name: str | None) -> dict[str, 
     for profile in profiles:
         if profile.get("id", "").lower() == name.lower() or profile.get("name", "").lower() == name.lower():
             return profile
+    aliases = [p for p in profiles if p.get("type") == "chatgpt" and any(
+        isinstance(alias, str) and alias.casefold() == name.casefold() for alias in p.get("aliases", []))]
+    if len(aliases) == 1:
+        return aliases[0]
     return None
 
 
@@ -2470,7 +2485,7 @@ def show_codex_profiles(profiles: list[dict[str, Any]]) -> None:
         return
     for index, profile in enumerate(profiles, 1):
         print(
-            f"[{index}] {profile.get('name')}  {profile.get('baseUrl')}  "
+            f"[{index}] {profile.get('name')}  {profile.get('type', 'api_key')}  {profile.get('baseUrl') or 'ChatGPT'}  "
             f"cli={'custom' if profile.get('useCustomCodexCli') else 'official'}  "
             f"lastUsed={profile.get('lastUsedAt') or '-'}"
         )
@@ -2486,6 +2501,7 @@ def codex_profile_metadata(profile: dict[str, Any]) -> dict[str, Any]:
         "id": str(profile.get("id") or profile_id),
         "instanceId": dream_skin_instance_id(profile),
         "name": str(profile.get("name") or profile_id),
+        "type": profile.get("type", "api_key"),
         "baseUrl": str(profile.get("baseUrl") or ""),
         "profileHome": str(codex_profile_home(profile).resolve()),
         "desktopData": str((CODEX_DESKTOP_DATA_ROOT / profile_id).resolve()),
@@ -2518,6 +2534,9 @@ def add_codex_profile(
     profiles = load_codex_profiles()
     print("Add or update a Codex API profile")
     selected = find_profile(profiles, requested) if requested else None
+    if selected and selected.get("type", "api_key") != "api_key":
+        print("Error: use 'apicodex account' to manage ChatGPT profiles.", file=sys.stderr)
+        return 1
     if requested and not selected:
         print(f"Error: Codex profile '{requested}' was not found.", file=sys.stderr)
         return 1
@@ -2540,6 +2559,9 @@ def add_codex_profile(
         return 1
 
     existing = selected or find_profile(profiles, profile_name)
+    if existing and existing.get("type", "api_key") != "api_key":
+        print("Error: this name belongs to a ChatGPT profile; use 'apicodex account'.", file=sys.stderr)
+        return 1
     conflict = find_profile(profiles, profile_name)
     if selected and conflict and conflict.get("id") != selected.get("id"):
         print(f"Error: profile name '{profile_name}' is already in use.", file=sys.stderr)
@@ -2704,6 +2726,9 @@ def remove_codex_profile(requested: str | None = None) -> int:
     if not profile:
         print("Error: profile was not found.", file=sys.stderr)
         return 1
+    if profile.get("type") == "chatgpt":
+        from codex_accounts import main as account_main
+        return account_main(["archive", profile["name"]], sys.modules[__name__])
     if not is_safe_api_profile_home(profile):
         print(
             "Error: refusing to remove a Codex profile outside ~/.codex-api.",
@@ -2729,7 +2754,14 @@ def remove_codex_profile(requested: str | None = None) -> int:
     return 0
 
 
-def select_codex_profile(profiles: list[dict[str, Any]], requested: str | None) -> dict[str, Any] | None:
+def select_codex_profile(profiles: list[dict[str, Any]], requested: str | None, *, account_menu: bool = False) -> dict[str, Any] | None:
+    if account_menu and not requested:
+        from codex_account_menu import choose, CANCEL
+        try:
+            return choose(profiles, sys.modules[__name__])
+        except (EOFError, KeyboardInterrupt):
+            print("\nCancelled.")
+            return CANCEL
     if not profiles:
         if add_codex_profile() != 0:
             return None
@@ -2742,7 +2774,7 @@ def select_codex_profile(profiles: list[dict[str, Any]], requested: str | None) 
     if len(profiles) == 1:
         return profiles[0]
 
-    print("Choose Codex API profile")
+    print("Choose Codex profile")
     show_codex_profiles(profiles)
     last = sorted(profiles, key=lambda item: item.get("lastUsedAt") or "", reverse=True)[0]
     choice = input(f"Choose number or name [{last['name']}]: ").strip()
@@ -2768,6 +2800,9 @@ def configure_codex_custom_cli(requested: str | None = None) -> int:
     profiles = load_codex_profiles()
     selected = select_codex_profile(profiles, requested)
     if not selected:
+        return 1
+    if selected.get("type") == "chatgpt":
+        print("Error: ChatGPT account profiles use the official Codex CLI.", file=sys.stderr)
         return 1
     choice = input(
         f"Use custom Codex CLI for '{selected.get('name')}'? [y/N]: "
@@ -2879,6 +2914,9 @@ def launch_codex_desktop(
     profiles: list[dict[str, Any]],
     selected: dict[str, Any],
 ) -> int:
+    if selected.get("type") == "chatgpt":
+        from codex_accounts import launch
+        return launch(selected, [], sys.modules[__name__], desktop=True)
     if os.name != "nt":
         print("Error: --desktop is currently supported only on Windows.", file=sys.stderr)
         return 1
@@ -3038,6 +3076,9 @@ def launch_codex_vscode(
     profiles: list[dict[str, Any]],
     selected: dict[str, Any],
 ) -> int:
+    if selected.get("type") == "chatgpt":
+        print("Error: ChatGPT profiles currently support CLI and --desktop; VS Code is not supported.", file=sys.stderr)
+        return 1
     home = codex_profile_home(selected)
     if not is_safe_api_profile_home(selected):
         print(
@@ -3114,6 +3155,11 @@ def codex_help() -> None:
   apicodex shared sync             Refresh shared MCP config now
   apicodex shared status           Show account MCP sharing status
   apicodex shared disable          Remove managed MCP copies from API profiles
+  apicodex account --help          Manage isolated ChatGPT subscription accounts
+  apicodex account add NAME        Create an account profile without opening login
+  apicodex account import NAME --file PATH  Import selected OAuth JSON (Windows)
+  apicodex account login NAME      Reuse/refresh auth; sign in only when needed
+  apicodex --account-profile NAME  Run a named ChatGPT account (also with --desktop)
   apicodex --cus                   Choose a Profile and toggle custom Codex CLI use
   apicodex --vscode                Choose a profile and open VS Code here
   apicodex --desktop               Choose a profile and open an isolated desktop app
@@ -3169,6 +3215,22 @@ def codex_share_main(args: list[str]) -> int:
 
 
 def codex_main(args: list[str]) -> int:
+    if args and args[0] == "share":
+        return codex_share_main(args[1:])
+    if args and args[0] == "account":
+        from codex_accounts import main as account_main
+        return account_main(args[1:], sys.modules[__name__])
+    if "--account-profile" in args:
+        index = args.index("--account-profile")
+        if index + 1 >= len(args) or "--api-profile" in args or args.count("--account-profile") != 1:
+            print("Error: --account-profile requires one account name and cannot be combined with --api-profile.", file=sys.stderr)
+            return 1
+        profiles = load_codex_profiles()
+        selected = find_profile(profiles, args[index + 1])
+        if not selected or selected.get("type") != "chatgpt":
+            print("Error: --account-profile must select a ChatGPT account profile.", file=sys.stderr)
+            return 1
+        args = [*args[:index], "--api-profile", *args[index + 1:]]
     if args and args[0] == "models":
         return codex_models_main(args[1:])
     if args and args[0] == "vision":
@@ -3407,9 +3469,18 @@ def codex_main(args: list[str]) -> int:
             )
             return 1
         profiles = load_codex_profiles()
-        selected = select_codex_profile(profiles, requested)
+        selected = select_codex_profile(profiles, requested, account_menu=True)
         if not selected:
             return 1
+        if selected.get("type") == "menu_cancelled":
+            return 0
+        if selected.get("type") == "official_default":
+            from codex_accounts import launch_default, AccountError
+            try:
+                return launch_default([], sys.modules[__name__], desktop=True)
+            except AccountError as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                return 1
         return launch_codex_desktop(profiles, selected)
     if do_vscode:
         if pass_through:
@@ -3445,9 +3516,21 @@ def codex_main(args: list[str]) -> int:
             return code
 
     profiles = load_codex_profiles()
-    selected = select_codex_profile(profiles, requested)
+    selected = select_codex_profile(profiles, requested, account_menu=True)
     if not selected:
         return 1
+    if selected.get("type") == "menu_cancelled":
+        return 0
+    if selected.get("type") == "official_default":
+        from codex_accounts import launch_default, AccountError
+        try:
+            return launch_default(pass_through, sys.modules[__name__])
+        except AccountError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+    if selected.get("type") == "chatgpt":
+        from codex_accounts import launch
+        return launch(selected, pass_through, sys.modules[__name__])
     home = codex_profile_home(selected)
     if not is_safe_api_profile_home(selected):
         print(
@@ -4405,6 +4488,9 @@ def add_claude_codex_bridge(
 ) -> int:
     profiles = load_codex_profiles()
     profile = find_profile(profiles, clean_hidden_prefix(codex_profile_name))
+    if profile and profile.get("type", "api_key") != "api_key":
+        print("Error: ChatGPT profiles cannot be used by the CPA bridge.", file=sys.stderr)
+        return 1
     if not profile:
         print(
             f"Error: Codex profile '{codex_profile_name}' was not found.",

@@ -289,6 +289,16 @@ pub fn load_codex_config() -> Result<CodexConfig, String> {
     let content =
         fs::read_to_string(&path).map_err(|e| format!("Failed to read Codex profiles: {}", e))?;
 
+    // This legacy UI cannot preserve or manage subscription profile fields.
+    // Refuse before deserialization/migration can discard them on a later save.
+    let raw: Value = serde_json::from_str(content.trim_start_matches('\u{feff}'))
+        .map_err(|_| "Invalid Codex profile metadata".to_string())?;
+    if raw.get("profiles").and_then(Value::as_array).is_some_and(|profiles| {
+        profiles.iter().any(|p| p.get("type").and_then(Value::as_str).is_some_and(|t| t != "api_key"))
+    }) {
+        return Err("This legacy manager does not support ChatGPT profiles. Use the apicodex CLI.".into());
+    }
+
     let mut config: CodexConfig = serde_json::from_str(content.trim_start_matches('\u{feff}'))
         .map_err(|e| format!("Failed to parse Codex profiles: {}", e))?;
 
