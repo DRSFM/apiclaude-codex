@@ -3290,7 +3290,9 @@ def codex_main(args: list[str]) -> int:
             repair_install_task = True
         elif repair_mode and arg == "--uninstall-task":
             repair_uninstall_task = True
-        elif arg == "--json":
+        elif arg == "--json" and not (
+            pass_through and pass_through[0] in {"exec", "e"}
+        ):
             do_json = True
         elif arg == "--api-help":
             do_help = True

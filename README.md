@@ -77,6 +77,19 @@ apicodex --account-profile execution --model gpt-5.6-sol
 apicodex --desktop --account-profile execution
 ```
 
+For a bounded task with machine-readable results, put `exec` immediately after
+the account selector and pass the official CLI options after it:
+
+```powershell
+apicodex --account-profile execution exec --model gpt-5.6-luna -c model_reasoning_effort=max --sandbox read-only --json "Read README.md and summarize the account isolation rules."
+```
+
+`exec --json` (also `e --json`) streams official task events, including the final
+result; `--api-list --json` continues to list profiles. Model and reasoning
+overrides apply to this invocation without changing the saved account default.
+This launches one task and returns its output; it does not add an automatic
+cross-account scheduler or authorize third-party connectors.
+
 `add NAME` creates metadata/configuration only; `add` without a name opens the
 guided login/import flow. Normal CLI/Desktop launches reuse
 the selected profile's stored authentication and let official Codex refresh it;

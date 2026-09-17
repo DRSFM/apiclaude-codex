@@ -86,6 +86,24 @@ class AccountTests(unittest.TestCase):
         self.assertIn('--user-data-dir=', start.call_args.args[1][0])
         self.assertEqual(start.call_args.kwargs['env']['CODEX_HOME'], str(home))
 
+    def test_exec_json_reaches_official_cli_with_account_and_model_overrides(self):
+        profile = self.create(model='gpt-5.6-sol')
+        for command in ('exec', 'e'):
+            with (
+                self.subTest(command=command),
+                patch.object(apiagent, 'find_codex_cli_executable', return_value='codex.exe'),
+                patch.object(apiagent, 'run_command', return_value=0) as run,
+                patch.object(apiagent, 'show_codex_profiles_json', side_effect=AssertionError('management JSON')),
+            ):
+                forwarded = [command, '--model', 'gpt-5.6-luna', '-c',
+                             'model_reasoning_effort=max', '--json', '-']
+                self.assertEqual(apiagent.codex_main(['--account-profile', 'work', *forwarded]), 0)
+                self.assertEqual(run.call_args.args[1], forwarded)
+                self.assertEqual(run.call_args.kwargs['env']['CODEX_HOME'],
+                                 str(apiagent.codex_profile_home(profile)))
+        self.assertEqual(apiagent.find_profile(apiagent.load_codex_profiles(), 'work')['model'],
+                         'gpt-5.6-sol')
+
     def test_account_selector_rejects_api_profile(self):
         apiagent.save_codex_profiles([{'id': 'api', 'name': 'api', 'home': 'profiles/api'}])
         self.assertEqual(apiagent.codex_main(['--account-profile', 'api']), 1)
