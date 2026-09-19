@@ -6,7 +6,7 @@ import json
 import os
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stdout, redirect_stderr
 from pathlib import Path
 from unittest.mock import patch
 
@@ -130,6 +130,85 @@ class AccountTests(unittest.TestCase):
             with patch.object(accounts, 'read_account', side_effect=accounts.AccountError('network failure')):
                 self.assertEqual(accounts.main(['login', 'work'], apiagent), 1)
             run.assert_not_called()
+
+    def test_active_profile_login_reads_cache_and_explicit_refresh_is_refused(self):
+        profile = self.create()
+        home = apiagent.codex_profile_home(profile)
+        with (patch.object(accounts, 'profile_busy', return_value=True),
+              patch.object(apiagent, 'find_codex_cli_executable', return_value='codex.exe'),
+              patch.object(apiagent, 'run_command') as run,
+              patch.object(accounts, 'read_account', return_value={'type': 'chatgpt'}) as read,
+              redirect_stderr(io.StringIO())):
+            self.assertEqual(accounts.main(['login', 'work'], apiagent), 0)
+            read.assert_called_once_with(home, 'codex.exe', refresh=False)
+            read.reset_mock()
+            self.assertEqual(accounts.main(['status', 'work', '--refresh'], apiagent), 1)
+            read.assert_not_called()
+            self.assertEqual(accounts.main(['status', 'work'], apiagent), 0)
+            read.assert_called_once_with(home, 'codex.exe', refresh=False)
+            read.return_value = None
+            self.assertEqual(accounts.main(['login', 'work'], apiagent), 1)
+            run.assert_not_called()
+
+    def test_changed_official_store_is_reread_once_before_reauth(self):
+        profile = self.create()
+        home = apiagent.codex_profile_home(profile)
+        directory = home / 'secrets'
+        directory.mkdir()
+        path = directory / 'codex_auth.age'
+        path.write_bytes(b'synthetic-old-ciphertext')
+        with patch.object(accounts, 'CodexAppServer') as server:
+            client = server.return_value.__enter__.return_value
+            def refresh_race(method, params):
+                if params['refreshToken']:
+                    path.write_bytes(b'synthetic-new-ciphertext')
+                    raise accounts.AppServerError('refresh_token_reused synthetic-secret')
+                return {'account': {'type': 'chatgpt', 'email': 'test@example.invalid'}}
+            client.request.side_effect = refresh_race
+            self.assertEqual(accounts.read_account(home, 'codex.exe', refresh=True)['type'], 'chatgpt')
+            self.assertEqual([c.args[1]['refreshToken'] for c in client.request.call_args_list], [True, False])
+            self.assertEqual(path.read_bytes(), b'synthetic-new-ciphertext')
+
+    def test_auth_errors_are_bounded_classified_and_redacted(self):
+        profile = self.create()
+        home = apiagent.codex_profile_home(profile)
+        for code in ('refresh_token_reused', 'refresh_token_expired', 'refresh_token_invalidated',
+                     'invalid_grant', 'failed to decrypt secrets file', 'network timeout'):
+            with self.subTest(code=code), patch.object(accounts, 'CodexAppServer') as server:
+                client = server.return_value.__enter__.return_value
+                client.request.side_effect = accounts.AppServerError(code + ' synthetic-secret')
+                expected = accounts.AccountError if code == 'network timeout' else accounts.LoginRequired
+                with self.assertRaises(expected) as caught:
+                    accounts.read_account(home, 'codex.exe', refresh=True)
+                self.assertNotIn('synthetic-secret', str(caught.exception))
+                self.assertEqual(client.request.call_count, 1)
+                self.assertEqual(isinstance(caught.exception, accounts.LoginRequired), code != 'network timeout')
+        with (patch.object(accounts, 'CodexAppServer') as server,
+              patch.object(accounts, '_auth_revision', side_effect=[b'a', b'b', b'b', b'c'])):
+            client = server.return_value.__enter__.return_value
+            client.request.side_effect = accounts.AppServerError('refresh_token_reused')
+            with self.assertRaises(accounts.LoginRequired):
+                accounts.read_account(home, 'codex.exe', refresh=True)
+            self.assertEqual(client.request.call_count, 2)
+
+    def test_status_cannot_race_with_import_or_logout_management(self):
+        self.create()
+        with (accounts.operation_lock(apiagent.CODEX_HOME / '.account-operation.lock'),
+              patch.object(accounts, 'read_account') as read, redirect_stderr(io.StringIO())):
+            self.assertEqual(accounts.main(['status', 'work', '--refresh'], apiagent), 1)
+            self.assertEqual(accounts.main(['status', 'work'], apiagent), 1)
+            read.assert_not_called()
+
+    def test_same_home_auth_check_is_locked_but_other_home_can_proceed(self):
+        a, b = self.create('a'), self.create('b')
+        home_a, home_b = apiagent.codex_profile_home(a), apiagent.codex_profile_home(b)
+        with (accounts.operation_lock(home_a / '.apicodex-auth.lock'),
+              patch.object(accounts, 'CodexAppServer') as server):
+            server.return_value.__enter__.return_value.request.return_value = {'account': {'type': 'chatgpt'}}
+            with self.assertRaises(accounts.AccountError):
+                accounts.read_account(home_a, 'codex.exe', refresh=True)
+            server.assert_not_called()
+            self.assertEqual(accounts.read_account(home_b, 'codex.exe')['type'], 'chatgpt')
 
     def test_dry_run_leaves_account_metadata_and_files_unchanged(self):
         self.create()

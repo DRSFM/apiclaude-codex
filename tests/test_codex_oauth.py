@@ -29,6 +29,13 @@ def synthetic_auth(identity="account-a", padding=0):
             "last_refresh": "2026-09-17T00:00:00Z"}
 
 
+def refreshed_auth():
+    auth = synthetic_auth()
+    auth["tokens"]["refresh_token"] = "synthetic-rotated-refresh"
+    auth["last_refresh"] = "2026-09-17T01:00:00Z"
+    return auth
+
+
 class FakeKey:
     values = {}
 
@@ -130,7 +137,7 @@ class OAuthTests(unittest.TestCase):
         path.write_bytes(oauth.encrypt(json.dumps(doc).encode(), key))
         original = path.read_bytes()
         with self.assertRaises(RuntimeError):
-            with oauth.save_auth(self.home, synthetic_auth("account-b")):
+            with oauth.save_auth(self.home, refreshed_auth()):
                 self.assertIn("global/OTHER", json.loads(oauth.decrypt(path.read_bytes(), key))["secrets"])
                 raise RuntimeError("registry failure")
         self.assertEqual(original, path.read_bytes())
@@ -163,7 +170,7 @@ class OAuthTests(unittest.TestCase):
         original, key = path.read_bytes(), FakeKey(self.home).read()
         with patch.object(oauth, "_atomic", side_effect=OSError("synthetic disk full")):
             with self.assertRaises(OSError):
-                with oauth.save_auth(self.home, synthetic_auth("account-b")):
+                with oauth.save_auth(self.home, refreshed_auth()):
                     pass
         self.assertEqual(path.read_bytes(), original)
         self.assertEqual(FakeKey(self.home).read(), key)
@@ -184,6 +191,117 @@ class OAuthTests(unittest.TestCase):
             with oauth.save_auth(self.home, self.auth):
                 pass
         self.assertIsNone(FakeKey(self.home).read())
+
+    def test_stale_ambiguous_cross_account_and_refresh_loss_do_not_replace_store(self):
+        with oauth.save_auth(self.home, refreshed_auth()):
+            pass
+        path = self.home / "secrets" / "codex_auth.age"
+        original = path.read_bytes()
+        ambiguous = refreshed_auth()
+        ambiguous["tokens"]["refresh_token"] = "synthetic-other-chain"
+        missing = refreshed_auth()
+        missing["last_refresh"] = "2026-09-17T02:00:00Z"
+        missing["tokens"]["refresh_token"] = ""
+        for candidate in (self.auth, ambiguous, missing, synthetic_auth("account-b")):
+            with self.subTest(candidate=candidate["last_refresh"]):
+                with self.assertRaises(oauth.ImportError):
+                    with oauth.save_auth(self.home, candidate):
+                        self.fail("unsafe update accepted")
+                self.assertEqual(path.read_bytes(), original)
+        self.assertFalse(list(path.parent.glob("*before-import*")))
+
+    def test_identical_import_does_not_rewrite_or_advance_refresh_time(self):
+        with oauth.save_auth(self.home, self.auth):
+            pass
+        path = self.home / "secrets" / "codex_auth.age"
+        original = path.read_bytes()
+        candidate = synthetic_auth()
+        candidate["last_refresh"] = "2099-01-01T00:00:00Z"
+        with oauth.save_auth(self.home, candidate):
+            pass
+        self.assertEqual(path.read_bytes(), original)
+        self.assertFalse(list(path.parent.glob("*before-import*")))
+
+    def test_forward_update_is_retained_on_restart_and_old_export_is_rejected(self):
+        with oauth.save_auth(self.home, self.auth):
+            pass
+        with oauth.save_auth(self.home, refreshed_auth()):
+            pass
+        path = self.home / "secrets" / "codex_auth.age"
+        document = json.loads(oauth.decrypt(path.read_bytes(), FakeKey(self.home).read()))
+        self.assertEqual(json.loads(document["secrets"]["global/CODEX_AUTH"]), refreshed_auth())
+        with self.assertRaises(oauth.ImportError):
+            with oauth.save_auth(self.home, self.auth):
+                pass
+
+    def test_token_issue_time_can_order_exports_but_expiry_alone_cannot(self):
+        def with_claims(auth, **updates):
+            parts = auth["tokens"]["access_token"].split('.')
+            claims = oauth._jwt(auth["tokens"]["access_token"])
+            claims.update(updates)
+            parts[1] = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip('=')
+            auth["tokens"]["access_token"] = '.'.join(parts)
+            auth.pop("last_refresh", None)
+            return auth
+        old = with_claims(synthetic_auth(), iat=1750000000, exp=1750010000)
+        newer = with_claims(refreshed_auth(), iat=1750001000, exp=1750011000)
+        self.assertTrue(oauth.check_update(old, newer))
+        for candidate in (
+            with_claims(refreshed_auth(), iat=1750000000, exp=1750011000),
+            with_claims(refreshed_auth(), iat=1750001000, exp=1750009000),
+            with_claims(refreshed_auth(), iat=None, exp=1750011000),
+        ):
+            with self.assertRaises(oauth.ImportError):
+                oauth.check_update(old, candidate)
+
+    def test_update_cannot_cross_user_identity_or_use_future_refresh_timestamp(self):
+        changed_user = refreshed_auth()
+        parts = changed_user["tokens"]["id_token"].split('.')
+        claims = oauth._jwt(changed_user["tokens"]["id_token"])
+        claims["https://api.openai.com/auth"]["chatgpt_user_id"] = "other-user"
+        parts[1] = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip('=')
+        changed_user["tokens"]["id_token"] = '.'.join(parts)
+        future = refreshed_auth()
+        future["last_refresh"] = "2099-01-01T00:00:00Z"
+        for candidate in (changed_user, future):
+            with self.assertRaises(oauth.ImportError):
+                oauth.check_update(self.auth, candidate)
+
+    def test_external_change_during_encryption_is_not_overwritten(self):
+        with oauth.save_auth(self.home, self.auth):
+            pass
+        path = self.home / "secrets" / "codex_auth.age"
+        changed = b"synthetic-concurrent-official-ciphertext"
+        def concurrent_encrypt(raw, password):
+            path.write_bytes(changed)
+            return self.encrypt(raw, password, cost=10)
+        with patch.object(oauth, "encrypt", side_effect=concurrent_encrypt):
+            with self.assertRaisesRegex(oauth.ImportError, "changed during import"):
+                with oauth.save_auth(self.home, refreshed_auth()):
+                    pass
+        self.assertEqual(path.read_bytes(), changed)
+
+    def test_failed_verification_never_rolls_back_over_official_refresh(self):
+        # Cover both initial import and update: the new key must survive when
+        # the official client has saved newer ciphertext using that key.
+        for initial in (True, False):
+            home = self.root / ("initial" if initial else "updated")
+            home.mkdir()
+            if not initial:
+                with oauth.save_auth(home, self.auth):
+                    pass
+            path = home / "secrets" / "codex_auth.age"
+            with self.assertRaisesRegex(oauth.ImportError, "latest store retained"):
+                with oauth.save_auth(home, refreshed_auth()):
+                    password = FakeKey(home).read()
+                    document = json.loads(oauth.decrypt(path.read_bytes(), password))
+                    document["secrets"]["global/CODEX_AUTH"] = json.dumps({
+                        **refreshed_auth(), "last_refresh": "2026-09-17T02:00:00Z"})
+                    latest = oauth.encrypt(json.dumps(document).encode(), password)
+                    path.write_bytes(latest)
+                    raise RuntimeError("registry persistence failed")
+            self.assertEqual(path.read_bytes(), latest)
+            self.assertEqual(FakeKey(home).read(), password)
 
     def test_import_preview_reuse_explicit_update_and_failed_recognition(self):
         for key, value in {"HOME": self.root, "CODEX_HOME": self.root / ".codex-api",
@@ -226,6 +344,17 @@ class OAuthTests(unittest.TestCase):
             with patch.object(accounts, "profile_busy", return_value=True):
                 self.assertEqual(accounts.main([*args, "--update"], apiagent), 1)
             self.assertEqual(stored.read_bytes(), before)
+            # The official on-disk store, not importer metadata, determines
+            # which credentials are current after a refresh/restart.
+            self.file.write_text(json.dumps(refreshed_auth()))
+            self.assertEqual(accounts.main([*args, "--update"], apiagent), 0)
+            current = stored.read_bytes()
+            self.assertNotEqual(current, before)
+            self.file.write_bytes(source)
+            read.reset_mock()
+            self.assertEqual(accounts.main([*args, "--update"], apiagent), 1)
+            read.assert_not_called()
+            self.assertEqual(stored.read_bytes(), current)
             # A prior logout leaves registry identity metadata behind. Duplicate
             # import must not silently claim to have restored authentication.
             stored.unlink()

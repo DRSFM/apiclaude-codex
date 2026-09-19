@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
 import os
 import re
@@ -205,7 +206,26 @@ def validate_args(args: list[str]) -> None:
                 raise AccountError("Authentication/provider overrides are not allowed for account profiles.")
 
 
+def _auth_revision(home: Path) -> bytes | None:
+    """Opaque revision only, for detecting a refresh by another official client."""
+    try:
+        with (home / "secrets" / "codex_auth.age").open("rb") as stream:
+            raw = stream.read(2 * 1024 * 1024 + 4097)
+        return hashlib.sha256(raw).digest()
+    except OSError:
+        return None
+
+
 def read_account(home: Path, executable: str, *, refresh: bool = False) -> dict[str, Any] | None:
+    # Reload from the canonical home on every check. Serialize wrapper checks;
+    # this lock is not a lock on running official CLI/Desktop refresh workers.
+    with operation_lock(home / ".apicodex-auth.lock"):
+        return _read_account(home, executable, refresh=refresh)
+
+
+def _read_account(home: Path, executable: str, *, refresh: bool,
+                  retry_changed: bool = True) -> dict[str, Any] | None:
+    before = _auth_revision(home)
     try:
         with CodexAppServer(home, codex_command=executable,
                             extra_env=clean_environment(home)) as client:
@@ -215,9 +235,15 @@ def read_account(home: Path, executable: str, *, refresh: bool = False) -> dict[
             "refresh_token_reused", "refresh_token_expired", "refresh_token_invalid", "invalid_grant",
             "failed to decrypt secrets file",
         )):
+            after = _auth_revision(home)
+            if retry_changed and after is not None and after != before:
+                # A rotating token can be stale in one process while another
+                # has already saved its successor. Re-read once, without asking
+                # for another refresh, before declaring the login unusable.
+                return _read_account(home, executable, refresh=False, retry_changed=False)
             raise LoginRequired("Stored authentication is no longer usable; official login is required.",
                                 unreadable="failed to decrypt secrets file" in str(exc).lower()) from None
-        raise AccountError("Could not read account authentication; retry or use 'account login NAME'.") from None
+        raise AccountError("Could not read account authentication; credentials were retained. Retry when the service is available.") from None
     except OSError:
         raise AccountError("Could not start the official account authentication check.") from None
     account = result.get("account")
@@ -240,11 +266,14 @@ def login(profile: dict[str, Any], api: Any, *, device: bool = False) -> int:
     executable = api.find_codex_cli_executable(profile)
     if not executable:
         raise AccountError("Official Codex CLI was not found.")
+    # Running official clients own their refresh; do not ask a second process
+    # to refresh the same token chain merely to check an already open profile.
+    busy = profile_busy(profile, api)
     # account/read performs the official managed refresh when required. Never
     # destroy unreadable credentials to 'repair' an OAuth account with an API key.
     unreadable = False
     try:
-        account = read_account(home, executable, refresh=True)
+        account = read_account(home, executable, refresh=not busy)
     except LoginRequired as exc:
         account = None
         unreadable = exc.unreadable
@@ -252,7 +281,7 @@ def login(profile: dict[str, Any], api: Any, *, device: bool = False) -> int:
         print(f"Reusing ChatGPT login for '{profile['name']}' ({mask_identity(account.get('email', ''))}).")
         return 0
     args = ["login"] + (["--device-auth"] if device else [])
-    if profile_busy(profile, api):
+    if busy or profile_busy(profile, api):
         raise AccountError("Close this profile's sessions before replacing its unusable login.")
     encrypted = home / "secrets" / "codex_auth.age"
     if encrypted.is_file():
@@ -448,7 +477,7 @@ def main(args: list[str], api: Any) -> int:
         if args == ["add"]:
             from codex_account_menu import add_account
             return 0 if add_account(api) else 1
-        if args and args[0] in {"add", "model", "archive", "logout", "login", "import", "rename", "sync"} and not any(x in args for x in ("--help", "-h", "--dry-run")):
+        if args and args[0] in {"add", "model", "archive", "logout", "login", "import", "rename", "sync", "status"} and not any(x in args for x in ("--help", "-h", "--dry-run")):
             with operation_lock(api.CODEX_HOME / ".account-operation.lock"):
                 return _main(args, api)
         return _main(args, api)
@@ -499,6 +528,8 @@ def _main(args: list[str], api: Any) -> int:
         if ns.command == "login":
             return login(profile, api, device=ns.device_auth)
         if ns.command == "status":
+            if ns.refresh and profile_busy(profile, api):
+                raise AccountError("This profile is in use; its official client manages refresh. Use status without --refresh, or close its sessions first.")
             executable = api.find_codex_cli_executable(profile)
             if not executable:
                 raise AccountError("Official Codex CLI was not found.")

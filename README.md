@@ -107,6 +107,12 @@ the selected profile's stored authentication and let official Codex refresh it;
 they do not call login, inject API keys, or query an API provider's model list.
 The explicit `account login` command first asks official Codex to read/refresh
 cached authentication and opens the official login flow only when needed.
+While a managed CLI/Desktop session is running, login only reads the cache;
+that running official client owns refresh. `status --refresh` requires those
+sessions to be closed; ordinary `status` remains available. Wrapper account
+checks and management operations are serialized. If a permanent auth error
+coincides with changed official ciphertext, the check reloads once without
+requesting another refresh before reporting that login is required.
 For device authorization use `account login NAME --device-auth` (subject to
 account/workspace support). Temporary network errors do not clear stored auth
 or trigger a replacement login. Credentials use official `keyring` storage,
@@ -137,9 +143,28 @@ age-encrypted `secrets/codex_auth.age` and stores its passphrase in the Windows
 credential manager under the official path-derived identity. It verifies local
 readback and official Codex recognition before recording success, preserving
 unrelated secrets and backing up previous ciphertext for an explicit update.
-Failed verification or registry persistence restores the prior auth. The source
+Failed verification or registry persistence restores the prior auth only if
+the transaction's ciphertext/key are still current. If official Codex has
+written a newer store in the meantime, it is retained and a conflict is reported;
+check account status before retrying. The source
 file is never changed, registered as a startup source, or copied into the profile.
 Subsequent launches use the official refreshed credentials.
+
+The official store in each named account home is the sole credential source
+for both its CLI and Desktop. Explicit `--update` reads that latest store before
+writing: it rejects a different account/user, removal of a stored refresh token,
+and older or ambiguously ordered credentials. Ordering uses `last_refresh` or
+access-token issuance time, rejects time/expiry regressions, and never uses file
+mtime or expiry alone. These local checks do not validate tokens with the server.
+An identical token bundle is a no-op and cannot advance the stored refresh time.
+For exports without enough ordering information, use official `account login`
+instead of overwriting a usable login. `--dry-run` is only an export preview;
+it does not read the target credentials or certify that an update will be accepted.
+
+Imports still require managed sessions to be closed. Ciphertext/key revision
+checks detect intervening writes before replacement and rollback, but wrapper
+locks cannot coordinate unrelated clients that bypass the launcher. No second
+token database, periodic refresher, or Cockpit account-store integration is added.
 
 Reimporting an identity already recorded by this importer reuses its existing
 profile unless `--update` explicitly replaces that profile's login. Reuse does
@@ -149,8 +174,9 @@ Accounts
 created through browser login have no import identity marker; their existing
 profile also requires explicit `--update`. This is not live synchronization with
 Cockpit: refreshing the same copied account in both tools can invalidate an old
-refresh token. Use one active credential owner for that account; separate
-accounts remain independent. macOS supports official account login, while this
+refresh token. Use one active owner for each imported credential chain; separately
+authorized sessions are not the same copied chain. Accounts remain independent.
+macOS supports official account login, while this
 file-import adapter and Desktop launch currently support Windows only.
 
 ```powershell

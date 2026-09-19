@@ -158,6 +158,11 @@ def parse_file(path: Path, *, index: int | None = None) -> tuple[dict[str, Any],
         value = value[chosen]
     elif index is not None:
         raise ImportError("--index applies only to an account array.")
+    return parse_auth(value)
+
+
+def parse_auth(value: Any) -> tuple[dict[str, Any], dict[str, Any], str]:
+    """Normalize an in-memory snapshot; claims remain locally unverified."""
     if not isinstance(value, dict) or value.get("auth_mode") not in (None, "chatgpt") or value.get("OPENAI_API_KEY") or value.get("openai_api_key"):
         raise ImportError("Select a ChatGPT OAuth export, not an API key or agent identity export.")
     tokens = value.get("tokens", value)
@@ -207,6 +212,42 @@ def parse_file(path: Path, *, index: int | None = None) -> tuple[dict[str, Any],
     user_id = _clean(auth_claim.get("chatgpt_user_id") or auth_claim.get("user_id") or identity.get("sub"))
     fingerprint = hashlib.sha256((account_id + "\0" + user_id).encode()).hexdigest()
     return auth, preview, fingerprint
+
+
+def check_update(current: Any, incoming: dict[str, Any]) -> bool:
+    """Accept only an identifiable forward update; identical tokens are a no-op.
+
+    These are conservative local ordering checks, not server validation. Never
+    infer token generation from file mtime or access expiry alone.
+    """
+    old, _, old_identity = parse_auth(current)
+    new, _, new_identity = parse_auth(incoming)
+    if old_identity != new_identity:
+        raise ImportError("OAuth account identity differs from the stored login; use a separate profile or official login.")
+    if old["tokens"] == new["tokens"]:
+        return False
+    if old["tokens"]["refresh_token"] and not new["tokens"]["refresh_token"]:
+        raise ImportError("OAuth update would remove the stored refresh token; use a complete current export or official login.")
+    old_time = datetime.fromisoformat(old["last_refresh"]).timestamp()
+    new_time = datetime.fromisoformat(new["last_refresh"]).timestamp()
+    old_claims = _jwt(old["tokens"]["access_token"])
+    new_claims = _jwt(new["tokens"]["access_token"])
+    def number(claims: dict[str, Any], name: str) -> float | None:
+        value = claims.get(name)
+        return float(value) if type(value) in (int, float) and 0 < value < 253402300800 else None
+    old_issued, new_issued = number(old_claims, "iat"), number(new_claims, "iat")
+    old_expiry, new_expiry = number(old_claims, "exp"), number(new_claims, "exp")
+    regressed = (new_time > 0 and old_time > 0 and new_time < old_time) or any(
+        a is not None and b is not None and b < a
+        for a, b in ((old_issued, new_issued), (old_expiry, new_expiry))
+    )
+    newer = (new_time > old_time) or (
+        old_issued is not None and new_issued is not None and new_issued > old_issued
+    )
+    future = new_time > datetime.now(timezone.utc).timestamp() + 300
+    if regressed or not newer or future:
+        raise ImportError("OAuth export is older or cannot be proven newer than the stored login; retained current credentials. Use official login if needed.")
+    return True
 
 
 class WindowsKey:
@@ -278,9 +319,24 @@ def _atomic(path: Path, data: bytes) -> None:
         temp.unlink(missing_ok=True)
 
 
+def _snapshot(path: Path) -> bytes | None:
+    try:
+        with path.open("rb") as stream:
+            value = stream.read(MAX_BYTES + 4097)
+    except FileNotFoundError:
+        return None
+    if len(value) > MAX_BYTES + 4096:
+        raise ImportError("Authentication store is too large; nothing was replaced.")
+    return value
+
+
 @contextmanager
 def save_auth(home: Path, auth: dict[str, Any]) -> Iterator[None]:
-    """Commit on successful caller verification/registry save; roll back on error."""
+    """Update the latest official store; never roll back over a concurrent write.
+
+    Caller holds the account operation lock and excludes managed live sessions.
+    Snapshot checks detect external changes but cannot lock unrelated clients.
+    """
     _crypto()
     directory = home / "secrets"
     path = directory / "codex_auth.age"
@@ -291,10 +347,8 @@ def save_auth(home: Path, auth: dict[str, Any]) -> Iterator[None]:
     directory.mkdir(parents=True, exist_ok=True)
     key = WindowsKey(home)
     password = key.read()
-    original = None
-    if path.exists():
-        with path.open("rb") as stream:
-            original = stream.read(MAX_BYTES + 4097)
+    original = _snapshot(path)
+    if original is not None:
         if password is None:
             raise ImportError("Encrypted auth exists without its key; use official login recovery.")
     document: dict[str, Any] = {"version": 1, "secrets": {}}
@@ -307,6 +361,16 @@ def save_auth(home: Path, auth: dict[str, Any]) -> Iterator[None]:
                 raise ValueError()
         except (ValueError, TypeError):
             raise ImportError("Unsupported or unreadable existing auth store; nothing was replaced.") from None
+    current = document["secrets"].get("global/CODEX_AUTH")
+    if current is not None:
+        try:
+            current = json.loads(current)
+        except (ValueError, RecursionError):
+            raise ImportError("Unsupported existing login; use official login recovery.") from None
+        if not check_update(current, auth):
+            # Do not rewrite ciphertext or last_refresh for an identical export.
+            yield
+            return
     new_key = password is None
     if new_key and any(directory.glob("*.age")):
         raise ImportError("Other encrypted secrets exist without a key; refusing to replace their key.")
@@ -317,6 +381,8 @@ def save_auth(home: Path, auth: dict[str, Any]) -> Iterator[None]:
     encrypted = encrypt(plaintext, password)
     wrote = False
     try:
+        if _snapshot(path) != original or key.read() != (None if new_key else password):
+            raise ImportError("Authentication changed during import; retry using the latest stored credentials.")
         if new_key:
             key.write(password)
             if key.read() != password:
@@ -327,17 +393,24 @@ def save_auth(home: Path, auth: dict[str, Any]) -> Iterator[None]:
                 stream.write(original)
             if backup.read_bytes() != original:
                 raise ImportError("Encrypted authentication backup verification failed.")
+        if _snapshot(path) != original or key.read() != password:
+            raise ImportError("Authentication changed during import; latest credentials were retained.")
         _atomic(path, encrypted)
         wrote = True
         if decrypt(path.read_bytes(), password) != plaintext:
             raise ImportError("Encrypted authentication readback failed.")
         yield
     except BaseException:
+        # Official recognition may refresh credentials. Those bytes belong to
+        # the official client, even when the subsequent registry save fails.
+        same_key = key.read() == password
+        if wrote and (_snapshot(path) != encrypted or not same_key):
+            raise ImportError("Authentication changed during import; latest store retained instead of rolling back. Check account status before retrying.") from None
         if wrote:
             if original is None:
                 path.unlink(missing_ok=True)
             else:
                 _atomic(path, original)
-        if new_key:
+        if new_key and same_key and not any(directory.glob("*.age")):
             key.delete()
         raise
