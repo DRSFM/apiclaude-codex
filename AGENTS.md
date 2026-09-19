@@ -31,6 +31,13 @@
 
 ## 协作修改记录
 
+### 2026-09-19：委派控制器审查修补（非破坏性）
+
+- 修改简介：`codex_delegate_runtime` 读线程逐行容忍非 JSON 输出，事件队列满时丢最旧、保留最新（`dropped_events` 计数），不再因此断线；`codex_delegate.spawn` 对“启动失败且未创建线程”的记录允许同 request_id、同参数重试（旧归档目录保留，同秒重试目录加后缀），有线程的失败记录仍保持原样；`_turn` 未确认的 turn/start 改抛 `TurnUnconfirmed`，调用方不再把已记录的 `interrupted`/“显式恢复”状态覆盖成 `failed`；官方响应结构异常（KeyError/TypeError）按失败处理并释放账号租约，fork 响应异常回落到可见历史路径。
+- 修改原因：Claude Code 对未提交改动做 review，发现 request_id 重试与工具描述矛盾、一行杂散输出即断线、异常响应会让任务卡在 starting 并长期占用账号锁。均为异常路径，不改变正常路径行为、工具契约、记录格式或配置。
+- 验证情况：新增 4 个单测（同 request_id 重试与有线程失败保留、未确认首轮保留可恢复状态、异常响应释放租约、读线程容错与满队列保序）；完整 pytest 370 passed、16 skipped、218 subtests。未做真实账号实机验收。
+- 未处理：`account status` 持全局操作锁期间并发启动会快速失败（保守但安全，保持不变）；`check_update` 对非 ChatGPT 结构的既有 store 报错文案指向导入文件（仅在 API-key home 上做 OAuth `--update` 时出现，保持不变）。
+
 ### 2026-09-18：接入原版 Codex 跨账户子代理 MCP
 
 - 修改简介：新增 `apicodex delegate install/serve`，经官方 app-server 在独立订阅账号执行、追问、等待、中断与恢复；接入父会话归属、跨进程去重/账号锁、任务归档，并保留按来源独立的 MCP 配置。

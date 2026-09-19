@@ -240,6 +240,73 @@ class DelegateTests(unittest.TestCase):
         self.assertTrue(FakeClient.instances[-1].closed)
         self.assertTrue(Path(result['artifacts']).is_dir())
 
+    def test_failed_startup_without_thread_may_be_retried_under_same_request_id(self):
+        original = FakeClient.request
+        def fail_start(client, method, params, **kwargs):
+            if method == 'thread/start':
+                raise AppServerError('Synthetic start failure')
+            return original(client, method, params, **kwargs)
+        with patch.object(FakeClient, 'request', fail_start):
+            failed = self.spawn(context='none')
+        self.assertEqual(failed['status'], 'failed')
+        self.assertNotIn('threadId', failed)
+        with self.assertRaises(delegate.DelegateError):
+            self.manager.spawn(self.owner, message='Different task', request_id='task-1', context='none')
+        retried = self.spawn(context='none')
+        self.assertEqual(retried['status'], 'running')
+        self.assertEqual(retried['taskId'], failed['taskId'])
+        self.assertNotEqual(retried['artifacts'], failed['artifacts'])
+        self.assertTrue(Path(failed['artifacts']).is_dir())
+        self.assertEqual(len(self.manager.list_tasks(self.owner)['tasks']), 1)
+        FakeClient.instances[-1].complete()
+        self.manager.wait(self.owner, retried['taskId'], 0)
+        # A failure after the thread exists is retained, not re-run.
+        def fail_name(client, method, params, **kwargs):
+            if method == 'thread/name/set':
+                raise AppServerError('Synthetic name failure')
+            return original(client, method, params, **kwargs)
+        with patch.object(FakeClient, 'request', fail_name):
+            kept = self.manager.spawn(self.owner, message='x', request_id='task-2', context='none')
+        self.assertEqual(kept['status'], 'failed')
+        self.assertIn('threadId', kept)
+        self.assertEqual(self.manager.spawn(self.owner, message='x', request_id='task-2', context='none')['status'], 'failed')
+        self.assertEqual(len(FakeClient.instances), 3)
+
+    def test_unconfirmed_first_turn_keeps_retained_thread_state(self):
+        original = FakeClient.request
+        def fail_turn(client, method, params, **kwargs):
+            if method == 'turn/start':
+                raise AppServerError('Synthetic timeout')
+            return original(client, method, params, **kwargs)
+        with patch.object(FakeClient, 'request', fail_turn):
+            result = self.spawn(context='none')
+        self.assertEqual(result['status'], 'interrupted')
+        self.assertIn('explicitly resume', result['detail'])
+        self.assertIn('threadId', result)
+        self.assertTrue(FakeClient.instances[-1].closed)
+        resumed = self.manager.send_message(self.owner, result['taskId'], 'continue')
+        self.assertEqual(resumed['status'], 'running')
+        self.assertEqual(FakeClient.instances[-1].requests[0][0], 'thread/resume')
+
+    def test_malformed_official_response_fails_task_and_releases_lease(self):
+        with patch.object(FakeClient, 'request', return_value={}):
+            result = self.spawn(context='none')
+        self.assertEqual(result['status'], 'failed')
+        self.assertTrue(FakeClient.instances[-1].closed)
+        self.assertFalse(list((FakeClient.instances[-1].home / '.apicodex-runs').glob('*.json')))
+
+    def test_reader_survives_stray_output_and_keeps_newest_events_when_full(self):
+        lines = ['not json', json.dumps({'method': 'turn/started', 'params': {}})]
+        lines += [json.dumps({'method': 'item/completed', 'params': {'item': {'type': 'x', 'n': i}}}) for i in range(4100)]
+        lines.append(json.dumps({'method': 'turn/completed', 'params': {'turn': {'id': 't', 'status': 'completed'}}}))
+        client = DelegateClient(Path.cwd())
+        client._process = SimpleNamespace(stdout=io.StringIO('\n'.join(lines)), stdin=io.StringIO(), poll=lambda: None)
+        client._read_stdout()
+        events = client.drain()
+        self.assertEqual(events[-1]['method'], 'turn/completed')
+        self.assertEqual(len(events), 4096)
+        self.assertEqual(client.dropped_events, 6)
+
     def test_approval_is_attention_not_success(self):
         result = self.spawn(context='none')
         client = FakeClient.instances[-1]

@@ -16,6 +16,7 @@ class DelegateClient(CodexAppServer):
         self._pending_lock = threading.Lock()
         self._send_lock = threading.Lock()
         self.events: queue.Queue = queue.Queue(maxsize=4096)
+        self.dropped_events = 0
         self.dead = False
 
     def _send(self, message: dict[str, Any]) -> None:
@@ -28,7 +29,11 @@ class DelegateClient(CodexAppServer):
             for line in process.stdout:
                 if not line.strip():
                     continue
-                message = json.loads(line)
+                try:
+                    message = json.loads(line)
+                except ValueError:
+                    # One stray non-JSON line must not end the transport.
+                    continue
                 if not isinstance(message, dict):
                     continue
                 if 'method' in message:
@@ -41,19 +46,32 @@ class DelegateClient(CodexAppServer):
                             'requestMethod': str(message['method'])}}
                     if message.get('method') in {'item/completed', 'turn/started', 'turn/completed',
                                                  'delegate/needsAttention', 'error'}:
-                        self.events.put_nowait(message)
+                        self._queue_event(message)
                 elif 'id' in message:
                     with self._pending_lock:
                         waiter = self._pending.get(message['id'])
                     if waiter:
                         waiter.put(message)
-        except (OSError, ValueError, queue.Full, AppServerError):
+        except (OSError, ValueError, AppServerError):
             pass
         finally:
             self.dead = True
             with self._pending_lock:
                 for waiter in self._pending.values():
                     waiter.put(None)
+
+    def _queue_event(self, message: dict[str, Any]) -> None:
+        try:
+            self.events.put_nowait(message)
+        except queue.Full:
+            # Keep the newest events: turn/completed arrives last and decides
+            # the task status. Only this reader thread ever puts.
+            try:
+                self.events.get_nowait()
+            except queue.Empty:
+                pass
+            self.dropped_events += 1
+            self.events.put_nowait(message)
 
     def request(self, method: str, params: dict[str, Any], *, timeout=None) -> dict[str, Any]:
         if self.dead:

@@ -53,6 +53,10 @@ class DelegateError(ValueError):
     pass
 
 
+class TurnUnconfirmed(AppServerError):
+    """turn/start was not confirmed; _turn already recorded the retained thread."""
+
+
 def now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -254,7 +258,7 @@ class DelegateManager:
                         record['context'] = {'mode': 'official_fork', 'sourceThread': record['owner']}
                         record['actualModel'] = fork.get('model')
                         return fork['thread']['id'], ''
-                except (AppServerError, OSError, ValueError):
+                except (AppServerError, OSError, ValueError, KeyError, TypeError):
                     # Public history is already fully read; the result clearly
                     # identifies the compatible path used instead of a fork.
                     pass
@@ -292,6 +296,11 @@ class DelegateManager:
                 if old.record['owner'] == owner and old.record['requestId'] == request_id:
                     if old.record.get('requestSignature') != signature:
                         raise DelegateError('request_id is already associated with different task arguments.')
+                    # A startup failure that never created a thread has nothing
+                    # to continue; the same request may run again. Its record
+                    # is replaced and its artifact folder is kept.
+                    if old.record['status'] == 'failed' and not old.record.get('threadId') and old.client is None:
+                        break
                     return self.inspect(owner, old.record['taskId'])
             profile, work = self._profile(account), self._cwd(cwd)
             model = model or profile.get('model')
@@ -303,6 +312,11 @@ class DelegateManager:
                 f'_{short_account}_{model}_task-{task_id[:8]}')
             if not folder.resolve().is_relative_to(work):
                 raise DelegateError('Task artifacts must remain inside the enabled workspace.')
+            # A retry within the same second keeps the earlier folder untouched.
+            for attempt in range(2, 100):
+                if not folder.exists():
+                    break
+                folder = folder.with_name(f'{folder.name}-{attempt}')
             folder.mkdir(parents=True, exist_ok=False)
             record = {'taskId': task_id, 'requestId': request_id, 'owner': owner, 'accountId': profile['id'],
                       'requestSignature': signature,
@@ -322,7 +336,9 @@ class DelegateManager:
                 self._persist(task)
                 task.client.request('thread/name/set', {'threadId': record['threadId'], 'name': 'Delegated · ' + task_id[:8]})
                 self._turn(task, prefix + message)
-            except (AppServerError, accounts.AccountError, OSError, DelegateError) as exc:
+            except TurnUnconfirmed:
+                pass  # _turn recorded the retained thread and released the runtime.
+            except (AppServerError, accounts.AccountError, OSError, DelegateError, KeyError, TypeError) as exc:
                 record['status'], record['detail'] = 'failed', self._error(exc)
                 self._release(task)
                 self._persist(task)
@@ -341,13 +357,13 @@ class DelegateManager:
             args['effort'] = task.record['effort']
         try:
             result = task.client.request('turn/start', args)
-        except AppServerError:
+        except AppServerError as exc:
             # The server may have accepted the turn before a transport timeout.
             # Close this runtime and retain its thread; never issue a second turn.
             task.record.update(status='interrupted', detail='Turn start was not confirmed; inspect or explicitly resume the saved thread.')
             self._release(task)
             self._persist(task)
-            raise
+            raise TurnUnconfirmed(str(exc)) from None
         task.record['turnId'] = result['turn']['id']
         self._persist(task)
 
@@ -458,7 +474,9 @@ class DelegateManager:
                 # A different host may own this account; do not overwrite its
                 # live record with a local failed-resume status.
                 raise DelegateError(str(exc)) from None
-            except (AppServerError, OSError) as exc:
+            except TurnUnconfirmed:
+                raise DelegateError(task.record['detail']) from None
+            except (AppServerError, OSError, KeyError, TypeError) as exc:
                 task.record['detail'] = self._error(exc)
                 if task.record['status'] not in ACTIVE:
                     task.record['status'] = 'failed'
