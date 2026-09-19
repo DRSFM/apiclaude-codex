@@ -71,6 +71,16 @@ secret_auth_storage = false
         self.assertNotIn('secret_auth_storage', data['features'])
         self.assertTrue(data['features']['js_repl'])
 
+    def test_delegate_remains_bound_to_local_parent_home(self):
+        source = '[mcp_servers.apicodex_delegate]\ncommand = "source-only"\n\n[mcp_servers.shared]\ncommand = "shared"\n'
+        target = self.original + '\n[mcp_servers.apicodex_delegate]\ncommand = "local-parent"\n'
+        merged = resources.merge_config(target, source)
+        self.assertIn('local-parent', merged)
+        self.assertNotIn('source-only', merged)
+        self.assertIn('[mcp_servers.shared]', merged)
+        self.assertEqual(resources.merge_config(merged, source), merged)
+        self.assertNotIn('apicodex_delegate', resources.merge_config(self.original, source))
+
     def test_unclosed_multiline_value_is_rejected(self):
         with self.assertRaises(resources.ResourceError):
             resources.merge_config(self.original, 'notify = ["unfinished"\n')

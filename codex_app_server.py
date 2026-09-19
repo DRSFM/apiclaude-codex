@@ -180,11 +180,13 @@ class CodexAppServer:
         extra_env: dict[str, str] | None = None,
         codex_command: str = "codex",
         timeout: float = 30.0,
+        config_overrides: list[str] | None = None,
     ) -> None:
         self.codex_home = codex_home.resolve()
         self.extra_env = dict(extra_env or {})
         self.codex_command = codex_command
         self.timeout = timeout
+        self.config_overrides = list(config_overrides or [])
         self._process: subprocess.Popen[str] | None = None
         self._messages: queue.Queue[dict[str, Any] | BaseException | None] = queue.Queue()
         self._stderr: list[str] = []
@@ -225,6 +227,7 @@ class CodexAppServer:
                     "apps",
                     "--disable",
                     "plugins",
+                    *[arg for value in self.config_overrides for arg in ("-c", value)],
                 ],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,

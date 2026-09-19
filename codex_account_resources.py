@@ -15,7 +15,10 @@ import subprocess
 from typing import Any
 import uuid
 
-from codex_shared_config import _split_toml_dotted_key
+from codex_shared_config import (
+    _split_toml_dotted_key, extract_mcp_server_sections,
+    _remove_mcp_server_sections, append_toml_sections,
+)
 
 
 class ResourceError(ValueError):
@@ -178,6 +181,10 @@ def _feature_entries(block: str) -> dict[tuple[str, ...], str]:
 
 
 def merge_config(target: str, source: str) -> str:
+    # Delegation points at a particular parent home and must never be copied
+    # into a different account, or erased by ordinary resource synchronization.
+    local_delegate = extract_mcp_server_sections(target).get('apicodex_delegate')
+    source = _remove_mcp_server_sections(source, {'apicodex_delegate'})
     selected = []
     features: dict[tuple[str, ...], str] = {}
     for root, block in config_parts(source):
@@ -203,6 +210,8 @@ def merge_config(target: str, source: str) -> str:
     assignments = [p for p in all_parts if not p.lstrip().startswith("[")]
     tables = [p for p in all_parts if p.lstrip().startswith("[")]
     merged = "\n\n".join([*assignments, *tables]).rstrip() + "\n"
+    if local_delegate:
+        merged = append_toml_sections(merged, [local_delegate])
     try:
         import tomllib
     except ModuleNotFoundError:  # Python 3.10: lexical checks above remain available.

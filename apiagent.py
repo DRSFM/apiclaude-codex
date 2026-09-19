@@ -3215,6 +3215,9 @@ def codex_share_main(args: list[str]) -> int:
 
 
 def codex_main(args: list[str]) -> int:
+    if args and args[0] == "delegate":
+        from codex_delegate import main as delegate_main
+        return delegate_main(args[1:], sys.modules[__name__])
     if args and args[0] == "share":
         return codex_share_main(args[1:])
     if args and args[0] == "account":

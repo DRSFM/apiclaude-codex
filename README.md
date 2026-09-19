@@ -253,6 +253,68 @@ source. Do not recursively delete a junction or overwrite authentication data.
 Neither credentials, histories, databases nor plugin runtime/staging directories
 are linked to the default account.
 
+### Cross-account delegated tasks (local MCP)
+
+Keep the original Codex Desktop/CLI and let its model dispatch bounded tasks to
+a named ChatGPT account through the official app-server. No subscription-to-API
+proxy or custom Codex build is required. Credentials remain in each account's
+official home; ordinary official requests maintain them.
+
+```powershell
+apicodex delegate install --source-home "C:\Users\YOU\.codex-api\profiles\planning" --target-account execution --workspace "D:\project" --sandbox workspace-write --dry-run
+# Review the preview, then repeat without --dry-run.
+```
+
+The source can be an API profile or a named account home. Each source gets its
+own settings and config backup. Repeat `--workspace` / `--target-account` for
+additional explicit roots/accounts. Account resource synchronization preserves
+this source-owned MCP entry. Reload MCP tools or open a new session to activate;
+existing windows are not restarted. To disable it, set `enabled = false` in
+`[mcp_servers.apicodex_delegate]`; task histories and artifacts remain.
+
+By default, official MCP approval rules still apply to dispatch, follow-up and
+interruption. With `approval_policy = "never"`, those calls can be rejected
+before reaching the controller. After explicitly deciding to trust this local
+controller for its configured accounts/projects, add `--trust-tools` to install
+(preview with `--dry-run` first). It sets official per-tool `approval_mode =
+"approve"` only for `spawn`, `send_message` and `interrupt`; it does not change
+the worker sandbox or other tools' approval policies. Reinstall without that
+flag to remove this explicit trust. Do not relabel writes as read-only to avoid
+approval, and do not enable trust in response to a rejection without user consent.
+
+The model receives `list_accounts`, `spawn`, `list_tasks`, `wait`, `send_message`
+and `interrupt`. Pass the current project `cwd` when spawning, use a stable
+`request_id` for retries, and wait for a confirmed terminal status before final
+acceptance. Follow-ups resume the same official B thread/account. Only the
+parent thread identified by official MCP metadata can operate its tasks. One
+delegated task per target account may run at a time across controllers; no
+automatic account/model fallback occurs. A disconnected controller reports
+`detached`; continuation is blocked while another controller holds the account.
+
+`context=auto` tries official fork for eligible legacy sessions. Current
+paginated sessions use official `thread/read` to supply supported visible user,
+assistant and tool history as background to a new thread. The result reports
+the actual mode. Hidden reasoning is excluded from that adapter, and images or
+unsupported item types are not guaranteed equivalent. History above 1 MiB is
+rejected without truncation; use `context=none` with an explicit task in that
+case. This does not clone the native subagent UI or its complete internal state.
+
+The host fixes the sandbox at install time (`read-only` by default, or official
+`workspace-write`); it does **not** dynamically inherit the parent's current
+approval settings. Only configured project directories can be selected as cwd.
+Official workspace-write rules still govern filesystem writes, and shared MCP
+tools retain their own permissions. Interactive approval/input requests stop for
+attention instead of being approved by the controller. Apps/plugins are disabled
+in this initial worker runtime; connector parity is not claimed. Scope every
+task to the user's authorization; do not use delegation to raise permissions.
+
+Records are under `子代理任务/<date_time_account_model_task>/`: task input,
+visible execution log, result and status metadata, with a README index. They are
+local, not a guarantee that Desktop places the thread in its native subagent
+panel. Controller shutdown interrupts active workers and preserves resumable
+official histories. B's subscription must support the chosen model; inheriting
+context consumes B's own quota. Inspect failed/uncertain tasks before retrying.
+
 ### Optional two-line usage display
 
 [Token Tracker](https://github.com/stormzhang/token-tracker) can display colored
