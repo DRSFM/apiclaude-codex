@@ -31,6 +31,12 @@
 
 ## 协作修改记录
 
+### 2026-09-23：修复 ApiClaude 更新时误删终端代理
+
+- 修改简介：`apiclaude --up` 清理节点专用环境时保留终端的 HTTP(S) 代理变量，普通节点启动仍按原规则隔离代理；增加更新环境回归测试。
+- 修改原因：9 月 3 日远程代理整合后，代理变量进入通用清理列表，导致关闭 Clash TUN 时更新器直连下载站失败。
+- 验证情况：关闭 TUN 时已部署入口实测更新检查成功；仓库针对性测试 8 passed、4 subtests，完整测试 383 passed、16 skipped、235 subtests。
+
 ### 2026-09-19：委派控制器审查修补（非破坏性）
 
 - 修改简介：`codex_delegate_runtime` 读线程逐行容忍非 JSON 输出，事件队列满时丢最旧、保留最新（`dropped_events` 计数），不再因此断线；`codex_delegate.spawn` 对“启动失败且未创建线程”的记录允许同 request_id、同参数重试（旧归档目录保留，同秒重试目录加后缀），有线程的失败记录仍保持原样；`_turn` 未确认的 turn/start 改抛 `TurnUnconfirmed`，调用方不再把已记录的 `interrupted`/“显式恢复”状态覆盖成 `failed`；官方响应结构异常（KeyError/TypeError）按失败处理并释放账号租约，fork 响应异常回落到可见历史路径。

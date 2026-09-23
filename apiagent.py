@@ -164,6 +164,9 @@ CLAUDE_PROFILE_ENV = (
     "http_proxy",
     "https_proxy",
 )
+CLAUDE_UPDATE_ENV_REMOVE = tuple(
+    key for key in CLAUDE_PROFILE_ENV if key.lower() not in {"http_proxy", "https_proxy"}
+)
 
 
 def now_iso() -> str:
@@ -5415,7 +5418,7 @@ def upgrade_claude() -> int:
     return run_command(
         "claude",
         ["update"],
-        env_remove=CLAUDE_PROFILE_ENV,
+        env_remove=CLAUDE_UPDATE_ENV_REMOVE,
     )
 
 

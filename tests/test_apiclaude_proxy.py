@@ -105,6 +105,31 @@ class ApiClaudeProxyTests(unittest.TestCase):
                     self.assertIn("HTTP_PROXY", removed)
                     self.assertIn("HTTPS_PROXY", removed)
 
+    def test_update_keeps_terminal_proxy_and_drops_profile_environment(self) -> None:
+        proxy = "http://127.0.0.1:7897"
+        with (
+            patch.dict(
+                apiagent.os.environ,
+                {
+                    "HTTP_PROXY": proxy,
+                    "HTTPS_PROXY": proxy,
+                    "ANTHROPIC_API_KEY": "sk-test",
+                    "ANTHROPIC_BASE_URL": "https://relay.test",
+                },
+            ),
+            patch.object(apiagent.shutil, "which", return_value="claude.exe"),
+            patch.object(apiagent.subprocess, "run") as child,
+            redirect_stdout(io.StringIO()),
+        ):
+            child.return_value.returncode = 0
+            self.assertEqual(apiagent.claude_main(["--up"]), 0)
+
+        env = child.call_args.kwargs["env"]
+        self.assertEqual(env["HTTP_PROXY"], proxy)
+        self.assertEqual(env["HTTPS_PROXY"], proxy)
+        self.assertNotIn("ANTHROPIC_API_KEY", env)
+        self.assertNotIn("ANTHROPIC_BASE_URL", env)
+
     def test_vscode_launch_uses_the_same_proxy_environment(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
