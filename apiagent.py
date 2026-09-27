@@ -37,7 +37,9 @@ from codex_history_images import (
     default_state_root,
     repair_codex_history_images,
 )
-from codex_desktop_windows import label_codex_desktop_window
+from codex_desktop_windows import (
+    label_codex_desktop_window, needs_package_identity, start_packaged_codex_desktop,
+)
 from codex_vision_proxy import (
     VisionImage,
     VisionProxyError,
@@ -374,6 +376,9 @@ def start_detached_process(
         proc_env.pop(key, None)
     if env:
         proc_env.update(env)
+
+    if needs_package_identity(Path(exe)):
+        return start_packaged_codex_desktop(Path(exe), args, proc_env)
 
     creationflags = 0
     if os.name == "nt":

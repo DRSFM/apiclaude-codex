@@ -567,6 +567,15 @@ commands documented below read only its `config.toml`; they never copy account
 authentication or conversation state. The API key is passed only in the child
 process environment or login stdin and is not placed on the command line.
 Desktop launch is currently supported on Windows with the official ChatGPT app.
+For the installed MSIX app, PowerShell 7 activates a short-lived `pythonw.exe`
+helper in the registered package context. The helper transfers the filtered
+environment over a process-local pipe and verifies the new Desktop process's
+package identity, preserving `CODEX_HOME`, API credentials and profile arguments.
+This applies to default accounts, named accounts and normal API Desktop launches;
+unpackaged `APICODEX_DESKTOP_EXE` overrides keep the direct launch path. A package
+activation failure is reported rather than retried without identity. This uses
+Windows' [package-context activation utility](https://learn.microsoft.com/en-us/powershell/module/appx/invoke-commandindesktoppackage),
+not a modification to the official app. Use `apicodex --desktop` (with two hyphens).
 The launcher also keeps the API desktop in Codex coding mode, so the project
 menu includes local folders instead of falling back to ChatGPT cloud projects.
 The API profile's master key remains DPAPI-encrypted by this launcher. When the
