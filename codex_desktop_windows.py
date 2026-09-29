@@ -35,7 +35,19 @@ def needs_package_identity(executable: Path) -> bool:
 def start_packaged_codex_desktop(
     executable: Path, args: list[str], environment: dict[str, str],
 ) -> int:
-    return _start_in_package(executable, [str(executable), *args], environment)
+    result = _start_in_package(executable, [str(executable), *args], environment)
+    if result == 0 and not ensure_desktop_tray():
+        print("Warning: Desktop started, but independent tray menus could not be enabled.",
+              file=sys.stderr)
+    return result
+
+
+def ensure_desktop_tray() -> bool:
+    try:
+        from codex_desktop_tray import start
+        return start()
+    except (ImportError, OSError):
+        return False
 
 
 def _start_in_package(

@@ -438,6 +438,13 @@ apicodex.bat
 apiclaude.bat
 ```
 
+Keep the `.bat` launchers beside `apiagent.py` and all root-level Python modules.
+To update a repository installation, run `git pull --ff-only` in that repository.
+For a copied installation such as `C:\tools`, also copy the updated root-level
+`.py` files, including `codex_desktop_tray.py`, into the installation directory.
+The next `apicodex --desktop` launch enables independent profile tray icons.
+`apicodex --up` updates the official Codex CLI; it does not update this launcher.
+
 ## Codex Usage
 
 Add or update a Codex API profile with the guided setup:
@@ -862,6 +869,29 @@ Labeling matches the official executable and exact isolated Desktop data path;
 failure only produces a warning and never blocks launch. The integrated Dream
 Skin WPF launcher provides the unified tray menu and retains all existing skin,
 profile, and instance controls.
+
+On Windows, successful packaged Desktop launches also start a lightweight,
+single-instance tray helper. When several official Desktop processes are running,
+each receives its own official tray icon with its window/profile name as the
+tooltip. The official process still handles its Recent menu and Exit action.
+This includes the default account, named accounts, and API profiles and does not
+require Dream Skin. The helper verifies package identity, executable path,
+window ownership, and process creation time; it does not read credentials,
+modify the official application, or terminate Desktop processes. It restores
+the shared icon when only one instance remains, repairs icons after Explorer
+restarts, and exits shortly after the last Desktop closes.
+
+For already-running desktops, use `python codex_desktop_tray.py --start` from
+the launcher installation directory. `--status` reports the current icons;
+`--stop` stops only the helper and restores the shared official icon. Run this
+helper separately from the old Dream Skin tray bridge to avoid duplicate icons.
+
+The native callback used by this bridge was checked with Desktop 26.924.2738.0,
+including four simultaneous profiles and exiting a separate test instance while
+the other profiles stayed running.
+When investigating a future update, test menus and Exit in a disposable Desktop
+instance with an interactive Windows session. Icon registration alone does not
+verify menu behavior; avoid sending synthetic tray notifications to active chats.
 
 Run a specific profile:
 

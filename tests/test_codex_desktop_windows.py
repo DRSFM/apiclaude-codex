@@ -66,6 +66,7 @@ class DesktopWindowTests(unittest.TestCase):
             patch.object(desktop_windows.shutil, "which", return_value="pwsh.exe"),
             patch.object(Path, "is_file", return_value=True),
             patch.object(desktop_windows.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as run,
+            patch.object(desktop_windows, "ensure_desktop_tray", return_value=True),
         ):
             self.assertEqual(desktop_windows.start_packaged_codex_desktop(Path("ChatGPT.exe"), ["--test"], env), 0)
         self.assertNotIn("synthetic-secret", str(run.call_args.args))
