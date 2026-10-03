@@ -357,14 +357,17 @@ class DelegateManager:
             args['effort'] = task.record['effort']
         try:
             result = task.client.request('turn/start', args)
-        except AppServerError as exc:
+            turn_id = result['turn']['id']
+            if not isinstance(turn_id, str) or not turn_id:
+                raise AppServerError('Invalid turn start response.')
+        except (AppServerError, KeyError, TypeError) as exc:
             # The server may have accepted the turn before a transport timeout.
             # Close this runtime and retain its thread; never issue a second turn.
             task.record.update(status='interrupted', detail='Turn start was not confirmed; inspect or explicitly resume the saved thread.')
             self._release(task)
             self._persist(task)
             raise TurnUnconfirmed(str(exc)) from None
-        task.record['turnId'] = result['turn']['id']
+        task.record['turnId'] = turn_id
         self._persist(task)
 
     def _task(self, owner: str, task_id: str) -> Task:

@@ -12,6 +12,7 @@ older local tools:
 from __future__ import annotations
 
 import ast
+import copy
 import json
 import hashlib
 import os
@@ -243,6 +244,34 @@ def write_json_atomic(path: Path, data: Any) -> None:
     write_text_atomic(path, json.dumps(data, indent=2, ensure_ascii=False))
 
 
+def _claude_npm_command(executable: str, environment: dict[str, str]) -> list[str] | None:
+    """Use the installed npm target directly, so prompts never pass through cmd."""
+    shim = Path(executable)
+    if shim.name.lower() not in {"claude.cmd", "claude.bat"}:
+        return None
+    try:
+        with shim.open(encoding="utf-8-sig") as stream:
+            text = stream.read(65536).replace("/", "\\").lower()
+    except (OSError, UnicodeError):
+        return None
+    for relative in (
+        "node_modules/@anthropic-ai/claude-code/bin/claude.exe",
+        "node_modules/@anthropic-ai/claude-code/cli.js",
+    ):
+        if relative.replace("/", "\\").lower() not in text:
+            continue
+        target = shim.parent / relative
+        if not target.is_file():
+            continue
+        if target.suffix == ".exe":
+            return [str(target)]
+        node = shim.parent / "node.exe"
+        runtime = str(node) if node.is_file() else shutil.which("node", path=environment.get("PATH"))
+        if runtime and Path(runtime).suffix.lower() == ".exe":
+            return [runtime, str(target)]
+    return None
+
+
 def run_command(
     command: str,
     args: list[str],
@@ -280,11 +309,21 @@ def run_command(
 
     if os.name == "nt":
         if Path(exe).suffix.lower() in {".bat", ".cmd"}:
-            comspec = os.environ.get("ComSpec", "cmd.exe")
-            command_line = subprocess.list2cmdline([exe, *args])
-            cmd: list[str] | str = (
-                f"{subprocess.list2cmdline([comspec])} /d /s /c call {command_line}"
-            )
+            native = _claude_npm_command(exe, proc_env) if command == "claude" else None
+            if native:
+                cmd: list[str] | str = [*native, *args]
+            else:
+                # list2cmdline quotes for the C runtime, not cmd's expansion and
+                # CALL's second parsing pass. Unknown batch scripts cannot safely
+                # receive arbitrary prompts; fail before executing any of them.
+                if any(re.search(r'[&|<>^%!"()\r\n]', value) for value in args) or re.search(r'[%!^"\r\n]', exe):
+                    print("Error: shell-sensitive arguments require a native executable; refusing an unsafe batch launch.", file=sys.stderr)
+                    return 1
+                comspec = os.environ.get("ComSpec", "cmd.exe")
+                command_line = f'"{exe}"'
+                if args:
+                    command_line += " " + subprocess.list2cmdline(args)
+                cmd = f"{subprocess.list2cmdline([comspec])} /v:off /d /s /c call {command_line}"
         else:
             cmd = [exe, *args]
     else:
@@ -2746,18 +2785,41 @@ def remove_codex_profile(requested: str | None = None) -> int:
     if input(f"Unregister '{profile['name']}'? Type YES to confirm: ") != "YES":
         print("Cancelled.")
         return 0
-    save_codex_profiles([item for item in profiles if item.get("id") != profile.get("id")])
-    if profile.get("credentialId"):
-        SECRET_STORE.clear(profile["credentialId"])
-    if profile.get("home") != ".":
-        home = codex_profile_home(profile)
-        if home.exists():
+    home = codex_profile_home(profile)
+    archive_path: Path | None = None
+    try:
+        if profile.get("home") != "." and home.exists():
             CODEX_ARCHIVE_ROOT.mkdir(parents=True, exist_ok=True)
             archive_id = slugify(str(profile.get("id") or profile.get("name") or "profile"))
-            archive_path = CODEX_ARCHIVE_ROOT / f"{archive_id}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
-            shutil.move(str(home), str(archive_path))
-            print(f"Archived profile directory to {archive_path}")
-    else:
+            archive_name = f"{archive_id}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+            candidate = CODEX_ARCHIVE_ROOT / archive_name
+            suffix = 2
+            while candidate.exists():
+                candidate = CODEX_ARCHIVE_ROOT / f"{archive_name}-{suffix}"
+                suffix += 1
+            shutil.move(str(home), str(candidate))
+            archive_path = candidate
+        save_codex_profiles([item for item in profiles if item.get("id") != profile.get("id")])
+    except OSError as exc:
+        if archive_path is not None:
+            try:
+                if home.exists():
+                    raise OSError("The profile home was recreated by another process.")
+                shutil.move(str(archive_path), str(home))
+            except OSError:
+                print(f"Error: unregister failed; restore the retained archive at {archive_path} to {home}.", file=sys.stderr)
+                return 1
+        print(f"Error: failed to unregister profile; credentials retained: {exc}", file=sys.stderr)
+        return 1
+    if profile.get("credentialId"):
+        try:
+            SECRET_STORE.clear(profile["credentialId"])
+        except (OSError, SecureStoreError) as exc:
+            print(f"Error: profile unregistered, but credential cleanup failed: {exc}", file=sys.stderr)
+            return 1
+    if archive_path is not None:
+        print(f"Archived profile directory to {archive_path}")
+    elif profile.get("home") == ".":
         print(f"Root profile unregistered. Existing files under {CODEX_HOME} were left in place.")
     return 0
 
@@ -3602,18 +3664,82 @@ def codex_main(args: list[str]) -> int:
     )
 
 
-def load_claude_config() -> dict[str, Any]:
-    config = read_json(CLAUDE_CONFIG_PATH, {"nodes": {}, "current": None})
-    changed = migrate_claude_secrets(config, SECRET_STORE)
-    if migrate_claude_proxy_settings(config):
-        changed = True
-    if changed:
-        save_claude_config(config)
+class _ClaudeConfig(dict[str, Any]):
+    """An in-memory baseline; no tracking fields are added to the JSON format."""
+
+    def __init__(self, value: dict[str, Any]) -> None:
+        super().__init__(value)
+        self.baseline = copy.deepcopy(value)
+
+
+@contextmanager
+def _claude_config_lock() -> Iterator[None]:
+    from codex_accounts import AccountError, operation_lock
+
+    deadline = time.monotonic() + 5
+    with ExitStack() as stack:
+        while True:
+            try:
+                stack.enter_context(operation_lock(CLAUDE_CONFIG_PATH.with_suffix(".json.lock")))
+                break
+            except AccountError:
+                if time.monotonic() >= deadline:
+                    raise ValueError("Claude configuration is busy; retry when the other operation finishes.") from None
+                time.sleep(0.05)
+        yield
+
+
+def _read_claude_config() -> dict[str, Any]:
+    config = _read_json_object_strict(CLAUDE_CONFIG_PATH, missing_ok=True)
+    config.setdefault("nodes", {})
+    config.setdefault("current", None)
+    nodes = config.get("nodes")
+    if nodes is None:
+        config["nodes"] = {}
+    elif not isinstance(nodes, dict) or not all(isinstance(node, dict) for node in nodes.values()):
+        raise ValueError("Claude configuration nodes must contain objects; the file was retained.")
     return config
 
 
+def _merge_claude_edits(baseline: dict[str, Any], edited: dict[str, Any], current: dict[str, Any],
+                        path: tuple[str, ...] = ()) -> dict[str, Any]:
+    merged = copy.deepcopy(current)
+    missing = object()
+    for key in baseline.keys() | edited.keys():
+        previous, updated, latest = baseline.get(key, missing), edited.get(key, missing), current.get(key, missing)
+        if updated == previous:
+            continue
+        field = (*path, key)
+        if isinstance(previous, dict) and isinstance(updated, dict) and isinstance(latest, dict):
+            merged[key] = _merge_claude_edits(previous, updated, latest, field)
+            continue
+        launch_metadata = field == ("current",) or (len(field) == 3 and field[0] == "nodes" and field[-1] == "lastUsedAt")
+        if latest != previous and latest != updated and not launch_metadata:
+            raise ValueError("Claude configuration changed in another process; reload before applying this edit.")
+        if updated is missing:
+            merged.pop(key, None)
+        else:
+            merged[key] = copy.deepcopy(updated)
+    return merged
+
+
+def load_claude_config() -> dict[str, Any]:
+    with _claude_config_lock():
+        config = _read_claude_config()
+        changed = migrate_claude_secrets(config, SECRET_STORE)
+        if migrate_claude_proxy_settings(config):
+            changed = True
+        if changed:
+            write_json_atomic(CLAUDE_CONFIG_PATH, config)
+        return _ClaudeConfig(config)
+
+
 def save_claude_config(config: dict[str, Any]) -> None:
-    write_json(CLAUDE_CONFIG_PATH, config)
+    with _claude_config_lock():
+        updated = _merge_claude_edits(config.baseline, config, _read_claude_config()) if isinstance(config, _ClaudeConfig) else config
+        write_json_atomic(CLAUDE_CONFIG_PATH, updated)
+        if isinstance(config, _ClaudeConfig):
+            config.baseline = copy.deepcopy(dict(config))
 
 
 def claude_credential_id(name: str) -> str:
@@ -5919,12 +6045,16 @@ def apiagent_main(args: list[str]) -> int:
 
 
 def main() -> int:
-    invoked = Path(sys.argv[0]).stem.lower()
-    if invoked == "apicodex":
-        return codex_main(sys.argv[1:])
-    if invoked == "apiclaude":
-        return claude_main(sys.argv[1:])
-    return apiagent_main(sys.argv[1:])
+    try:
+        invoked = Path(sys.argv[0]).stem.lower()
+        if invoked == "apicodex":
+            return codex_main(sys.argv[1:])
+        if invoked == "apiclaude":
+            return claude_main(sys.argv[1:])
+        return apiagent_main(sys.argv[1:])
+    except (ValueError, OSError, SecureStoreError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

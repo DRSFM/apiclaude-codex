@@ -232,6 +232,28 @@ class DelegateTests(unittest.TestCase):
         self.assertNotIn(self.manager.inspect(self.owner, result['taskId'])['status'], delegate.ACTIVE)
         self.assertEqual(self.manager.spawn(self.owner, message='new', request_id='new', context='none')['status'], 'running')
 
+    def test_malformed_followup_turn_releases_runtime_and_remains_recoverable(self):
+        result = self.spawn(context='none')
+        FakeClient.instances[-1].complete()
+        self.manager.wait(self.owner, result['taskId'], 0)
+        original = FakeClient.request
+
+        def malformed(client, method, params, **kwargs):
+            if method == 'turn/start':
+                return {'turn': {}}
+            return original(client, method, params, **kwargs)
+
+        with patch.object(FakeClient, 'request', malformed):
+            with self.assertRaises(delegate.DelegateError):
+                self.manager.send_message(self.owner, result['taskId'], 'Follow up.')
+        task = self.manager.tasks[result['taskId']]
+        self.assertEqual(task.record['status'], 'interrupted')
+        self.assertIsNone(task.client)
+        self.assertIsNone(task.lease)
+        self.assertFalse(list((accounts.profile_home(self.profile, api) / '.apicodex-runs').glob('*.json')))
+        self.assertEqual(self.manager.interrupt(self.owner, result['taskId'])['status'], 'interrupted')
+        self.assertEqual(self.manager.send_message(self.owner, result['taskId'], 'Retry explicitly.')['status'], 'running')
+
     def test_runtime_failure_retains_record_redacts_error_and_releases_lease(self):
         with patch.object(FakeClient, 'request', side_effect=AppServerError('token=synthetic-secret')):
             result = self.spawn(context='none')

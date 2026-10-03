@@ -35,6 +35,26 @@ codex --version
 claude --version
 ```
 
+## CLI launch and configuration safety
+
+On Windows, recognized Claude npm shims launch their installed native executable
+or JavaScript entry directly, keeping prompt text out of `cmd`. Unknown batch
+launchers reject shell-sensitive arguments; use a native executable for arbitrary
+prompt text. Python's [batch-file security notes](https://docs.python.org/3/library/subprocess.html#security-considerations)
+and Microsoft's [cmd reference](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/cmd)
+describe why Windows batch arguments need separate handling.
+
+Claude configuration updates use a process lock and atomic file replacement.
+Independent edits are merged; conflicting edits to the same setting require
+reloading before retrying. An unreadable configuration is retained and reported,
+rather than treated as an empty node registry.
+
+Removing a Codex API Profile archives its directory before changing the registry
+or clearing its credential. A registry write failure restores the directory when
+the original path is still free; otherwise the retained archive is reported for
+manual recovery. Delegated turns with an unconfirmed or malformed start response
+release their runtime and account lease, retaining the thread for explicit retry.
+
 ## Named ChatGPT subscription accounts
 
 Running `apicodex` always offers `[0] Account login`, followed by numbered API
