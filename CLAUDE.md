@@ -15,7 +15,9 @@ apiagent / apicodex / apiclaude：为 Codex CLI 和 Claude Code 提供多 API Pr
 - `codex_history_images.py` — Desktop 历史图片自愈
 - `codex_app_server.py` — Codex app-server 交互
 - `codex_desktop_windows.py` — API Desktop 窗口标记
-- `tests/` — 单元测试；`tauri-app/`、`web/` — GUI 前端
+- `tests/` — CLI、会话共享及官方 Desktop 集成的单元测试
+
+节点和 Profile 管理统一使用 CLI；已弃用的 Web/Tauri 管理界面已移除。
 
 ## 协作规则（每次改动必做）
 
@@ -68,7 +70,7 @@ apiclaude 功能对齐 apicodex（详见 AGENTS.md 后续记录）：
    `CLAUDE_USER_DATA_DIR`、动态回环端口、独立本地令牌和隐藏 worker，窗口
    退出时自动回收对应桥。该路径不复用 `CLAUDE_CONFIG_DIR`，且 GPT
    协议转换仍属实验能力。
-5. Codex ↔ Claude Code 会话迁移（已完成，2026-07-31）：Web 迁移面板将
+5. Codex ↔ Claude Code 会话迁移（已完成，2026-07-31）：`apicodex share` 将
    Claude 节点纳入来源和目标；跨运行时只复制已清洗的可见问答与用户图片，
    Codex 目标继续经 app-server 创建独立线程，Claude 目标生成带新 UUID、
    父链和标题的独立 transcript，并通过目标节点的 `--resume` 继续。

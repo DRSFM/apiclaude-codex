@@ -62,9 +62,8 @@ Run ordinary `codex` to keep using the default official account. A named ChatGPT
 profile uses a separate `CODEX_HOME` under `~/.codex-api/accounts/<stable-id>`;
 its official Desktop window also uses a separate `~/.apicodex-desktop/<stable-id>`.
 The default account's credentials are never automatically copied or changed.
-This feature is managed through the CLI. The old Web/Tauri managers are not
-supported for subscription accounts; Tauri refuses a registry containing them
-before it can discard unfamiliar fields.
+Profiles and nodes are managed through the CLI. The retired Web and Tauri
+management interfaces have been removed.
 
 ```powershell
 apicodex account add planning --model gpt-6-astra
@@ -827,8 +826,8 @@ copies and the original source remain available.
 
 ### Codex ↔ Claude Code conversation migration
 
-The Web manager's **Conversation Migration** view also exposes every configured
-Claude Code node alongside Account Codex and ApiCodex Profiles. It supports
+The `apicodex share` CLI exposes every configured Claude Code node alongside
+Account Codex and ApiCodex Profiles. It supports
 Codex → Codex, Claude Code → Codex, Codex → Claude Code, and copies between
 distinct Claude Code nodes. Every operation publishes the cleaned visible
 history to the same protected local pool and creates a new target session ID;
