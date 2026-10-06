@@ -639,6 +639,13 @@ whether existing visual observations are sufficient and calls Gemini only when
 more visual evidence is needed. A replayed history image alone never triggers
 Gemini.
 
+When Codex TPS all-profile capture is explicitly active, the launcher preserves
+its local capture address after rebuilding the vision settings. This requires
+the TPS marker, a matching active recovery record, and a reachable loopback
+listener. A missing or inconsistent active capture blocks launch with a fixed
+error; stop and restore TPS capture, then start it again. Profiles without the
+TPS marker keep their existing launch behavior.
+
 Visual observations are cached by the ordered image IDs, focused question,
 Gemini model, and adapter prompt version. An identical inspection reuses the
 local text cache without uploading the image to Gemini or calling Gemini. A
