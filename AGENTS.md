@@ -1070,3 +1070,10 @@
 - 修改原因：DeepSeek 配置脚本直接写入账号态 `~/.codex`，导致账号端 Codex 被切到第三方 provider；需要把第三方上游迁移到 ApiCodex 隔离 Profile。
 - 安全说明：DeepSeek 密钥仅从当前用户环境变量读取并写入 DPAPI `SecureStore`，Profile 文件只保存非敏感 base URL、模型和凭据 ID；账号态回滚前已创建时间戳备份。
 - 验证情况：写入后读回账号态配置确认不再包含 `model_provider = "deepseek"`、`model_catalog_json` 或 `[model_providers.deepseek]`；读回 `profiles.json` 与 Profile `config.toml` 确认 `deepseek` Profile 存在，DPAPI 凭据可读取非空值。
+
+### 2026-10-06：图片转接启动兼容 Codex TPS 全 Profile 采集
+
+- 修改简介：图片运行时准备后，校验 TPS 显式标记、匹配的有效恢复记录及本机监听，将启动器刚重建的连接地址接回正在运行的采集器；普通 Profile 行为保留，异常使用固定英文提示，不输出配置值。
+- 修改原因：用户要求一次采集全部 Profile；图片功能每次启动会生成本机转接地址，覆盖已接入的 TPS 地址，导致该 Profile 漏采。
+- 验证情况：新增测试先复现 2 失败、1 通过，修复后 3 项全部通过；完整 pytest 395 passed、17 skipped；TPS 临时目录与真实本机监听集成通过，关闭后恢复上游并保留图片设置；Python 编译、git diff --check 通过。
+- 安全说明：仅处理已明确开启采集的 API Profile 连接字段；不读取或更改认证文件，不新增凭据存储或模型请求，不下载依赖，不重启用户客户端。

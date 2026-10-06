@@ -1617,6 +1617,58 @@ def ensure_codex_vision_worker(profile: dict[str, Any]) -> bool:
     return False
 
 
+def preserve_codex_tps_capture(profile: dict[str, Any]) -> bool:
+    """After our own vision rewrite, preserve an explicitly enabled local TPS relay."""
+    try:
+        home = codex_profile_home(profile).resolve()
+        config_path = home / "config.toml"
+        raw = config_path.read_text(encoding="utf-8-sig")
+        if not raw.startswith("# CODEX TPS PROFILES AUDIT "):
+            return True
+        marker = re.match(
+            r'\A# CODEX TPS PROFILES AUDIT ([a-f0-9]{32})\r?\n# CODEX TPS STATE ([^\r\n]+)\r?\n', raw
+        )
+        if marker is None:
+            raise ValueError
+        locator = json.loads(marker.group(2))
+        if not isinstance(locator, str) or not Path(locator).is_absolute():
+            raise ValueError
+        state_path = Path(locator)
+        if state_path.is_symlink() or state_path.stat().st_size > 2 * 1024 * 1024:
+            raise ValueError
+        saved = state_path.read_bytes()
+        state = json.loads(saved)
+        if not isinstance(state, dict) or state.get("schema_version") != 1 or state.get("token") != marker.group(1):
+            raise ValueError
+        if state.get("active") is False:
+            return True
+        if state.get("active") is not True or not isinstance(state.get("entries"), list):
+            raise ValueError
+        entries = [item for item in state["entries"] if isinstance(item, dict)
+                   and isinstance(item.get("home"), str) and Path(item["home"]).resolve() == home]
+        if len(entries) != 1:
+            raise ValueError
+        entry = entries[0]
+        if (entry.get("key_path") != ["model_providers", "apicodex", "base_url"]
+                or entry.get("upstream") != codex_vision_proxy_base_url(profile, on_demand=True)):
+            raise ValueError
+        endpoint = entry.get("endpoint")
+        if not isinstance(endpoint, str) or not re.fullmatch(r"http://127\.0\.0\.1:([0-9]{1,5})/v1", endpoint):
+            raise ValueError
+        port = urlparse(endpoint).port
+        if port is None or not 0 < port < 65536:
+            raise ValueError
+        with socket.create_connection(("127.0.0.1", port), timeout=1):
+            pass
+        if state_path.read_bytes() != saved or config_path.read_text(encoding="utf-8-sig") != raw:
+            raise ValueError
+        _replace_toml_key_in_section(config_path, "model_providers.apicodex", "base_url", toml_basic_string(endpoint))
+        return True
+    except (OSError, ValueError, UnicodeError, TypeError):
+        print("Error: TPS capture could not be preserved. Stop and restore TPS capture, then start it again.", file=sys.stderr)
+        return False
+
+
 def prepare_codex_vision_runtime(profile: dict[str, Any]) -> bool:
     if codex_vision_config(profile) is None:
         return True
@@ -1628,7 +1680,9 @@ def prepare_codex_vision_runtime(profile: dict[str, Any]) -> bool:
             file=sys.stderr,
         )
         return False
-    return ensure_codex_vision_worker(profile)
+    if not ensure_codex_vision_worker(profile):
+        return False
+    return preserve_codex_tps_capture(profile)
 
 
 def run_codex_vision_worker(requested: str) -> int:
