@@ -227,6 +227,7 @@ class MacOSSecureStoreTests(unittest.TestCase):
         self.assertEqual(
             run.call_args_list[1].kwargs["input"], f"{secret}\n{secret}\n"
         )
+        self.assertTrue(run.call_args_list[1].kwargs["start_new_session"])
 
 
 @unittest.skipUnless(sys.platform == "darwin", "macOS Keychain test")

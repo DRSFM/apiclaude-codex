@@ -144,6 +144,15 @@ CODEX_DESKTOP_ENV_REMOVE = CODEX_PARENT_CONTEXT_ENV + (
     "OPENAI_ORG_ID",
     "OPENAI_PROJECT_ID",
 )
+CODEX_API_ENV_REMOVE = CODEX_PARENT_CONTEXT_ENV + (
+    "CODEX_HOME",
+    "CODEX_API_KEY",
+    "CODEX_ACCESS_TOKEN",
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+    "OPENAI_ORG_ID",
+    "OPENAI_PROJECT_ID",
+)
 CLAUDE_PROFILE_ENV = (
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
@@ -665,7 +674,10 @@ def get_codex_secret(profile: dict[str, Any]) -> str:
     credential_id = profile.get("credentialId") or codex_credential_id(profile)
     value = clean_hidden_prefix(SECRET_STORE.get(credential_id))
     if not value or value == CODEX_API_AUTH_MARKER:
-        raise KeyError(f"Credential '{credential_id}' does not contain a valid API key")
+        raise SecureStoreError(
+            f"Credential '{credential_id}' does not contain a valid API key; "
+            "use --api-add to replace it explicitly"
+        )
     return value
 
 
@@ -2290,7 +2302,7 @@ def choose_codex_provider_model(models: list[str], default: str | None = None) -
     raise ValueError(f"model selection '{choice}' was not found")
 
 
-def ensure_codex_keyring_store(home: Path) -> None:
+def ensure_codex_keyring_store(home: Path, *, store: str = CODEX_AUTH_STORE) -> None:
     config_path = home / "config.toml"
     raw = config_path.read_text(encoding="utf-8-sig")
     newline = "\r\n" if "\r\n" in raw else "\n"
@@ -2308,7 +2320,7 @@ def ensure_codex_keyring_store(home: Path) -> None:
         for index, line in enumerate(lines[:first_table_index])
         if re.match(r"^\s*cli_auth_credentials_store\s*=", line)
     ]
-    replacement = f'cli_auth_credentials_store = "{CODEX_AUTH_STORE}"{newline}'
+    replacement = f'cli_auth_credentials_store = "{store}"{newline}'
     if key_indices:
         lines[key_indices[0]] = replacement
         for index in reversed(key_indices[1:]):
@@ -2317,7 +2329,44 @@ def ensure_codex_keyring_store(home: Path) -> None:
         lines.insert(first_table_index, replacement)
     updated = "".join(lines)
     if updated != raw:
-        config_path.write_text(updated, encoding="utf-8")
+        if sys.platform == "darwin" and store == "ephemeral":
+            backup = home / "config.before-macos-cli.toml"
+            try:
+                with backup.open("x", encoding="utf-8") as handle:
+                    handle.write(raw)
+            except FileExistsError:
+                pass
+        write_text_atomic(config_path, updated)
+
+
+def resolve_codex_api_key(
+    profile: dict[str, Any], profiles: list[dict[str, Any]]
+) -> str | None:
+    """Ask for a missing key; never replace a credential after a storage error."""
+    try:
+        return get_codex_secret(profile)
+    except SecureStoreError as exc:
+        print(
+            f"Error: could not read the saved API key for '{profile.get('name')}': {exc}. "
+            "The credential was retained; resolve the credential-store error and retry.",
+            file=sys.stderr,
+        )
+        return None
+    except KeyError:
+        print(f"Profile '{profile.get('name')}' has no saved API key yet.")
+    api_key = clean_hidden_prefix(getpass("API key: "))
+    if not api_key.strip():
+        print("Error: API key cannot be empty.", file=sys.stderr)
+        return None
+    credential_id = codex_credential_id(profile)
+    try:
+        SECRET_STORE.set(credential_id, api_key)
+    except SecureStoreError as exc:
+        print(f"Error: failed to save the API key: {exc}.", file=sys.stderr)
+        return None
+    profile["credentialId"] = credential_id
+    save_codex_profiles(profiles)
+    return api_key
 
 
 def ensure_codex_desktop_coding_mode(home: Path) -> None:
@@ -2847,6 +2896,13 @@ def configure_codex_custom_cli(requested: str | None = None) -> int:
 
 def upgrade_codex() -> int:
     """Update the standalone Codex CLI through the official installer."""
+    if os.name != "nt":
+        executable = find_official_codex_cli_executable()
+        if not executable:
+            print("Error: official Codex CLI was not found.", file=sys.stderr)
+            return 1
+        print("Updating Codex CLI...")
+        return run_command(executable, ["update"], env_remove=CODEX_API_ENV_REMOVE)
     if shutil.which("pwsh"):
         powershell = "pwsh"
     elif shutil.which("powershell"):
@@ -3551,6 +3607,15 @@ def codex_main(args: list[str]) -> int:
             file=sys.stderr,
         )
         return 1
+    codex_exe = find_codex_cli_executable(selected)
+    if not codex_exe:
+        print("Error: Codex CLI was not found.", file=sys.stderr)
+        return 1
+    if any(arg in {"--version", "-V", "--help", "-h"} for arg in pass_through):
+        return run_command(
+            codex_exe, pass_through,
+            env={"CODEX_HOME": str(home)}, env_remove=CODEX_API_ENV_REMOVE,
+        )
     if not (home / "config.toml").exists():
         write_codex_config(
             home,
@@ -3558,47 +3623,40 @@ def codex_main(args: list[str]) -> int:
             selected.get("model") or DEFAULT_CODEX_MODEL,
             selected.get("reasoningEffort") or DEFAULT_CODEX_REASONING_EFFORT,
         )
-    try:
-        api_key = get_codex_secret(selected)
-    except (KeyError, SecureStoreError):
-        print(f"Profile '{selected.get('name')}' has no saved API key yet.")
-        api_key = getpass("API key: ")
-        if not api_key.strip():
-            print("Error: API key cannot be empty.", file=sys.stderr)
-            return 1
-        credential_id = codex_credential_id(selected)
-        SECRET_STORE.set(credential_id, clean_hidden_prefix(api_key))
-        selected["credentialId"] = credential_id
-        save_codex_profiles(profiles)
+    api_key = resolve_codex_api_key(selected, profiles)
+    if api_key is None:
+        return 1
 
-    if not any(arg in {"--version", "-V", "--help", "-h"} for arg in pass_through):
-        auto_refresh_codex_models(selected)
+    auto_refresh_codex_models(selected)
     if not prepare_codex_vision_runtime(selected):
         return 1
     sync_codex_shared_mcp(profiles)
 
     add_current_project_trust(home)
     update_codex_last_used(selected)
-    codex_exe = find_codex_cli_executable(selected)
-    if not codex_exe:
-        print("Error: Codex CLI was not found.", file=sys.stderr)
-        return 1
+    if sys.platform == "darwin":
+        # The launcher owns the Keychain credential and passes it through the
+        # provider's env_key. Persist the memory-only official auth setting in
+        # this isolated profile instead of forcing embedded mode with -c.
+        try:
+            ensure_codex_keyring_store(home, store="ephemeral")
+        except OSError as exc:
+            print(f"Error: could not prepare the isolated CLI config: {exc}.", file=sys.stderr)
+            return 1
+        launch_args = pass_through
+    else:
+        launch_args = [
+            "-c", CODEX_EPHEMERAL_AUTH_OVERRIDE,
+            "--disable", "apps", "--disable", "plugins", *pass_through,
+        ]
     return run_command(
         codex_exe,
-        [
-            "-c",
-            CODEX_EPHEMERAL_AUTH_OVERRIDE,
-            "--disable",
-            "apps",
-            "--disable",
-            "plugins",
-            *pass_through,
-        ],
+        launch_args,
         env={
             "CODEX_HOME": str(home),
             "APICODEX_API_KEY": clean_hidden_prefix(api_key),
         },
-        env_remove=CODEX_PARENT_CONTEXT_ENV,
+        env_remove=CODEX_API_ENV_REMOVE,
     )
 
 

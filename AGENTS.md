@@ -31,6 +31,19 @@
 
 ## 协作修改记录
 
+### 2026-10-09：本地保存 macOS CLI 适配基线
+
+- 修改简介：按用户要求，将现有 Mac CLI、Keychain 修复及对应测试、说明保存为独立本地 Git 提交；后续聚焦 Desktop，Web/Tauri 不在本轮范围内。
+- 修改原因：在继续 Desktop 适配前保留可回溯的 CLI 工作快照。
+- 验证情况：隔离测试环境下专项 19 passed / 3 skipped / 4 subtests；完整 pytest 373 passed / 23 skipped / 225 subtests，14 个失败与此前记录的 Mac 基线一致；`git diff --check` 通过。本轮未重复真实模型请求，未推送远端。
+
+### 2026-10-09：恢复 macOS 原生 ApiCodex CLI 启动与钥匙串输入
+
+- 修改简介：macOS 钥匙串写入 helper 脱离控制终端，使用 stdin 保存密钥；区分凭据缺失与读取/冲突错误，后者保留凭据并停止启动。Mac API Profile 将官方临时认证设置持久化到隔离配置并保留原备份，正常启动原样透传参数；帮助/版本查询跳过凭据与运行期准备，Mac/Linux 更新调用官方 `codex update`，保留 Windows 安装及启动参数路径。
+- 修改原因：`security` 优先从控制终端读取导致重复的 password data 输入；读取异常此前被误认为缺少 API key。实机 anyrouter 新旧钥匙串值冲突，新值返回 401、旧值返回 200；恢复可用旧值并读回确认后清理旧条目，错误值仅保留在钥匙串备份。本机该节点旧默认模型不在当前列表中，保留配置备份后改用已实际验证的 `gpt-6-astra`。
+- 验证情况：真实 PTY 下临时 Keychain 条目新增、更新、读回、删除均无额外密码输入；原样 `apicodex` 默认菜单选择 anyrouter，官方 0.162.0 CLI 无强制嵌入模式警告，以默认 on-request 完整回复 `MAC_CLI_NATIVE_OK` 并退出码 0（上游繁忙时由官方重试后完成）。专项 19 passed / 3 skipped / 4 subtests；完整 pytest 373 passed / 23 skipped / 225 subtests，14 个失败与修改前 HEAD 在 Mac 上的基线一致，无新增失败；使用实体 TMPDIR 排除 macOS 临时目录软链接差异，`py_compile`、`git diff --check` 通过。
+- 安全说明：密钥仅经 SecureStore 和子进程环境/stdin 流转，无明文凭据文件、参数或日志；修复限本机 API Profile，配置与错误凭据保留备份，本轮范围为 CLI，Desktop 的 Mac 适配仍待后续处理。
+
 ### 2026-10-01：同步官方后台版本并恢复原样 Sol CLI 回复
 
 - 修改简介：确认旧后台无活跃或排队任务后，用官方 `app-server daemon update --from-cli --yes` 复用本机已安装的 0.159.3 包，将 wup 后台从 0.157.1 更新并重启为 0.159.3；未改运行源码，旧 release 保留，任务与验收留存在 `子代理任务/2026-10-01_135056_wup_GPT-6.1-Sol_正常CLI修复/`。

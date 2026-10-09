@@ -427,6 +427,22 @@ echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
 source ~/.zshrc
 ```
 
+On macOS, API keys stay in the login Keychain and are passed only to the selected
+official CLI through its provider environment. The isolated API profile uses
+`cli_auth_credentials_store = "ephemeral"`; its previous config is preserved as
+`config.before-macos-cli.toml`. Normal launches pass through your CLI arguments
+without forcing embedded mode. Help/version queries do not read API keys or
+start model refresh, vision workers, or MCP synchronization.
+
+Keychain writes use stdin without attaching the helper to the terminal, so
+adding or migrating a key does not ask you to type it again as “password data”.
+A Keychain access error or conflicting legacy credential stops the launch and
+preserves the credential instead of asking for a replacement API key. Use
+`apicodex --api-add --api-profile NAME` when you explicitly want to replace one.
+An older protected Keychain item may still require one macOS authorization during
+its first migration. `apicodex --up` uses the official CLI's `codex update` on
+macOS/Linux; the Windows installer remains unchanged.
+
 ## Install On Windows
 
 Put this repository somewhere stable, then put these `.bat` files in a folder on
