@@ -83,7 +83,7 @@ def registry_profiles(api: Any) -> list[dict[str, Any]]:
         raise AccountError("Could not read the account profile registry.") from None
 
 
-def environment_remove() -> tuple[str, ...]:
+def environment_remove(*, desktop: bool = False) -> tuple[str, ...]:
     # Start from the OS environment, not the calling API profile's auth/session.
     fixed = {
         "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_ORG_ID", "OPENAI_PROJECT_ID",
@@ -91,6 +91,9 @@ def environment_remove() -> tuple[str, ...]:
         "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
         "RUST_LOG", "RUST_BACKTRACE", "OTEL_EXPORTER_OTLP_HEADERS",
     }
+    if desktop and sys.platform == "darwin":
+        from codex_desktop_macos import environment_remove as macos_environment_remove
+        fixed.update(macos_environment_remove())
     return tuple(sorted(fixed | {k for k in os.environ if k.upper().startswith(
         ("CODEX_", "APICODEX_", "OPENAI_"))}))
 
@@ -111,7 +114,7 @@ def launch_default(args: list[str], api: Any, *, desktop: bool = False) -> int:
         if not executable or args:
             raise AccountError("Official Desktop was not found or received unsupported CLI arguments.")
         return api.start_detached_process(str(executable), [], env={"CODEX_HOME": str(home)},
-                                          env_remove=environment_remove())
+                                          env_remove=environment_remove(desktop=True))
     executable = api.find_official_codex_cli_executable()
     if not executable:
         raise AccountError("Official Codex CLI was not found.")
@@ -354,8 +357,8 @@ def _launch(profile: dict[str, Any], args: list[str], api: Any, *, desktop: bool
             return code
         sync_resources(profile, api)
         if desktop:
-            if os.name != "nt":
-                raise AccountError("Account Desktop launch is currently supported only on Windows.")
+            if os.name != "nt" and sys.platform != "darwin":
+                raise AccountError("Account Desktop launch supports Windows and macOS.")
             if args:
                 raise AccountError("Desktop does not accept CLI arguments; set the account default model instead.")
             executable = api.find_codex_desktop_executable()
@@ -364,13 +367,22 @@ def _launch(profile: dict[str, Any], args: list[str], api: Any, *, desktop: bool
             data = api.CODEX_DESKTOP_DATA_ROOT / str(profile["id"])
             if data.resolve() != data.absolute():
                 raise AccountError("Refusing a redirected Desktop directory.")
-            data.mkdir(parents=True, exist_ok=True)
+            data.mkdir(parents=True, exist_ok=True, mode=0o700)
+            environment = {"CODEX_HOME": str(home)}
+            if sys.platform == "darwin":
+                environment["CODEX_ELECTRON_USER_DATA_PATH"] = str(data)
             code = api.start_detached_process(str(executable), [f"--user-data-dir={data}"],
-                    env={"CODEX_HOME": str(home)}, env_remove=environment_remove())
+                    env=environment, env_remove=environment_remove(desktop=True))
             if code == 0:
                 with operation_lock(api.CODEX_HOME / ".account-operation.lock"):
                     api.update_codex_last_used(profile)
-                api.label_codex_desktop_window(data, str(profile["name"]), executable)
+                if os.name == "nt":
+                    api.label_codex_desktop_window(data, str(profile["name"]), executable)
+                elif sys.platform == "darwin":
+                    if not api.register_macos_codex_desktop(
+                        api.CODEX_DESKTOP_DATA_ROOT, data, str(profile["name"]), executable,
+                    ):
+                        print("Warning: Desktop started, but its menu bar label could not be enabled.", file=sys.stderr)
             return code
         executable = api.find_codex_cli_executable(profile)
         if not executable:

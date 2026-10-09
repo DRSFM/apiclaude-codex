@@ -40,6 +40,13 @@ from codex_history_images import (
 from codex_desktop_windows import (
     label_codex_desktop_window, needs_package_identity, start_packaged_codex_desktop,
 )
+from codex_desktop_macos import (
+    activate_process as activate_macos_codex_desktop,
+    bundle_executable as macos_codex_bundle_executable,
+    environment_remove as macos_codex_desktop_environment_remove,
+    find_executable as find_macos_codex_desktop_executable,
+)
+from codex_desktop_menubar import register_instance as register_macos_codex_desktop
 from codex_vision_proxy import (
     VisionImage,
     VisionProxyError,
@@ -389,13 +396,31 @@ def start_detached_process(
     if needs_package_identity(Path(exe)):
         return start_packaged_codex_desktop(Path(exe), args, proc_env)
 
+    macos_desktop = (
+        sys.platform == "darwin"
+        and macos_codex_bundle_executable(Path(exe).parent.parent.parent) == Path(exe)
+    )
     creationflags = 0
     if os.name == "nt":
         creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
         creationflags |= getattr(subprocess, "DETACHED_PROCESS", 0)
 
     try:
-        subprocess.Popen(
+        if macos_desktop and not args and not proc_env.get("CODEX_ELECTRON_USER_DATA_PATH"):
+            # Let LaunchServices activate the ordinary account app. Packaged
+            # macOS builds only acquire a process lock for explicit data paths.
+            command_args = ["/usr/bin/open", "-a", str(Path(exe).parent.parent.parent)]
+            if proc_env.get("CODEX_HOME"):
+                command_args += ["--env", f"CODEX_HOME={proc_env['CODEX_HOME']}"]
+            completed = subprocess.run(
+                command_args, env=proc_env, stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20,
+            )
+            if completed.returncode:
+                print("Error: could not activate Codex Desktop.", file=sys.stderr)
+                return 1
+            return 0
+        process = subprocess.Popen(
             [exe, *args],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
@@ -403,9 +428,20 @@ def start_detached_process(
             env=proc_env,
             close_fds=True,
             creationflags=creationflags,
+            **({"start_new_session": True} if macos_desktop else {}),
         )
+        if macos_desktop:
+            try:
+                code = process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                if not activate_macos_codex_desktop(process.pid):
+                    print("Warning: Desktop started, but its window could not be activated.", file=sys.stderr)
+                return 0
+            if code != 0:
+                print("Error: Codex Desktop exited during startup.", file=sys.stderr)
+                return 1
         return 0
-    except OSError as exc:
+    except (OSError, subprocess.TimeoutExpired) as exc:
         print(f"Error: failed to start {command}: {exc}", file=sys.stderr)
         return 1
 
@@ -2469,8 +2505,8 @@ def ensure_codex_keyring_auth(
     profile: dict[str, Any] | None = None,
 ) -> bool:
     """Sync one API profile's key into the selected Codex CLI keyring."""
-    if os.name != "nt":
-        print("Error: Codex keyring authentication requires Windows.", file=sys.stderr)
+    if os.name != "nt" and sys.platform != "darwin":
+        print("Error: Codex keyring authentication requires Windows or macOS.", file=sys.stderr)
         return False
     prepare_codex_desktop_profile(home, {})
     codex_exe = find_codex_cli_executable(profile)
@@ -2931,7 +2967,12 @@ def find_codex_desktop_executable() -> Path | None:
     override = clean_hidden_prefix(os.environ.get("APICODEX_DESKTOP_EXE", ""))
     if override:
         candidate = Path(override).expanduser()
+        if sys.platform == "darwin" and candidate.is_dir():
+            return macos_codex_bundle_executable(candidate)
         return candidate if candidate.is_file() else None
+
+    if sys.platform == "darwin":
+        return find_macos_codex_desktop_executable(HOME)
 
     if os.name != "nt":
         return None
@@ -2981,8 +3022,8 @@ def launch_codex_desktop(
     if selected.get("type") == "chatgpt":
         from codex_accounts import launch
         return launch(selected, [], sys.modules[__name__], desktop=True)
-    if os.name != "nt":
-        print("Error: --desktop is currently supported only on Windows.", file=sys.stderr)
+    if os.name != "nt" and sys.platform != "darwin":
+        print("Error: --desktop is supported on Windows and macOS.", file=sys.stderr)
         return 1
 
     home = codex_profile_home(selected)
@@ -2997,9 +3038,15 @@ def launch_codex_desktop(
     if not desktop_exe:
         print(
             "Error: the ChatGPT desktop app was not found. Install the official "
-            "Windows app or set APICODEX_DESKTOP_EXE.",
+            "app or set APICODEX_DESKTOP_EXE.",
             file=sys.stderr,
         )
+        return 1
+
+    profile_id = slugify(str(selected.get("id") or selected.get("name") or "default"))
+    desktop_data = CODEX_DESKTOP_DATA_ROOT / profile_id
+    if desktop_data.resolve() != desktop_data.absolute():
+        print("Error: refusing a redirected Desktop directory.", file=sys.stderr)
         return 1
 
     repair_codex_home_images(
@@ -3016,28 +3063,17 @@ def launch_codex_desktop(
             selected.get("reasoningEffort") or DEFAULT_CODEX_REASONING_EFFORT,
         )
 
-    try:
-        api_key = get_codex_secret(selected)
-    except (KeyError, SecureStoreError):
-        print(f"Profile '{selected.get('name')}' has no saved API key yet.")
-        api_key = getpass("API key: ")
-        if not api_key.strip():
-            print("Error: API key cannot be empty.", file=sys.stderr)
-            return 1
-        credential_id = codex_credential_id(selected)
-        SECRET_STORE.set(credential_id, clean_hidden_prefix(api_key))
-        selected["credentialId"] = credential_id
-        save_codex_profiles(profiles)
+    api_key = resolve_codex_api_key(selected, profiles)
+    if api_key is None:
+        return 1
 
     auto_refresh_codex_models(selected)
     if not prepare_codex_vision_runtime(selected):
         return 1
     sync_codex_shared_mcp(profiles)
 
-    profile_id = slugify(str(selected.get("id") or selected.get("name") or "default"))
     dream_skin_id = dream_skin_instance_id(selected)
-    desktop_data = CODEX_DESKTOP_DATA_ROOT / profile_id
-    desktop_data.mkdir(parents=True, exist_ok=True)
+    desktop_data.mkdir(parents=True, exist_ok=True, mode=0o700)
     if not ensure_codex_keyring_auth(home, api_key, selected):
         return 1
     add_current_project_trust(home)
@@ -3052,9 +3088,22 @@ def launch_codex_desktop(
         "CODEX_HOME": str(home),
         "APICODEX_API_KEY": clean_hidden_prefix(api_key),
     }
+    env_remove = CODEX_DESKTOP_ENV_REMOVE
+    if sys.platform == "darwin":
+        # The app overrides --user-data-dir and reloads the login-shell env.
+        # This variable both selects Electron storage and preserves CODEX_HOME.
+        launch_env["CODEX_ELECTRON_USER_DATA_PATH"] = str(desktop_data)
+        env_remove += macos_codex_desktop_environment_remove()
 
     def finish_launch(exit_code: int) -> int:
         if exit_code != 0:
+            return exit_code
+        if sys.platform == "darwin":
+            if not register_macos_codex_desktop(
+                CODEX_DESKTOP_DATA_ROOT, desktop_data,
+                str(selected.get("name") or selected.get("id") or profile_id), desktop_exe,
+            ):
+                print("Warning: Desktop started, but its menu bar label could not be enabled.", file=sys.stderr)
             return exit_code
         if not label_codex_desktop_window(
             desktop_data,
@@ -3071,7 +3120,7 @@ def launch_codex_desktop(
     dream_skin_script_value = clean_hidden_prefix(
         os.environ.get("APICODEX_DREAM_SKIN_SCRIPT", "")
     )
-    if dream_skin_script_value:
+    if dream_skin_script_value and os.name == "nt":
         dream_skin_script = Path(dream_skin_script_value).expanduser().resolve()
         if not dream_skin_script.is_file():
             print(
@@ -3131,7 +3180,7 @@ def launch_codex_desktop(
             command,
             args,
             env=launch_env,
-            env_remove=CODEX_DESKTOP_ENV_REMOVE,
+            env_remove=env_remove,
         )
     )
 
