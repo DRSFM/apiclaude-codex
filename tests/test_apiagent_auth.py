@@ -394,6 +394,7 @@ class ApiAgentAuthTests(KeychainIsolationMixin):
                 patch.object(apiagent, "select_codex_profile", return_value=profile),
                 patch.object(apiagent, "find_codex_desktop_executable", return_value=desktop_exe),
                 patch.object(apiagent, "ensure_codex_keyring_auth", return_value=True) as keyring,
+                patch.object(apiagent, "desktop_environment", return_value={"CODEX_CLI_PATH": "audit-entry.exe"}) as audit,
                 patch.object(apiagent, "update_codex_last_used"),
                 patch.object(apiagent, "add_current_project_trust"),
                 patch.object(apiagent, "start_detached_process", return_value=0) as start,
@@ -408,6 +409,8 @@ class ApiAgentAuthTests(KeychainIsolationMixin):
                 '{"account":"must-stay-untouched"}',
             )
             self.assertEqual(start.call_args.args[0], str(desktop_exe))
+            audit.assert_called_once_with(desktop_exe, codex_home / "profiles" / "relay")
+            self.assertEqual(start.call_args.kwargs["env"]["CODEX_CLI_PATH"], "audit-entry.exe")
             keyring.assert_called_once_with(
                 codex_home / "profiles" / "relay", "sk-test-secret", profile
             )
@@ -420,6 +423,7 @@ class ApiAgentAuthTests(KeychainIsolationMixin):
                 {
                     "CODEX_HOME": str(codex_home / "profiles" / "relay"),
                     "APICODEX_API_KEY": "sk-test-secret",
+                    "CODEX_CLI_PATH": "audit-entry.exe",
                 },
             )
             self.assertNotIn(

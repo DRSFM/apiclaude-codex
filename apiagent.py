@@ -48,6 +48,7 @@ from codex_desktop_macos import (
     find_executable as find_macos_codex_desktop_executable,
 )
 from codex_desktop_menubar import register_instance as register_macos_codex_desktop
+from codex_native_audit import desktop_environment, exec_environment, environment_remove as audit_environment_remove
 from codex_vision_proxy import (
     VisionImage,
     VisionProxyError,
@@ -143,7 +144,7 @@ CODEX_PARENT_CONTEXT_ENV = (
     "CODEX_SHELL",
     "CODEX_THREAD_ID",
 )
-CODEX_DESKTOP_ENV_REMOVE = CODEX_PARENT_CONTEXT_ENV + (
+CODEX_DESKTOP_ENV_REMOVE = CODEX_PARENT_CONTEXT_ENV + audit_environment_remove() + (
     "CODEX_HOME",
     "APICODEX_DREAM_SKIN_SCRIPT",
     "APICODEX_DREAM_SKIN_PORT",
@@ -152,7 +153,7 @@ CODEX_DESKTOP_ENV_REMOVE = CODEX_PARENT_CONTEXT_ENV + (
     "OPENAI_ORG_ID",
     "OPENAI_PROJECT_ID",
 )
-CODEX_API_ENV_REMOVE = CODEX_PARENT_CONTEXT_ENV + (
+CODEX_API_ENV_REMOVE = CODEX_PARENT_CONTEXT_ENV + audit_environment_remove() + (
     "CODEX_HOME",
     "CODEX_API_KEY",
     "CODEX_ACCESS_TOKEN",
@@ -3214,6 +3215,7 @@ def launch_codex_desktop(
         "CODEX_HOME": str(home),
         "APICODEX_API_KEY": clean_hidden_prefix(api_key),
     }
+    launch_env.update(desktop_environment(desktop_exe, home))
     env_remove = CODEX_DESKTOP_ENV_REMOVE
     if sys.platform == "darwin":
         # The app overrides --user-data-dir and reloads the login-shell env.
@@ -3824,12 +3826,14 @@ def codex_main(args: list[str]) -> int:
             "-c", CODEX_EPHEMERAL_AUTH_OVERRIDE,
             "--disable", "apps", "--disable", "plugins", *pass_through,
         ]
+    codex_exe, audit_env = exec_environment(codex_exe, launch_args, home)
     return run_command(
         codex_exe,
         launch_args,
         env={
             "CODEX_HOME": str(home),
             "APICODEX_API_KEY": clean_hidden_prefix(api_key),
+            **audit_env,
         },
         env_remove=CODEX_API_ENV_REMOVE,
     )

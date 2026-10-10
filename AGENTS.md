@@ -31,6 +31,19 @@
 
 ## 协作修改记录
 
+### 2026-10-10：本机 SFM 联合同步 TPS 日志只读方案
+
+- 修改简介：main 快进至 16d9d49，保存并恢复本地委派、额度保底改动及协作记录，账号连接采用远端官方直连规则；联合 TPS 恢复 10 个 API 旧采集地址，正常关闭旧后台，同步 C:/tools 全局运行模块。
+- 修改原因：本机仍运行旧 TPS 转发和旧启动器；需按用户确认的只读方案消除监控对账号/API 请求路由的依赖，并保留未提交的委派功能。
+- 验证情况：完整 pytest 423 passed、38 skipped、258 subtests；预加载 26 个 C:/tools 实际模块后专项 90 passed、1 skipped、38 subtests。TPS 完整测试 109 passed、6 subtests；13 份真实配置 features list 通过，监控启停及默认启动配置哈希不变，旧采集端口无监听。
+- 保存边界：本地改动完整保存在 joint-tps-readonly-20261010 Git stash，旧账号采集补丁仅保留在快照；7 个运行文件部署前备份至 C:/tools/backups/tps-readonly-joint-20261010-115728。未改认证或重启用户 Codex，未发送模型请求；本地修改未提交/推送。详细验收见 TPS 仓库 VALIDATION.md 本机 SFM 联合更新章节。
+- 后续正式接入：用户确认先修 Desktop 与 exec/e，普通交互 CLI 继续研究。新增 codex_native_audit.py，在内存过滤 HTTP/SSE/压缩 WebSocket 诊断并再次限制落盘字段；接入 API、具名账号及官方默认账号的 Windows 启动分支，TPS 自动发现各 home 的审计文件。Windows 入口保留参数和包身份、回收子进程，辅助客户端缺少收集上下文时退回原生程序；临时 shell 设置防止 TRACE 传给嵌套命令。写入或编译失败仅提示，连接不依赖 TPS。
+- 验证与部署：完整 pytest 447 passed、38 skipped、263 subtests，TPS 111 passed、6 subtests；预加载 C:/tools 实际模块的专项 117 passed、17 subtests。源码和安装副本各完成 API/具名账号/默认账号 exec 与同包 Desktop 内核的隔离请求，low 出站、high 回显及缺失回显均按预期显示，重开 TPS 仍可读，新增诊断无合成正文标记及原始收发负载。三个模块部署前备份至 C:/tools/backups/native-metadata-desktop-exec-20261010-162239；独立 Desktop 窗口启动成功，界面回复验证未完成。用户指出焦点干扰后停止 computer-use，精确清理测试进程，后续全用隐藏后台验证。未重启用户客户端或提交推送。
+- CLI 研究边界：TUI 原生文件日志会先落完整内容，remote 会改变 worktree/resume 等行为，OTel 默认事件还含工具输出片段且手册未列服务端 effort 回显。暂未发现同时满足必要字段和原生行为的接入方式；不启用这些替代路线，不调整 Windows 权限。现有客户端需由用户方便时通过 ApiCodex 重开，服务端未返回等级仍为无法审计。
+- 实际生产补证：只读发现用户新启动的 tiantiansub2api Desktop 已使用安装入口；48 个新增元数据事件关联 16 条回复，其中 14 条出站/回显 xhigh 一致，2 条缺少可靠出站为 unknown，读取错误 0。此项无请求发送或窗口操作；保留用户进程。真实 13 个连接字段均与恢复基线一致，12 份全文件哈希不变，一份在期间更新而未覆盖。
+- 发布范围：按用户要求将本轮 Desktop/exec 审计、启动接入与对应测试独立提交；此前委派、额度保底及个人 Skill 改动继续留在本机，不纳入本批发布。 按暂存内容导出的独立发布快照完整 pytest 435 passed、38 skipped、246 subtests；该结果排除本机未提交的委派测试。
+
+
 ### 2026-10-10：提交 Mac Desktop 适配与菜单栏方案
 
 - 修改简介：用户确认暂时采用单一菜单栏入口，整理 Codex Desktop 的 Mac 启动、实例隔离和节点菜单栏功能为独立提交；与此前 CLI 提交 `55bc1b8` 一并同步至 `origin/main`。

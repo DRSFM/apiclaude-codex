@@ -105,6 +105,36 @@ class AccountTests(unittest.TestCase):
         self.assertEqual(apiagent.find_profile(apiagent.load_codex_profiles(), 'work')['model'],
                          'gpt-5.6-sol')
 
+    def test_named_and_default_exec_forward_audit_context_without_changing_native_args(self):
+        profile = self.create()
+        home = apiagent.codex_profile_home(profile)
+        args = ['exec', '--json', '-']
+        for target in (home, self.root / '.codex'):
+            with patch.object(apiagent, 'find_codex_cli_executable', return_value='native.exe'), \
+                    patch.object(apiagent, 'find_official_codex_cli_executable', return_value='native.exe'), \
+                    patch.object(apiagent, 'exec_environment', return_value=('audit.exe', {'APICODEX_NATIVE_AUDIT_PROFILE': 'fixture'})) as prepare, \
+                    patch.object(apiagent, 'run_command', return_value=0) as run:
+                code = accounts.launch(profile, args, apiagent) if target == home else accounts.launch_default(args, apiagent)
+                self.assertEqual(code, 0)
+                prepare.assert_called_once_with('native.exe', args, target)
+                self.assertEqual(run.call_args.args, ('audit.exe', args))
+                self.assertEqual(run.call_args.kwargs['env']['CODEX_HOME'], str(target))
+                self.assertEqual(run.call_args.kwargs['env']['APICODEX_NATIVE_AUDIT_PROFILE'], 'fixture')
+
+    def test_named_and_default_desktop_forward_audit_context_to_isolated_launch(self):
+        profile = self.create()
+        home = apiagent.codex_profile_home(profile)
+        for target in (home, self.root / '.codex'):
+            with patch.object(apiagent, 'find_codex_desktop_executable', return_value=Path('ChatGPT.exe')), \
+                    patch.object(apiagent, 'desktop_environment', return_value={'CODEX_CLI_PATH': 'audit.exe'}) as prepare, \
+                    patch.object(apiagent, 'label_codex_desktop_window', return_value=True), \
+                    patch.object(apiagent, 'start_detached_process', return_value=0) as start:
+                code = accounts.launch(profile, [], apiagent, desktop=True) if target == home else accounts.launch_default([], apiagent, desktop=True)
+                self.assertEqual(code, 0)
+                prepare.assert_called_once_with(Path('ChatGPT.exe'), target)
+                self.assertEqual(start.call_args.kwargs['env']['CODEX_HOME'], str(target))
+                self.assertEqual(start.call_args.kwargs['env']['CODEX_CLI_PATH'], 'audit.exe')
+
     def test_account_selector_rejects_api_profile(self):
         apiagent.save_codex_profiles([{'id': 'api', 'name': 'api', 'home': 'profiles/api'}])
         self.assertEqual(apiagent.codex_main(['--account-profile', 'api']), 1)

@@ -113,12 +113,13 @@ def launch_default(args: list[str], api: Any, *, desktop: bool = False) -> int:
         executable = api.find_codex_desktop_executable()
         if not executable or args:
             raise AccountError("Official Desktop was not found or received unsupported CLI arguments.")
-        return api.start_detached_process(str(executable), [], env={"CODEX_HOME": str(home)},
+        return api.start_detached_process(str(executable), [], env={"CODEX_HOME": str(home), **api.desktop_environment(executable, home)},
                                           env_remove=environment_remove(desktop=True))
     executable = api.find_official_codex_cli_executable()
     if not executable:
         raise AccountError("Official Codex CLI was not found.")
-    return api.run_command(executable, args, env={"CODEX_HOME": str(home)}, env_remove=environment_remove())
+    executable, audit_env = api.exec_environment(executable, args, home)
+    return api.run_command(executable, args, env={"CODEX_HOME": str(home), **audit_env}, env_remove=environment_remove())
 
 
 def sync_resources(profile: dict[str, Any], api: Any, *, dry_run: bool = False) -> dict[str, Any]:
@@ -369,6 +370,7 @@ def _launch(profile: dict[str, Any], args: list[str], api: Any, *, desktop: bool
                 raise AccountError("Refusing a redirected Desktop directory.")
             data.mkdir(parents=True, exist_ok=True, mode=0o700)
             environment = {"CODEX_HOME": str(home)}
+            environment.update(api.desktop_environment(executable, home))
             if sys.platform == "darwin":
                 environment["CODEX_ELECTRON_USER_DATA_PATH"] = str(data)
             code = api.start_detached_process(str(executable), [f"--user-data-dir={data}"],
@@ -390,7 +392,8 @@ def _launch(profile: dict[str, Any], args: list[str], api: Any, *, desktop: bool
         api.add_current_project_trust(home)
         with operation_lock(api.CODEX_HOME / ".account-operation.lock"):
             api.update_codex_last_used(profile)
-        return api.run_command(executable, args, env={"CODEX_HOME": str(home)},
+        executable, audit_env = api.exec_environment(executable, args, home)
+        return api.run_command(executable, args, env={"CODEX_HOME": str(home), **audit_env},
                                env_remove=environment_remove())
     except (AccountError, OSError):
         # OS errors can include source paths; never echo raw auth/server errors.

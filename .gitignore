@@ -7,6 +7,7 @@ __pycache__/
 *.pyc
 .DS_Store
 /debug.log
+/native-audit/
 
 # Context management data (session-local, not committed)
 .ctx/

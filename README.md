@@ -69,6 +69,22 @@ session-log statistics, including named subscription accounts stored under
 retain their official connection route. API-key profiles now also use read-only
 session-log statistics. TPS never redirects either login mode through a monitor.
 
+On Windows, Desktop and non-interactive `exec` / `e` launched through ApiCodex
+also collect native reasoning audit metadata into each profile's
+`CODEX_HOME/audits/native-reasoning.jsonl`. TPS discovers these files automatically;
+closing or reopening TPS does not control requests or collection. The collector
+keeps only effort, model, time and correlation identifiers, without additional
+diagnostic prompt/response bodies or credentials. A missing server effort echo
+remains unknown. Reopen existing clients through ApiCodex after updating to enable
+collection for new replies. Interactive CLI behavior stays native; it does not
+enable full diagnostic files or automatically insert a remote backend.
+
+The Windows entry is compiled once with the system .NET compiler and cached in
+`native-audit/` beside the launcher. It uses the selected Desktop's bundled core
+and sibling sandbox helpers. If setup or metadata writing fails, the normal
+client path remains available with a warning. Auxiliary clients that inherit a
+cached entry without its audit launch context fall back to their native binary.
+
 Add profile offers browser login, device login, or an explicitly selected OAuth
 JSON file. It suggests the account email as the profile name; accept it or enter
 a short alias. Codex's account response exposes an email, not a separate public
