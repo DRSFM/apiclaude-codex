@@ -63,6 +63,12 @@ and `[a] Add profile`. The official entry launches ordinary Codex with `~/.codex
 it reuses the existing login and lets Codex handle authentication when needed.
 The same selection works with `apicodex --desktop`.
 
+For Codex TPS, every login selected through `[0] Account login` uses read-only
+session-log statistics, including named subscription accounts stored under
+`~/.codex-api/accounts/`. These launches bypass API capture preparation and
+retain their official connection route. API-key profiles now also use read-only
+session-log statistics. TPS never redirects either login mode through a monitor.
+
 Add profile offers browser login, device login, or an explicitly selected OAuth
 JSON file. It suggests the account email as the profile name; accept it or enter
 a short alias. Codex's account response exposes an email, not a separate public
@@ -658,12 +664,14 @@ whether existing visual observations are sufficient and calls Gemini only when
 more visual evidence is needed. A replayed history image alone never triggers
 Gemini.
 
-When Codex TPS all-profile capture is explicitly active, the launcher preserves
-its local capture address after rebuilding the vision settings. This requires
-the TPS marker, a matching active recovery record, and a reachable loopback
-listener. A missing or inconsistent active capture blocks launch with a fixed
-error; stop and restore TPS capture, then start it again. Profiles without the
-TPS marker keep their existing launch behavior.
+Codex TPS now reads session logs for both account and API profiles. Launching
+an API profile does not preserve a TPS relay or check its listening port. A
+complete legacy TPS marker is removed; an owned loopback capture route is
+restored from the registered API or vision route, without depending on a TPS
+recovery journal. User-edited direct routes are retained. Profiles without the
+marker keep their existing behavior, and the vision runtime remains independent
+of the TPS monitor. Malformed configuration still reports a fixed error without
+exposing values.
 
 Visual observations are cached by the ordered image IDs, focused question,
 Gemini model, and adapter prompt version. An identical inspection reuses the

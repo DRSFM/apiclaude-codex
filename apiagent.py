@@ -1618,7 +1618,7 @@ def ensure_codex_vision_worker(profile: dict[str, Any]) -> bool:
 
 
 def preserve_codex_tps_capture(profile: dict[str, Any]) -> bool:
-    """After our own vision rewrite, preserve an explicitly enabled local TPS relay."""
+    """Retire a legacy TPS override using the registered API/vision route."""
     try:
         home = codex_profile_home(profile).resolve()
         config_path = home / "config.toml"
@@ -1630,48 +1630,58 @@ def preserve_codex_tps_capture(profile: dict[str, Any]) -> bool:
         )
         if marker is None:
             raise ValueError
-        locator = json.loads(marker.group(2))
-        if not isinstance(locator, str) or not Path(locator).is_absolute():
+        upstream = codex_vision_proxy_base_url(profile, on_demand=True)
+        in_provider = False
+        values = []
+        for line in raw.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("["):
+                in_provider = stripped == "[model_providers.apicodex]"
+            elif in_provider and re.match(r"^base_url\s*=", stripped):
+                values.append(ast.literal_eval(stripped.split("=", 1)[1].strip()))
+        if len(values) != 1 or not isinstance(values[0], str):
             raise ValueError
-        state_path = Path(locator)
-        if state_path.is_symlink() or state_path.stat().st_size > 2 * 1024 * 1024:
-            raise ValueError
-        saved = state_path.read_bytes()
-        state = json.loads(saved)
-        if not isinstance(state, dict) or state.get("schema_version") != 1 or state.get("token") != marker.group(1):
-            raise ValueError
-        if state.get("active") is False:
-            return True
-        if state.get("active") is not True or not isinstance(state.get("entries"), list):
-            raise ValueError
-        entries = [item for item in state["entries"] if isinstance(item, dict)
-                   and isinstance(item.get("home"), str) and Path(item["home"]).resolve() == home]
-        if len(entries) != 1:
-            raise ValueError
-        entry = entries[0]
-        if (entry.get("key_path") != ["model_providers", "apicodex", "base_url"]
-                or entry.get("upstream") != codex_vision_proxy_base_url(profile, on_demand=True)):
-            raise ValueError
-        endpoint = entry.get("endpoint")
-        if not isinstance(endpoint, str) or not re.fullmatch(r"http://127\.0\.0\.1:([0-9]{1,5})/v1", endpoint):
-            raise ValueError
-        port = urlparse(endpoint).port
-        if port is None or not 0 < port < 65536:
-            raise ValueError
-        with socket.create_connection(("127.0.0.1", port), timeout=1):
+        legacy_endpoint = None
+        # A valid old journal helps distinguish a user-edited loopback URL.
+        # Missing/corrupt journals never block cleanup or supply an upstream.
+        try:
+            locator = json.loads(marker.group(2))
+            journal = Path(locator) if isinstance(locator, str) else None
+            if (journal and journal.is_absolute() and not journal.is_symlink()
+                    and journal.stat().st_size <= 2 * 1024 * 1024):
+                saved = json.loads(journal.read_bytes())
+                entries = saved.get('entries') if isinstance(saved, dict) else None
+                if saved.get('schema_version') == 1 and saved.get('token') == marker.group(1) and isinstance(entries, list):
+                    matches = [e for e in entries if isinstance(e, dict) and isinstance(e.get('home'), str)
+                               and Path(e['home']).resolve() == home
+                               and e.get('key_path') == ['model_providers', 'apicodex', 'base_url']]
+                    if len(matches) == 1 and isinstance(matches[0].get('endpoint'), str):
+                        candidate = matches[0]['endpoint']
+                        if re.fullmatch(r'http://127\.0\.0\.1:[0-9]{1,5}/v1', candidate):
+                            legacy_endpoint = candidate
+        except (OSError, ValueError, UnicodeError, TypeError, AttributeError):
             pass
-        if state_path.read_bytes() != saved or config_path.read_text(encoding="utf-8-sig") != raw:
+        if config_path.read_text(encoding="utf-8-sig") != raw:
             raise ValueError
-        _replace_toml_key_in_section(config_path, "model_providers.apicodex", "base_url", toml_basic_string(endpoint))
+        # TPS endpoints used this exact route shape. Keep user-edited direct URLs
+        # and the vision runtime's own route; no TPS listener is ever contacted.
+        if (re.fullmatch(r"http://127\.0\.0\.1:[0-9]{1,5}/v1", values[0])
+                and (legacy_endpoint is None or values[0] == legacy_endpoint)):
+            _replace_toml_key_in_section(config_path, "model_providers.apicodex", "base_url", toml_basic_string(upstream))
+        updated = config_path.read_text(encoding="utf-8-sig")
+        if not updated.startswith(marker.group(0)):
+            raise ValueError
+        write_text_atomic(config_path, updated[len(marker.group(0)):])
+        print("Warning: removed legacy TPS capture override; using normal API routing.", file=sys.stderr)
         return True
-    except (OSError, ValueError, UnicodeError, TypeError):
-        print("Error: TPS capture could not be preserved. Stop and restore TPS capture, then start it again.", file=sys.stderr)
+    except (OSError, ValueError, UnicodeError, TypeError, SyntaxError):
+        print("Error: legacy TPS override could not be restored; check the API config before launching.", file=sys.stderr)
         return False
 
 
 def prepare_codex_vision_runtime(profile: dict[str, Any]) -> bool:
     if codex_vision_config(profile) is None:
-        return True
+        return preserve_codex_tps_capture(profile)
     try:
         configure_codex_vision_files(profile, enabled=True)
     except (OSError, UnicodeError, ValueError) as exc:

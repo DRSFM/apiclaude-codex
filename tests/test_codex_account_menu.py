@@ -53,6 +53,7 @@ class AccountMenuTests(unittest.TestCase):
              patch.object(apiagent, 'find_official_codex_cli_executable', return_value='official-codex'), \
              patch.object(apiagent, 'run_command', return_value=0) as run, \
              patch.object(accounts, 'sync_resources', side_effect=AssertionError('default must not be synchronized')), \
+             patch.object(apiagent, 'prepare_codex_vision_runtime', side_effect=AssertionError('API audit preparation')), \
              patch.object(apiagent, 'get_codex_secret', side_effect=AssertionError('API key read')):
             self.assertEqual(apiagent.codex_main(['--resume']), 0)
         self.assertEqual(run.call_args.args, ('official-codex', ['--resume']))
@@ -63,10 +64,39 @@ class AccountMenuTests(unittest.TestCase):
     def test_default_desktop_has_no_profile_user_data_override(self):
         with patch('builtins.input', side_effect=['0', '1']), redirect_stdout(io.StringIO()), \
              patch.object(apiagent, 'find_codex_desktop_executable', return_value=Path('ChatGPT.exe')), \
+             patch.object(apiagent, 'prepare_codex_vision_runtime', side_effect=AssertionError('API audit preparation')), \
              patch.object(apiagent, 'start_detached_process', return_value=0) as start:
             self.assertEqual(apiagent.codex_main(['--desktop']), 0)
         self.assertEqual(start.call_args.args[1], [])
         self.assertEqual(start.call_args.kwargs['env']['CODEX_HOME'], str(self.root / '.codex'))
+
+    def test_zero_named_account_uses_account_route_without_api_audit_or_config_changes(self):
+        home = accounts.ensure_config(self.account, apiagent)
+        config = home / 'config.toml'
+        original = config.read_bytes()
+        for desktop in (False, True):
+            with self.subTest(desktop=desktop), \
+                 patch('builtins.input', side_effect=['0', '2']), redirect_stdout(io.StringIO()), \
+                 patch.object(accounts, 'sync_resources'), \
+                 patch.object(apiagent, 'add_current_project_trust'), \
+                 patch.object(apiagent, 'label_codex_desktop_window'), \
+                 patch.object(apiagent, 'find_codex_cli_executable', return_value='official-codex'), \
+                 patch.object(apiagent, 'find_codex_desktop_executable', return_value=Path('ChatGPT.exe')), \
+                 patch.object(apiagent, 'run_command', return_value=0) as run, \
+                 patch.object(apiagent, 'start_detached_process', return_value=0) as start, \
+                 patch.object(apiagent, 'prepare_codex_vision_runtime', side_effect=AssertionError('API audit preparation')), \
+                 patch.object(apiagent, 'get_codex_secret', side_effect=AssertionError('API key read')):
+                self.assertEqual(apiagent.codex_main(['--desktop'] if desktop else ['--resume']), 0)
+            launch = start if desktop else run
+            other = run if desktop else start
+            launch.assert_called_once()
+            other.assert_not_called()
+            self.assertEqual(launch.call_args.kwargs['env']['CODEX_HOME'], str(home))
+            self.assertIn('OPENAI_API_KEY', launch.call_args.kwargs['env_remove'])
+            self.assertIn('OPENAI_BASE_URL', launch.call_args.kwargs['env_remove'])
+            if not desktop:
+                self.assertEqual(run.call_args.args, ('official-codex', ['--resume']))
+            self.assertEqual(config.read_bytes(), original)
 
     def test_rename_retains_old_alias_home_and_credentials(self):
         home = accounts.ensure_config(self.account, apiagent)
