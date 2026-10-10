@@ -31,6 +31,39 @@
 
 ## 协作修改记录
 
+### 2026-10-10：提交 Mac Desktop 适配与菜单栏方案
+
+- 修改简介：用户确认暂时采用单一菜单栏入口，整理 Codex Desktop 的 Mac 启动、实例隔离和节点菜单栏功能为独立提交；与此前 CLI 提交 `55bc1b8` 一并同步至 `origin/main`。
+- 修改原因：按用户明确要求保存并推送当前成果；保留现有交互，不扩展为 Windows 式独立托盘图标，普通默认账号暂不加入节点菜单。
+- 验证情况：提交前完整 pytest 395 passed / 23 skipped / 227 subtests，13 个既有失败与上一轮一致，无新增失败；`git diff --check` 通过。远端 main 无新增提交；只提交源码、测试和说明，临时测试产物、运行状态及凭据未纳入 Git。
+
+### 2026-10-10：增加 Mac Desktop 节点菜单栏标识与实例切换
+
+- 修改简介：新增标准库 Python + 系统 JXA/AppKit 菜单栏 helper；API 与具名账号 Desktop 启动后自动登记节点，前台对应实例显示 `Codex (节点名)`，点击菜单切换窗口。单一管理进程通过文件锁去重，关闭实例后移除条目、全部关闭后退出；长名称只在菜单栏缩写，菜单保留完整名称。
+- 修改原因：用户选择系统菜单栏方案，以区分多个 Mac Desktop。官方应用没有实例标题配置，本机也未开放辅助功能权限；采用独立原生菜单，不修改应用包或开启正式实例调试端口。
+- 验证情况：新增 9 项菜单栏测试，相关测试 45 passed / 10 subtests；完整 pytest 395 passed / 23 skipped / 227 subtests，13 个既有失败无新增。真实原生菜单动作在两个临时 Desktop 间切换，前台 PID 与 `Codex (mac-test-a/b)` 同步变化；重复登记复用同一 helper，错误启动时间记录被拒绝，关闭窗口后条目及 helper 回收。正常 `apicodex --desktop --api-profile anyrouter` 已接入菜单且原 PID 32768 保持；编译检查、`git diff --check` 通过。
+- 安全说明：helper 仅接收名称、路径、PID 和启动时间等非敏感元数据；环境使用白名单，校验官方可执行文件、进程身份和实例锁后才切换。临时测试窗口、认证和 daemon 已清理，未触及普通账号认证或 Web/Tauri；更改仍留在工作区，未推送。
+
+### 2026-10-09：适配 Codex Desktop 的 macOS 启动与多实例隔离
+
+- 修改简介：按 `com.openai.codex` 识别 Mac `ChatGPT.app` / `Codex.app`，支持 `.app` 覆盖路径；API 与具名账号同时设置 Codex home 和 Electron 数据目录，清除父 Desktop 运行期环境，使用官方 Keychain 登录及按 PID 激活窗口。默认官方账号通过 macOS 激活已有应用；不在 Mac 调用 Windows 标题、托盘或皮肤脚本。凭据读取异常停止启动，拒绝重定向的数据目录，补充测试及 README。
+- 修改原因：原 Desktop 入口拒绝 Mac；新版应用会重设 `--user-data-dir`，且仅在显式 `CODEX_ELECTRON_USER_DATA_PATH` 下保留启动时的 `CODEX_HOME` 并启用独立实例锁。直接启动默认账号还可能重复打开普通应用。
+- 验证情况：macOS 26.6.2 arm64 / 官方 Desktop 26.1007.21159，独立临时实例通过真实 Desktop 输入框使用 anyrouter、6 Astra / 高，完整收到 `MAC_DESKTOP_OK`；两个实例的数据库和锁分别独立，重复启动复用原实例。正常 `apicodex --desktop --api-profile anyrouter` 不附加调试参数启动成功并保留运行。专项 55 passed / 14 subtests；全量 386 passed / 23 skipped / 227 subtests，原有失败从 14 降至 13、无新增；`py_compile` 与 `git diff --check` 通过。具名订阅账号验证限单元测试，未登录真实订阅账号。
+- 安全说明：真实密钥只经 SecureStore、子进程环境/stdin 和官方 Keychain 流转；测试 UI 调试端口仅限临时实例，测试应用、临时认证与对应 daemon 已关闭/清理。未改官方应用包、普通账号登录目录或 Web/Tauri；Claude Desktop 不在本轮范围。CLI 基线已独立提交为 `55bc1b8`，本轮 Desktop 改动留在工作区待审阅。
+
+### 2026-10-09：本地保存 macOS CLI 适配基线
+
+- 修改简介：按用户要求，将现有 Mac CLI、Keychain 修复及对应测试、说明保存为独立本地 Git 提交；后续聚焦 Desktop，Web/Tauri 不在本轮范围内。
+- 修改原因：在继续 Desktop 适配前保留可回溯的 CLI 工作快照。
+- 验证情况：隔离测试环境下专项 19 passed / 3 skipped / 4 subtests；完整 pytest 373 passed / 23 skipped / 225 subtests，14 个失败与此前记录的 Mac 基线一致；`git diff --check` 通过。本轮未重复真实模型请求，未推送远端。
+
+### 2026-10-09：恢复 macOS 原生 ApiCodex CLI 启动与钥匙串输入
+
+- 修改简介：macOS 钥匙串写入 helper 脱离控制终端，使用 stdin 保存密钥；区分凭据缺失与读取/冲突错误，后者保留凭据并停止启动。Mac API Profile 将官方临时认证设置持久化到隔离配置并保留原备份，正常启动原样透传参数；帮助/版本查询跳过凭据与运行期准备，Mac/Linux 更新调用官方 `codex update`，保留 Windows 安装及启动参数路径。
+- 修改原因：`security` 优先从控制终端读取导致重复的 password data 输入；读取异常此前被误认为缺少 API key。实机 anyrouter 新旧钥匙串值冲突，新值返回 401、旧值返回 200；恢复可用旧值并读回确认后清理旧条目，错误值仅保留在钥匙串备份。本机该节点旧默认模型不在当前列表中，保留配置备份后改用已实际验证的 `gpt-6-astra`。
+- 验证情况：真实 PTY 下临时 Keychain 条目新增、更新、读回、删除均无额外密码输入；原样 `apicodex` 默认菜单选择 anyrouter，官方 0.162.0 CLI 无强制嵌入模式警告，以默认 on-request 完整回复 `MAC_CLI_NATIVE_OK` 并退出码 0（上游繁忙时由官方重试后完成）。专项 19 passed / 3 skipped / 4 subtests；完整 pytest 373 passed / 23 skipped / 225 subtests，14 个失败与修改前 HEAD 在 Mac 上的基线一致，无新增失败；使用实体 TMPDIR 排除 macOS 临时目录软链接差异，`py_compile`、`git diff --check` 通过。
+- 安全说明：密钥仅经 SecureStore 和子进程环境/stdin 流转，无明文凭据文件、参数或日志；修复限本机 API Profile，配置与错误凭据保留备份，本轮范围为 CLI，Desktop 的 Mac 适配仍待后续处理。
+
 ### 2026-10-03：同步本机 npm 安装副本并核对全局入口
 
 - 修改简介：确认本机没有 `C:\tools`，持久 PATH 中三个主命令直接使用仓库；将 `C:\Users\神风默\AppData\Roaming\npm` 的备用安装同步为当前 23 个根目录 Python 模块及 3 个 CMD 入口，新增 7 个模块、更新 10 个文件。覆盖前的 19 个文件及 SHA-256 清单保存在 `C:\Users\神风默\AppData\Local\ApiAgent\backups\cli-20261003-202849`。
@@ -1098,3 +1131,10 @@
 - 修改原因：用户要求账号与 API 均不经过 TPS 转发，监控未启动或关闭不得影响 Codex 使用。
 - 验证情况：原专项 18 项通过后新增预期先复现 4 失败；修复后 TPS 兼容 9 项通过，完整 pytest 402 passed、17 skipped、28.93 秒，编译及 git diff --check 通过。TPS 侧 109 项通过，实机 13 个接管地址恢复、3 份账号配置不变，旧端口关闭；全局只读窗口启动前后 16 份配置哈希不变。
 - 安全说明：原图片运行时路由保留，不检查或操作账号认证、密钥、会话数据库；未下载依赖、发送模型探测、重启用户 Codex 或提交推送。
+
+### 2026-10-10：TPS 关闭验收并合并远端发布
+
+- 修改简介：保存日志只读兼容修复，保留本地既有提交及远端 Mac CLI/Desktop/菜单栏支持；协作记录冲突保留双方内容。
+- 修改原因：用户要求重开 AnyRouter Astra API 窗口、发送“你好”，确认 TPS 未启动时账号与 API 均可用，并推送远端。
+- 验证情况：AnyRouter Astra、默认官方账号和实际菜单 0 的官方账号共三次请求均收到完整回复，各次请求前后配置哈希不变；15 份完整配置在重启前后不变，AnyRouter 普通启动同步 MCP/通知/项目及界面设置，请求地址不变。旧采集 inactive、端口无监听。完整 pytest 411 passed、38 skipped，编译与 diff 检查通过；合并后发布两个仓库 main。
+- 安全说明：请求使用现有登录与 SecureStore，不打印或提交密钥；未退出当前官方账号主窗口，验证对话仅本机保存。

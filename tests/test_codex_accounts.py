@@ -79,6 +79,7 @@ class AccountTests(unittest.TestCase):
             patch.object(apiagent, 'find_codex_desktop_executable', return_value=Path('ChatGPT.exe')),
             patch.object(apiagent, 'start_detached_process', return_value=0) as start,
             patch.object(apiagent, 'label_codex_desktop_window', return_value=True),
+            patch.object(apiagent, 'register_macos_codex_desktop', return_value=True),
             patch.object(apiagent, 'ensure_codex_keyring_auth', side_effect=AssertionError('API login')),
         ):
             self.assertEqual(apiagent.codex_main(['--desktop', '--account-profile', 'work']), 0)

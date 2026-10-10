@@ -105,6 +105,10 @@ def _macos_security_tool_set(
         encoding="utf-8",
         capture_output=True,
         check=False,
+        # security's password prompt prefers /dev/tty over the supplied stdin.
+        # Detach only this helper so an interactive launcher never asks the
+        # user to type the already-saved API key again.
+        start_new_session=True,
     )
     if completed.returncode != 0:
         raise SecureStoreError(

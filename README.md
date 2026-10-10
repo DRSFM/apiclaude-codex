@@ -452,6 +452,22 @@ echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
 source ~/.zshrc
 ```
 
+On macOS, API keys stay in the login Keychain and are passed only to the selected
+official CLI through its provider environment. The isolated API profile uses
+`cli_auth_credentials_store = "ephemeral"`; its previous config is preserved as
+`config.before-macos-cli.toml`. Normal launches pass through your CLI arguments
+without forcing embedded mode. Help/version queries do not read API keys or
+start model refresh, vision workers, or MCP synchronization.
+
+Keychain writes use stdin without attaching the helper to the terminal, so
+adding or migrating a key does not ask you to type it again as “password data”.
+A Keychain access error or conflicting legacy credential stops the launch and
+preserves the credential instead of asking for a replacement API key. Use
+`apicodex --api-add --api-profile NAME` when you explicitly want to replace one.
+An older protected Keychain item may still require one macOS authorization during
+its first migration. `apicodex --up` uses the official CLI's `codex update` on
+macOS/Linux; the Windows installer remains unchanged.
+
 ## Install On Windows
 
 Put this repository somewhere stable, then put these `.bat` files in a folder on
@@ -466,7 +482,8 @@ apiclaude.bat
 Keep the `.bat` launchers beside `apiagent.py` and all root-level Python modules.
 To update a repository installation, run `git pull --ff-only` in that repository.
 For a copied installation such as `C:\tools`, also copy the updated root-level
-`.py` files, including `codex_desktop_tray.py`, into the installation directory.
+`.py` files, including `codex_desktop_tray.py`, `codex_desktop_macos.py` and
+`codex_desktop_menubar.py`, into the installation directory.
 The next `apicodex --desktop` launch enables independent profile tray icons.
 `apicodex --up` updates the official Codex CLI; it does not update this launcher.
 
@@ -598,7 +615,38 @@ the normal ChatGPT account-backed Codex home at `~/.codex`. The opt-in shared MC
 commands documented below read only its `config.toml`; they never copy account
 authentication or conversation state. The API key is passed only in the child
 process environment or login stdin and is not placed on the command line.
-Desktop launch is currently supported on Windows with the official ChatGPT app.
+Codex Desktop launch supports Windows and macOS with the official app.
+
+On macOS, the launcher discovers `ChatGPT.app` or `Codex.app` in
+`~/Applications` and `/Applications`, checking the `com.openai.codex` bundle
+identifier so it does not select ChatGPT Classic. `APICODEX_DESKTOP_EXE` can
+also point to the `.app` bundle or its executable. API and named account
+instances receive both `CODEX_HOME` and `CODEX_ELECTRON_USER_DATA_PATH`; the
+latter is required by current builds to preserve the selected home during
+login-shell environment loading and select independent Electron storage.
+Each profile has its own window lock, so different profiles can run together
+and reopening the same profile activates its existing instance. The default
+official account entry uses macOS app activation to reuse its ordinary window.
+Inherited parent Desktop runtime paths and Electron launch flags are cleared;
+credentials remain in process environment or login stdin. Windows window-title
+labeling, tray helpers and Dream Skin scripts do not run on Mac.
+
+Mac API and named-account Desktop launches automatically enable a native menu
+bar item. It shows `Codex (anyrouter)` when that node is the foreground app,
+and `Codex` while another app is active. Click it to select any registered,
+running instance; the current instance has a checkmark. Long names are shortened
+in the menu bar and shown in full in the menu. Closing an instance removes its
+entry, and closing all registered instances stops the menu helper. The menu's
+hide action hides only this indicator; launching a node again restores it.
+
+The helper uses macOS AppKit and the system JavaScript interpreter, without
+Accessibility permission, a debugging port, or changes to the official app.
+Its private `.apicodex-desktop/.menubar` records contain only display names,
+paths and process identity. It receives an allowlisted environment without API
+keys and validates each executable, process start time and instance lock before
+offering a switch. Reopening a running node also attaches the menu to an instance
+started before this update.
+
 For the installed MSIX app, PowerShell 7 activates a short-lived `pythonw.exe`
 helper in the registered package context. The helper transfers the filtered
 environment over a process-local pipe and verifies the new Desktop process's
@@ -610,10 +658,15 @@ Windows' [package-context activation utility](https://learn.microsoft.com/en-us/
 not a modification to the official app. Use `apicodex --desktop` (with two hyphens).
 The launcher also keeps the API desktop in Codex coding mode, so the project
 menu includes local folders instead of falling back to ChatGPT cloud projects.
-The API profile's master key remains DPAPI-encrypted by this launcher. When the
-desktop starts, it is synchronized through stdin into the official Codex
-Windows keyring for that isolated `CODEX_HOME`; no API key is placed on the
+The API profile's master key remains in this launcher's SecureStore (Windows
+DPAPI or macOS Keychain). When Desktop starts, it is synchronized through stdin
+into the official Codex keyring for that isolated `CODEX_HOME`; no API key is placed on the
 command line or written to plaintext `auth.json`.
+Mac CLI launches restore their existing memory-only authentication setting on
+the next CLI start. A credential-store error stops Desktop startup and retains
+the saved key. Named ChatGPT accounts reuse their own official authentication
+without API-key login. Claude Desktop's Mac adaptation is separate from this
+Codex support.
 
 ### Shared Skills And MCP Servers
 

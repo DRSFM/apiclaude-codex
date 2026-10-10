@@ -4,6 +4,7 @@ import io
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -291,7 +292,7 @@ class ApiAgentAuthTests(KeychainIsolationMixin):
             profile = {"id": "relay", "credentialId": "codex:relay"}
 
             with patch.object(apiagent, "SECRET_STORE", store):
-                with self.assertRaises(KeyError):
+                with self.assertRaises(apiagent.SecureStoreError):
                     apiagent.get_codex_secret(profile)
 
     @unittest.skipUnless(__import__("os").name == "nt", "Windows keyring test")
@@ -643,6 +644,7 @@ class ApiAgentAuthTests(KeychainIsolationMixin):
 
     def test_codex_upgrade_invokes_official_installer(self) -> None:
         with (
+            patch.object(apiagent.os, "name", "nt"),
             patch.object(apiagent.shutil, "which", return_value="pwsh"),
             patch.object(apiagent, "run_command", return_value=0) as run,
         ):
@@ -1143,7 +1145,7 @@ class ApiAgentAuthTests(KeychainIsolationMixin):
         self.assertEqual(code, 0)
         self.assertEqual(
             run.call_args.args[1],
-            [
+            (["--model", "one-shot-model"] if sys.platform == "darwin" else [
                 "-c",
                 'cli_auth_credentials_store="ephemeral"',
                 "--disable",
@@ -1152,7 +1154,7 @@ class ApiAgentAuthTests(KeychainIsolationMixin):
                 "plugins",
                 "--model",
                 "one-shot-model",
-            ],
+            ]),
         )
 
     def test_api_add_rejects_unsafe_existing_home_before_secret_or_config_writes(self) -> None:
@@ -1396,20 +1398,19 @@ class ApiAgentAuthTests(KeychainIsolationMixin):
                 patch.object(apiagent, "add_current_project_trust"),
                 patch.object(apiagent, "run_command", return_value=0) as run,
             ):
-                code = apiagent.codex_main(["--api-profile", "relay", "--version"])
+                code = apiagent.codex_main(["--api-profile", "relay"])
 
             self.assertEqual(code, 0)
             self.assertEqual(
                 run.call_args.args[1],
-                [
+                ([] if sys.platform == "darwin" else [
                     "-c",
                     'cli_auth_credentials_store="ephemeral"',
                     "--disable",
                     "apps",
                     "--disable",
                     "plugins",
-                    "--version",
-                ],
+                ]),
             )
             self.assertNotIn("sk-test-secret", " ".join(run.call_args.args[1]))
             self.assertEqual(
@@ -1418,12 +1419,7 @@ class ApiAgentAuthTests(KeychainIsolationMixin):
             )
             self.assertEqual(
                 set(run.call_args.kwargs["env_remove"]),
-                {
-                    "CODEX_INTERNAL_ORIGINATOR_OVERRIDE",
-                    "CODEX_PERMISSION_PROFILE",
-                    "CODEX_SHELL",
-                    "CODEX_THREAD_ID",
-                },
+                set(apiagent.CODEX_API_ENV_REMOVE),
             )
 
     def test_run_command_can_remove_parent_environment_keys(self) -> None:
@@ -1853,7 +1849,7 @@ class ApiAgentAuthTests(KeychainIsolationMixin):
         self.assertEqual(code, 0)
         vision.assert_called_once_with(["status"])
 
-    def test_configured_vision_profile_starts_worker_before_codex(self) -> None:
+    def test_codex_version_does_not_start_configured_vision_worker(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             api_root = root / ".codex-api"
@@ -1895,7 +1891,7 @@ class ApiAgentAuthTests(KeychainIsolationMixin):
                 )
 
             self.assertEqual(code, 0)
-            ensure.assert_called_once_with(profile)
+            ensure.assert_not_called()
             run.assert_called_once()
 
     def test_vision_worker_spawn_command_contains_no_api_keys(self) -> None:
