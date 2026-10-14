@@ -85,6 +85,16 @@ secret_auth_storage = false
         with self.assertRaises(resources.ResourceError):
             resources.merge_config(self.original, 'notify = ["unfinished"\n')
 
+    def test_desktop_generated_node_repl_stays_account_local(self):
+        source = '[mcp_servers.node_repl]\ncommand = "default-runtime"\nenv = { NODE_REPL_TRUSTED_CODE_PATHS = "default-home" }\n'
+        target = self.original + '\n[mcp_servers.node_repl]\ncommand = "account-runtime"\n[mcp_servers.node_repl.env]\nNODE_REPL_TRUSTED_CODE_PATHS = "account-home"\n'
+        merged = resources.merge_config(target, source)
+        self.assertIn('account-runtime', merged)
+        self.assertIn('account-home', merged)
+        self.assertNotIn('default-runtime', merged)
+        self.assertEqual(resources.merge_config(merged, source), merged)
+        self.assertNotIn('node_repl', resources.merge_config(self.original, source))
+
     def test_inline_quoted_and_dotted_auth_feature_cannot_disable_encryption(self):
         for source in (
             'features = { secret_auth_storage = false, js_repl = true }',
@@ -234,7 +244,7 @@ description = """multi
         self.assertEqual((self.home / 'config.toml').read_text(), self.original)
 
     @unittest.skipUnless(os.name == 'nt', 'Windows backup path length regression')
-    def test_plugin_cache_backup_preserves_deep_package_paths(self):
+    def test_local_plugin_cache_preserves_deep_package_paths(self):
         self.assertEqual(self.root.parent.resolve(), Path(tempfile.gettempdir()).resolve())
         self.addCleanup(shutil.rmtree, '\\\\?\\' + str(self.root))
         cache = self.home / 'plugins' / 'cache'
@@ -248,13 +258,10 @@ description = """multi
         relative = sentinel.relative_to(cache)
         report = resources.sync(self.home, self.source, apiagent)
         self.assertEqual(report['deferredDirectories'], [])
-        self.assertTrue(cache.samefile(self.source / 'plugins/cache'))
-        saved = Path(report['backup']) / 'plugins/cache' / relative
-        self.assertGreater(len(str(saved)), 260)
-        self.assertEqual(Path('\\\\?\\' + str(saved)).read_text(), 'deep plugin content')
+        self.assertFalse(cache.samefile(self.source / 'plugins/cache'))
         self.assertEqual((cache / relative).read_text(), 'deep plugin content')
 
-    def test_live_plugin_cache_defers_only_its_link_and_keeps_other_sharing(self):
+    def test_live_local_plugin_cache_is_not_moved_or_relinked(self):
         cache = self.home / 'plugins' / 'cache'
         cache.mkdir(parents=True)
         (cache / 'loaded-plugin').write_text('retained')
@@ -265,13 +272,58 @@ description = """multi
             return original_rename(path, destination)
         with patch.object(Path, 'rename', busy):
             report = resources.sync(self.home, self.source, apiagent)
-        self.assertEqual(report['deferredDirectories'], ['plugins/cache'])
+        self.assertEqual(report['deferredDirectories'], [])
         self.assertTrue((self.home / 'skills').samefile(self.source / 'skills'))
         self.assertEqual((cache / 'loaded-plugin').read_text(), 'retained')
         self.assertIn('[mcp_servers.shared]', (self.home / 'config.toml').read_text())
         retry = resources.sync(self.home, self.source, apiagent)
         self.assertEqual(retry['deferredDirectories'], [])
-        self.assertTrue(cache.samefile(self.source / 'plugins/cache'))
+        self.assertFalse(cache.samefile(self.source / 'plugins/cache'))
+
+    def test_shared_cache_migrates_to_home_and_survives_later_sync(self):
+        source_cache = self.source / 'plugins' / 'cache'
+        source_cache.mkdir(parents=True)
+        (source_cache / 'browser-service.mjs').write_text('runtime code')
+        deep = Path(('deep-' * 12) + '/nested/' + ('long-' * 12) + '/sentinel.txt')
+        deep_source = resources._extended_path(source_cache / deep)
+        deep_source.parent.mkdir(parents=True)
+        deep_source.write_text('deep runtime file')
+        cache = self.home / 'plugins' / 'cache'
+        cache.parent.mkdir()
+        resources.link_directory(cache, source_cache)
+        before_config = (self.home / 'config.toml').read_bytes()
+        dry = resources.sync(self.home, self.source, apiagent, dry_run=True)
+        self.assertTrue(dry['dryRun'])
+        self.assertTrue(cache.samefile(source_cache))
+        self.assertEqual((self.home / 'config.toml').read_bytes(), before_config)
+        report = resources.sync(self.home, self.source, apiagent)
+        service = cache / 'browser-service.mjs'
+        self.assertEqual(service.read_text(), 'runtime code')
+        self.assertEqual(service.resolve().relative_to(self.home), Path('plugins/cache/browser-service.mjs'))
+        self.assertFalse(cache.samefile(source_cache))
+        self.assertEqual(resources._extended_path(cache / deep).read_text(), 'deep runtime file')
+        self.assertTrue((Path(report['backup']) / 'plugins/cache').samefile(source_cache))
+        service.write_text('account installer update')
+        again = resources.sync(self.home, self.source, apiagent)
+        self.assertIsNone(again['backup'])
+        self.assertEqual(service.read_text(), 'account installer update')
+        self.assertEqual((source_cache / service.name).read_text(), 'runtime code')
+
+    def test_cache_copy_failure_keeps_shared_link_and_removes_partial_stage(self):
+        source_cache = self.source / 'plugins' / 'cache'
+        source_cache.mkdir(parents=True)
+        cache = self.home / 'plugins' / 'cache'
+        cache.parent.mkdir()
+        resources.link_directory(cache, source_cache)
+        def fail_copy(source, staged, **kwargs):
+            staged.mkdir()
+            (staged / 'partial').write_text('partial')
+            raise OSError('synthetic interrupted copy')
+        with patch.object(shutil, 'copytree', side_effect=fail_copy):
+            with self.assertRaises(OSError):
+                resources.sync(self.home, self.source, apiagent)
+        self.assertTrue(cache.samefile(source_cache))
+        self.assertEqual(list(cache.parent.glob('cache.local-*')), [])
 
 
 if __name__ == '__main__':

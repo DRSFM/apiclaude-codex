@@ -245,11 +245,15 @@ while another profile-management operation is running.
 
 Named accounts follow the official default account's resources automatically:
 
-- `skills`, `rules`, `prompts`, and `plugins/cache` link to the same paths under
+- `skills`, `rules`, and `prompts` link to the same paths under
   `~/.codex`. Windows uses directory junctions without administrator privileges;
   other platforms use directory symlinks. Adding a Skill through a named
   account's `skills` directory therefore writes directly to the shared source.
   User-wide `~/.agents/skills` and personal `~/.agents/plugins` remain shared too.
+- `plugins/cache` stays inside each account home. A former shared-cache link is
+  backed up and replaced with a local copy; subsequent synchronization leaves
+  that cache to the official plugin installer. This lets browser runtime code
+  resolve inside Desktop's account-specific trusted-code paths.
 - `AGENTS.md`, `AGENTS.override.md`, and `hooks.json` follow the default source
   by atomic copy on each launch, including source deletions. Edit those files
   in `~/.codex`. Hook review/trust state in each account's `config.toml` stays
@@ -259,6 +263,8 @@ Named accounts follow the official default account's resources automatically:
   `config.toml` on launch. Account model choices, provider/authentication fields,
   trust/history and runtime data remain separate. A shared feature setting
   cannot disable named-account encrypted authentication.
+  Desktop's generated `node_repl` MCP and account-bound delegation MCP remain
+  local; resource synchronization neither imports nor removes those definitions.
 
 For a named profile, `mcp add/remove` and plugin/marketplace management commands
 update the default source, then synchronize that profile. Other accounts pick
@@ -282,9 +288,10 @@ follow the default runtime. Unknown local nested links stay in the backup for
 manual review. Dry-run previews directories and config changes; it does not
 enumerate file conflicts or detect live file locks.
 
-If an open Desktop locks `plugins/cache`, the existing cache stays in place and
-the command reports deferred sharing; close that account's Desktop and relaunch
-or run `account sync NAME` to retry. Other resource sharing still completes.
+If an open Desktop locks a former shared `plugins/cache` link, that link stays
+in place and the command reports deferred migration; close that account's
+Desktop and relaunch or run `account sync NAME` to retry. An already local cache
+is never moved. Other resource sharing still completes.
 Windows resource copying uses extended paths so moving a deeply nested plugin
 into the backup directory does not omit files or fail at the legacy path limit.
 A failed resource step retains originals/backups; previously completed steps
@@ -426,7 +433,8 @@ closed and reopened. After the user confirmed entering Desktop and authorized
 a full restart, both original process trees exited completely and new processes
 opened signed-in home screens with Astra/Sol and the corresponding identities.
 Other Desktop instances remained running; authentication/history hashes stayed
-unchanged. Skills/rules/prompts and both plugin caches now share the default source.
+unchanged. Skills/rules/prompts share the default source. Plugin cache sharing
+was subsequently replaced with account-local caches for browser runtime loading.
 Both accounts have now completed official elevated Windows sandbox setup. The
 Desktop-bundled engine reports `ready` and successfully executes a sandboxed
 PowerShell command for each account; after restarting both windows, the Windows

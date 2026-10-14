@@ -1,6 +1,7 @@
 """Default-account resources shared by named accounts, never authentication.
 
 Directory junctions work on Windows without developer-mode symlink privileges.
+Plugin caches stay local: trusted runtime code must resolve inside its own home.
 Config and instruction files follow the default source on each wrapper launch.
 """
 from __future__ import annotations
@@ -181,10 +182,12 @@ def _feature_entries(block: str) -> dict[tuple[str, ...], str]:
 
 
 def merge_config(target: str, source: str) -> str:
-    # Delegation points at a particular parent home and must never be copied
-    # into a different account, or erased by ordinary resource synchronization.
-    local_delegate = extract_mcp_server_sections(target).get('apicodex_delegate')
-    source = _remove_mcp_server_sections(source, {'apicodex_delegate'})
+    # Delegation and Desktop's generated Node REPL point at a particular home.
+    # Neither may be copied into another account or erased by resource sync.
+    local_names = {'apicodex_delegate', 'node_repl'}
+    local_servers = {name: block for name, block in extract_mcp_server_sections(target).items()
+                     if name in local_names}
+    source = _remove_mcp_server_sections(source, local_names)
     selected = []
     features: dict[tuple[str, ...], str] = {}
     for root, block in config_parts(source):
@@ -210,8 +213,8 @@ def merge_config(target: str, source: str) -> str:
     assignments = [p for p in all_parts if not p.lstrip().startswith("[")]
     tables = [p for p in all_parts if p.lstrip().startswith("[")]
     merged = "\n\n".join([*assignments, *tables]).rstrip() + "\n"
-    if local_delegate:
-        merged = append_toml_sections(merged, [local_delegate])
+    if local_servers:
+        merged = append_toml_sections(merged, list(local_servers.values()))
     try:
         import tomllib
     except ModuleNotFoundError:  # Python 3.10: lexical checks above remain available.
@@ -228,6 +231,46 @@ def merge_config(target: str, source: str) -> str:
 
 def _redirected(path: Path) -> bool:
     return path.is_symlink() or (hasattr(path, "is_junction") and path.is_junction())
+
+
+def _extended_path(path: Path) -> Path:
+    if os.name != 'nt':
+        return path
+    value = str(path.absolute())
+    if value.startswith('\\\\?\\'):
+        return path
+    return Path('\\\\?\\UNC\\' + value[2:] if value.startswith('\\\\') else '\\\\?\\' + value)
+
+
+def localize_plugin_cache(target: Path, source: Path, preserve: Any) -> None:
+    """Seed an independent cache; preserve an existing shared-cache junction.
+
+    Desktop regenerates its trusted-code paths from CODEX_HOME. A cache junction
+    outside that home therefore prevents the browser service from loading.
+    Existing independent caches belong to the official plugin installer.
+    """
+    if target.exists() and not _redirected(target):
+        if not target.is_dir():
+            raise ResourceError("The plugin cache is not a directory; no file was replaced.")
+        return
+    if _redirected(target) and target.resolve() != source.resolve():
+        raise ResourceError("The plugin cache points elsewhere; no link was replaced.")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    staged = target.with_name("cache.local-" + uuid.uuid4().hex)
+    # Stage the complete package before touching the old link. Dereference
+    # aliases such as chrome/latest so their code also resolves inside the home.
+    try:
+        shutil.copytree(_extended_path(source), _extended_path(staged), symlinks=False)
+        saved = preserve(target) if target.exists() else None
+        try:
+            staged.rename(target)
+        except BaseException:
+            if saved and not target.exists():
+                saved.rename(target)
+            raise
+    finally:
+        if staged.exists() and staged.resolve().parent == target.parent.resolve():
+            shutil.rmtree(_extended_path(staged))
 
 
 def link_directory(target: Path, source: Path) -> None:
@@ -321,6 +364,12 @@ def sync(home: Path, default_home: Path, api: Any, *, dry_run: bool = False) -> 
     for name in DIRECTORIES:
         target, source = home / name, default_home / name
         source.mkdir(parents=True, exist_ok=True)
+        if name == 'plugins/cache':
+            try:
+                localize_plugin_cache(target, source, preserve)
+            except PermissionError:
+                report['deferredDirectories'].append(name)
+            continue
         if target.resolve() == source.resolve():
             continue
         target.parent.mkdir(parents=True, exist_ok=True)
