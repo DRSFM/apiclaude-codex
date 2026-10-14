@@ -19,6 +19,7 @@ import subprocess
 import sys
 import threading
 import uuid
+import urllib.request
 import zlib
 
 EFFORTS = frozenset(("none", "minimal", "low", "medium", "high", "xhigh", "max"))
@@ -500,17 +501,98 @@ def _native_environment() -> dict[str, str]:
     return result
 
 
+_PROXY_ENV_NAMES = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+                    "http_proxy", "https_proxy", "all_proxy", "no_proxy")
+
+
+def _desktop_proxy_environment(environment: dict[str, str]) -> dict[str, str]:
+    """Use the current Windows system proxy for a newly started Desktop core."""
+    result = environment.copy()
+    if sys.platform != "win32":
+        return result
+    proxies = urllib.request.getproxies_registry()
+    for scheme in ("http", "https"):
+        if proxies.get(scheme):
+            result[scheme.upper() + "_PROXY"] = proxies[scheme]
+            if scheme + "_proxy" in result:
+                result[scheme + "_proxy"] = proxies[scheme]
+    if proxies.get("http") or proxies.get("https"):
+        bypass = result.get("NO_PROXY", result.get("no_proxy", ""))
+        bypass = ",".join(dict.fromkeys(filter(None, [*bypass.split(","), "localhost", "127.0.0.1", "::1"])))
+        result["NO_PROXY"] = bypass
+        if "no_proxy" in result:
+            result["no_proxy"] = bypass
+    return result
+
+
+def _desktop_proxy_request(line: bytes, names: tuple[str, ...]) -> bytes:
+    """Keep proxy variable names in Desktop's generated node_repl allowlist.
+
+    Desktop replaces this table on thread start/resume. Only its existing
+    stdio server's env_vars field is extended; commands, permissions, explicit
+    env values and all other requests retain their original meaning.
+    """
+    if not names:
+        return line
+    try:
+        message = json.loads(line)
+        if not isinstance(message, dict) or message.get("method") not in ("thread/start", "thread/resume", "thread/fork"):
+            return line
+        params = message.get("params")
+        config = params.get("config") if isinstance(params, dict) else None
+        if not isinstance(config, dict):
+            return line
+        server = config.get("mcp_servers.node_repl")
+        if not isinstance(server, dict):
+            servers = config.get("mcp_servers")
+            server = servers.get("node_repl") if isinstance(servers, dict) else None
+        if not isinstance(server, dict) or not isinstance(server.get("command"), str):
+            return line
+        existing = server.get("env_vars", [])
+        if not isinstance(existing, list) or any(not isinstance(name, str) for name in existing):
+            return line
+        merged = list(dict.fromkeys([*existing, *names]))
+        if merged == existing:
+            return line
+        server["env_vars"] = merged
+        return (json.dumps(message, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+    except (ValueError, UnicodeError, TypeError):
+        return line
+
+
+def _forward_desktop_input(source, target, names: tuple[str, ...]) -> None:
+    """Forward local JSONL without recording request bodies or proxy values."""
+    try:
+        for line in source:
+            target.write(_desktop_proxy_request(line, names))
+            target.flush()
+    except (OSError, ValueError):
+        pass  # The native process can close its input before Desktop exits.
+    finally:
+        try:
+            target.close()
+        except OSError:
+            pass
+
+
 def _collected_run(executable: str, args: list[str], *, home: Path, client: str, profile: str) -> int:
     writer = MetadataWriter(home)
     collector = DiagnosticCollector(writer.emit, profile=profile, client=client)
     environment = _native_environment()
+    if client == "Desktop":
+        environment = _desktop_proxy_environment(environment)
+    proxy_names = tuple(name for name in _PROXY_ENV_NAMES if environment.get(name)) if client == "Desktop" else ()
     environment.update(RUST_LOG=LOG_FILTER, LOG_FORMAT="json")
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if client == "Desktop" else 0
     # Trace filtering belongs to this native process. Shell tools must not
     # pass it to nested clients and capture their raw diagnostics as output.
     child_args = ["-c", 'shell_environment_policy.set.RUST_LOG="warn"', *args]
     process = subprocess.Popen([executable, *child_args], env=environment, stderr=subprocess.PIPE,
-                               creationflags=flags)
+                               stdin=subprocess.PIPE if proxy_names else None, creationflags=flags)
+    if proxy_names:
+        forwarder = threading.Thread(target=_forward_desktop_input,
+                                     args=(sys.stdin.buffer, process.stdin, proxy_names), daemon=True)
+        forwarder.start()
     reader = threading.Thread(target=_drain, args=(process, collector), daemon=True)
     reader.start()
     try:
