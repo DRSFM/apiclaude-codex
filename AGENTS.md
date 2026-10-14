@@ -35,7 +35,7 @@
 
 - 修改简介：Desktop 原生启动器在启动时读取当前 Windows HTTP(S) 系统代理；仅对 thread/start、thread/resume、thread/fork 中已生成的 node_repl 环境变量名单补入代理变量，避免 Desktop 重建配置时丢失。源码已同步 C:/tools。
 - 修改原因：Chrome 已跟随系统代理，但 node_repl 子进程没有 HTTP(S)_PROXY，TUN 关闭时页面读取的认证联网请求失败；修复启动链路，避免依赖临时 TUN 或反复编辑生成配置。
-- 验证情况：完整 pytest 457 passed、38 skipped、278 subtests；安装模块专项29 passed。真实原生 app-server 的隔离、临时线程对照验证：旧版 MCP 子进程无代理，源码版与安装版均获得127.0.0.1:7897；无模型调用或持久聊天。当前用户实例仍是旧进程，真实 Chrome 页面验证待退出后重开 API Codex；TUN 全程关闭。
+- 验证情况：完整 pytest 457 passed、38 skipped、278 subtests；安装模块专项29 passed。真实原生 app-server 的隔离、临时线程对照验证：旧版 MCP 子进程无代理，源码版与安装版均获得127.0.0.1:7897；无模型调用或持久聊天。作者重启后真实Chrome页面读取及截图均成功，已读取交大LaTeX项目文件树、英文编辑器与PDF预览；TUN前后均为false、系统代理127.0.0.1:7897，完成验收。
 - 安全说明：只转发标准代理变量名，不改 MCP 命令、可信代码目录或安全策略，不写代理凭据到参数或日志；未知请求逐字节转发，不记录正文。原文件、测试脚本及验证清单见 C:/tools/backups/browser-system-proxy-20261015。
 
 ### 2026-10-10：本机 SFM 联合同步 TPS 日志只读方案
