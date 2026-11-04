@@ -2017,6 +2017,7 @@ def codex_vision_main(args: list[str]) -> int:
 
 def fetch_codex_provider_models(
     base_url: str, api_key: str, *, timeout: float = 20,
+    retry_timeouts: bool = False,
 ) -> list[str]:
     parsed = urlparse(base_url)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
@@ -2026,17 +2027,29 @@ def fetch_codex_provider_models(
         headers={
             "Authorization": f"Bearer {api_key}",
             "Accept": "application/json",
+            # Some provider firewalls reject urllib's default User-Agent.
+            "User-Agent": "apicodex/1.0",
         },
     )
-    try:
-        with urlopen(request, timeout=timeout) as response:
-            raw = response.read(4 * 1024 * 1024 + 1)
-    except HTTPError as exc:
-        raise ValueError(f"model discovery returned HTTP {exc.code}") from exc
-    except URLError as exc:
-        raise ValueError(f"model discovery failed: {exc.reason}") from exc
-    except OSError as exc:
-        raise ValueError(f"model discovery failed: {exc}") from exc
+    attempts = 2 if retry_timeouts else 1
+    for attempt in range(attempts):
+        try:
+            with urlopen(request, timeout=timeout) as response:
+                raw = response.read(4 * 1024 * 1024 + 1)
+            break
+        except HTTPError as exc:
+            raise ValueError(f"model discovery returned HTTP {exc.code}") from exc
+        except (URLError, OSError) as exc:
+            reason = exc.reason if isinstance(exc, URLError) else exc
+            if isinstance(reason, TimeoutError):
+                if attempt + 1 < attempts:
+                    print("Model discovery timed out; retrying once with the same API key...", file=sys.stderr)
+                    continue
+                raise ValueError(
+                    f"model discovery timed out after {attempts} attempt(s) "
+                    f"(socket timeout: {timeout:g}s)"
+                ) from exc
+            raise ValueError(f"model discovery failed: {reason}") from exc
     if len(raw) > 4 * 1024 * 1024:
         raise ValueError("model discovery response exceeded 4 MiB")
     try:
@@ -2842,10 +2855,13 @@ def add_codex_profile(
         return 1
     cleaned_api_key = clean_hidden_prefix(api_key)
     if model is None and model_catalog is None:
+        print("Fetching provider models (60s network timeout; one retry on timeout)...")
         try:
             discovered_models = fetch_codex_provider_models(
                 provider_url,
                 cleaned_api_key,
+                timeout=60,
+                retry_timeouts=True,
             )
             compatible_models = [
                 item for item in discovered_models if is_codex_text_model(item)
@@ -2871,6 +2887,7 @@ def add_codex_profile(
             )
         except ValueError as exc:
             print(f"Error: {exc}", file=sys.stderr)
+            print("Profile and API key were not saved.", file=sys.stderr)
             return 1
     credential_id = codex_credential_id(profile)
     SECRET_STORE.set(credential_id, cleaned_api_key)

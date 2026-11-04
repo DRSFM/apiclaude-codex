@@ -10,6 +10,7 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
+from urllib.error import HTTPError, URLError
 
 import apiagent
 from secure_store import SecureStore
@@ -825,6 +826,153 @@ class ApiAgentAuthTests(KeychainIsolationMixin):
         self.assertEqual(code, 1)
         self.assertIn("requires --account", error.getvalue())
 
+    def test_model_discovery_identifies_client_to_provider_firewall(self) -> None:
+        def provider(request, *, timeout):
+            self.assertEqual(request.full_url, "https://example.test/v1/models")
+            self.assertEqual(request.get_header("Authorization"), "Bearer sk-test-secret")
+            self.assertEqual(request.get_header("Accept"), "application/json")
+            self.assertEqual(timeout, 5)
+            user_agent = request.get_header("User-agent", "Python-urllib")
+            if user_agent.startswith("Python-urllib"):
+                raise HTTPError(request.full_url, 403, "Forbidden", {}, None)
+            return io.BytesIO(b'{"data": [{"id": "vendor-model"}]}')
+
+        with patch.object(apiagent, "urlopen", side_effect=provider):
+            models = apiagent.fetch_codex_provider_models(
+                "https://example.test/v1/", "sk-test-secret", timeout=5,
+            )
+
+        self.assertEqual(models, ["vendor-model"])
+
+    def test_model_discovery_retries_connection_and_read_timeouts(self) -> None:
+        class SlowResponse(io.BytesIO):
+            def read(self, size=-1):
+                raise TimeoutError("The read operation timed out")
+
+        for first in (TimeoutError(), URLError(TimeoutError()), SlowResponse()):
+            with (
+                self.subTest(first=type(first).__name__),
+                patch.object(apiagent, "urlopen", side_effect=[
+                    first, io.BytesIO(b'{"data": [{"id": "vendor-model"}]}'),
+                ]) as request,
+                redirect_stderr(io.StringIO()) as error,
+            ):
+                models = apiagent.fetch_codex_provider_models(
+                    "https://example.test/v1", "sk-test-secret",
+                    timeout=60, retry_timeouts=True,
+                )
+                self.assertEqual(models, ["vendor-model"])
+                self.assertEqual(request.call_count, 2)
+                self.assertTrue(all(call.kwargs == {"timeout": 60} for call in request.call_args_list))
+                self.assertIn("retrying", error.getvalue())
+                self.assertNotIn("sk-test-secret", error.getvalue())
+                if isinstance(first, SlowResponse):
+                    self.assertTrue(first.closed)
+
+    def test_model_discovery_does_not_retry_non_timeout_failures(self) -> None:
+        failures = [
+            HTTPError("https://example.test/v1/models", code, "Rejected", {}, None)
+            for code in (401, 403, 503)
+        ] + [URLError(OSError("connection refused")), io.BytesIO(b"invalid JSON")]
+        for failure in failures:
+            with (
+                self.subTest(failure=repr(failure)),
+                patch.object(apiagent, "urlopen", side_effect=[failure]) as request,
+                redirect_stderr(io.StringIO()) as error,
+            ):
+                with self.assertRaises(ValueError):
+                    apiagent.fetch_codex_provider_models(
+                        "https://example.test/v1", "sk-test-secret", retry_timeouts=True,
+                    )
+                self.assertEqual(request.call_count, 1)
+                self.assertNotIn("retrying", error.getvalue())
+
+    def test_model_discovery_timeout_retries_are_bounded_and_opt_in(self) -> None:
+        for retry, attempts in ((False, 1), (True, 2)):
+            with (
+                self.subTest(retry=retry),
+                patch.object(apiagent, "urlopen", side_effect=TimeoutError("sk-test-secret")) as request,
+                redirect_stderr(io.StringIO()) as error,
+            ):
+                kwargs = {"retry_timeouts": True} if retry else {}
+                with self.assertRaisesRegex(ValueError, "model discovery timed out") as caught:
+                    apiagent.fetch_codex_provider_models(
+                        "https://example.test/v1", "sk-test-secret", **kwargs,
+                    )
+                self.assertEqual(request.call_count, attempts)
+                self.assertNotIn("sk-test-secret", str(caught.exception))
+                self.assertNotIn("sk-test-secret", error.getvalue())
+
+    def test_api_add_retry_completes_without_reprompting_for_key(self) -> None:
+        profile = {
+            "id": "relay", "name": "relay", "home": "profiles/relay",
+            "baseUrl": "https://example.test/v1", "model": "saved-model",
+        }
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch.object(apiagent, "CODEX_HOME", Path(tmp)),
+            patch.object(apiagent, "load_codex_profiles", return_value=[profile]),
+            patch.object(apiagent, "SECRET_STORE") as store,
+            patch.object(apiagent, "save_codex_profiles") as save,
+            patch.object(apiagent, "sync_codex_shared_mcp"),
+            patch.object(apiagent, "fetch_codex_builtin_model_catalog", return_value=None),
+            patch.object(apiagent, "getpass", return_value="\ufeffsk-new-secret") as prompt,
+            patch("builtins.input", return_value=""),
+            patch.object(apiagent, "urlopen", side_effect=[
+                TimeoutError("The read operation timed out"),
+                io.BytesIO(b'{"data": [{"id": "saved-model"}]}'),
+            ]) as request,
+            redirect_stderr(io.StringIO()),
+            redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(apiagent.add_codex_profile("relay"), 0)
+            prompt.assert_called_once_with("API key: ")
+            self.assertEqual(request.call_count, 2)
+            for call in request.call_args_list:
+                self.assertEqual(call.args[0].get_header("Authorization"), "Bearer sk-new-secret")
+            store.set.assert_called_once_with("codex:relay", "sk-new-secret")
+            save.assert_called_once()
+            self.assertTrue((Path(tmp) / "profiles" / "relay" / "models.json").is_file())
+            config = (Path(tmp) / "profiles" / "relay" / "config.toml").read_text(encoding="utf-8")
+            self.assertIn('model = "saved-model"', config)
+
+    def test_api_add_discovery_failure_preserves_existing_credential_and_config(self) -> None:
+        profile = {
+            "id": "relay", "name": "relay", "home": "profiles/relay",
+            "baseUrl": "https://example.test/v1", "model": "saved-model",
+        }
+        original = profile.copy()
+        failures = [
+            (HTTPError("https://example.test/v1/models", 403, "Forbidden", {}, None), "HTTP 403", 1),
+            (TimeoutError("The read operation timed out"), "model discovery timed out", 2),
+        ]
+        for failure, message, attempts in failures:
+            with (
+                self.subTest(failure=message),
+                tempfile.TemporaryDirectory() as tmp,
+                patch.object(apiagent, "CODEX_HOME", Path(tmp)),
+                patch.object(apiagent, "load_codex_profiles", return_value=[profile]),
+                patch.object(apiagent, "SECRET_STORE") as store,
+                patch.object(apiagent, "save_codex_profiles") as save,
+                patch.object(apiagent, "write_codex_config") as write_config,
+                patch.object(apiagent, "getpass", return_value="sk-new-secret"),
+                patch("builtins.input", return_value=""),
+                patch.object(apiagent, "urlopen", side_effect=failure) as request,
+                redirect_stderr(io.StringIO()) as error,
+                redirect_stdout(io.StringIO()),
+            ):
+                code = apiagent.add_codex_profile("relay")
+                self.assertEqual(code, 1)
+                self.assertIn(message, error.getvalue())
+                self.assertIn("Profile and API key were not saved.", error.getvalue())
+                self.assertEqual(request.call_count, attempts)
+                self.assertNotIn("sk-new-secret", error.getvalue())
+                store.set.assert_not_called()
+                save.assert_not_called()
+                write_config.assert_not_called()
+                self.assertEqual(profile, original)
+                self.assertEqual(list(Path(tmp).iterdir()), [])
+
     def test_api_add_preserves_profile_model_and_reasoning_effort(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -905,6 +1053,8 @@ class ApiAgentAuthTests(KeychainIsolationMixin):
             fetch_models.assert_called_once_with(
                 "https://api.vendor.test/v1",
                 "sk-vendor-secret",
+                timeout=60,
+                retry_timeouts=True,
             )
             profile = save_profiles.call_args.args[0][0]
             self.assertEqual(profile["model"], "DeepSeek-V4-Flash-0731")

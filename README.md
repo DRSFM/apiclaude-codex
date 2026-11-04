@@ -541,6 +541,11 @@ argument; it is read through a hidden prompt, used in memory for discovery, and
 stored in the platform secure store. Normal Codex arguments such as
 `apicodex --model MODEL` continue to pass through to Codex.
 
+Guided setup uses a 60-second network timeout and retries a timeout once without
+asking for the API key again. Authentication errors are reported immediately.
+If discovery still fails, the existing profile and stored credential are
+preserved, and setup reports that the new key was not saved.
+
 ### Refresh Codex model catalogs
 
 CLI, VS Code, and Desktop launches automatically check the provider's model
