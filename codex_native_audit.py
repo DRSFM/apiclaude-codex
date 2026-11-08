@@ -97,6 +97,10 @@ class NativeAuditEntry {
                 info.EnvironmentVariables["RUST_LOG"] = "warn";
             }
             bool detached = GetConsoleWindow() == IntPtr.Zero;
+            // Framework Process creates StandardInput with Console.InputEncoding
+            // and flushes its preamble before our raw byte pump can run.
+            // JSONL pipes must not gain a BOM on UTF-8 Windows installations.
+            if (detached) Console.InputEncoding = new UTF8Encoding(false);
             info.CreateNoWindow = detached;
             info.RedirectStandardInput = detached;
             info.RedirectStandardOutput = detached;

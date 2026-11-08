@@ -6,6 +6,8 @@ import tempfile
 import unittest
 import threading
 import os
+import subprocess
+import sys
 from unittest.mock import patch
 import zlib
 
@@ -225,6 +227,40 @@ class DiagnosticTests(unittest.TestCase):
         with patch("codex_native_audit.prepare_environment", side_effect=OSError("fixture")), patch("sys.stderr", io.StringIO()):
             self.assertEqual(audit.exec_environment("native.exe", ["exec", "prompt"], Path("home")), ("native.exe", {}))
             self.assertEqual(audit.desktop_environment(Path("ChatGPT.exe"), Path("home")), {})
+
+    @unittest.skipUnless(os.name == "nt", "Requires the Windows native entry")
+    def test_native_entry_preserves_pipe_bytes_with_utf8_console_encoding(self):
+        compiler = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Microsoft.NET/Framework64/v4.0.30319/csc.exe"
+        if not compiler.is_file():
+            self.skipTest("The .NET Framework compiler is unavailable")
+        # Force the problematic default inside this process, without changing
+        # Windows code pages or depending on this machine's language settings.
+        source = audit._ENTRY_SOURCE.replace(
+            "static int Main(string[] args) {",
+            "static int Main(string[] args) {\n        Console.InputEncoding = new UTF8Encoding(true);")
+        with tempfile.TemporaryDirectory() as folder:
+            home = Path(folder)
+            probe = home / "echo.py"
+            probe.write_text("import sys\nsys.stdout.buffer.write(sys.stdin.buffer.read())\n", encoding="utf-8")
+            with patch.object(audit, "_ENTRY_SOURCE", source):
+                context = audit.prepare_environment(sys.executable, home, profile="pipe-test", cache=home / "cache")
+            environment = {k: v for k, v in os.environ.items() if not k.startswith("APICODEX_NATIVE_AUDIT_")}
+            payloads = [b'{"id":1,"method":"initialize"}\n',
+                        (json.dumps({"text": "中文", "padding": "x" * 10000}, ensure_ascii=False) + "\r\n").encode("utf-8")]
+            for collected in (False, True):
+                child_env = environment.copy()
+                args = [str(probe)]
+                if collected:
+                    child_env.update(context)
+                    child_env["APICODEX_NATIVE_AUDIT_SCRIPT"] = str(probe)
+                    args = []
+                for payload in payloads:
+                    with self.subTest(collected=collected, size=len(payload)):
+                        result = subprocess.run([context["CODEX_CLI_PATH"], *args], input=payload,
+                                                capture_output=True, env=child_env,
+                                                creationflags=subprocess.CREATE_NO_WINDOW, timeout=15)
+                        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", errors="replace"))
+                        self.assertEqual(result.stdout, payload)
 
     def test_native_child_drops_collector_context_and_retains_auth_in_environment_only(self):
         context = {"APICODEX_NATIVE_AUDIT_BINARY": "native.exe", "APICODEX_NATIVE_AUDIT_PROFILE": "account-b",

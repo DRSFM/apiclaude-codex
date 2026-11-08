@@ -31,6 +31,13 @@
 
 ## 协作修改记录
 
+### 2026-11-08：修复 UTF-8 Windows 下 Desktop 审计入口添加 BOM
+
+- 修改简介：Windows 审计 EXE 仅在隐藏启动、重定向标准输入时显式使用无 BOM 的 UTF-8 编码；新增实际编译入口的字节管道回归，覆盖审计与备用原生启动、中文和跨缓冲区消息。
+- 修改原因：本机账号登录菜单 2 卡在 ChatGPT 标志；.NET Framework 创建子进程标准输入时提前写入 UTF-8 BOM，导致官方 app-server 无法解析首条 initialize 消息。测试在旧实现明确复现额外的 `EF BB BF`。
+- 验证情况：专项基线 29 passed，修复后 30 passed；完整 `python -m pytest tests/ -q` 为 452 passed / 38 skipped。通过正常启动菜单 0→2 打开原具名账号，真实日志确认新入口完成 initialize 且进入 connected，用户明确确认主界面已加载；Python 3.10 语法及 `git diff --check` 通过。
+- 文档与安全说明：依据 Microsoft 官方 [Console.InputEncoding](https://learn.microsoft.com/en-us/dotnet/api/system.console.inputencoding?view=netframework-4.8.1) 与 [UTF8Encoding(Boolean)](https://learn.microsoft.com/en-us/dotnet/api/system.text.utf8encoding.-ctor?view=netframework-4.8.1) 确认编码可显式设置且 false 不提供 BOM；仅修启动器，不更改 Windows 编码、认证或官方应用。未发送模型任务或下载依赖，其他既有 Desktop 实例及正常打开的目标窗口保留；按用户要求将本次源码、回归测试和本条记录提交并推送远端，不包含本机诊断文件或账号数据。
+
 ### 2026-11-04：发布模型发现 403 与超时修复
 
 - 修改简介：按用户要求整理并发布 Codex 模型发现的请求标识、60 秒交互等待及一次超时重试修复，包含对应测试、README 和本日协作记录，供另一台电脑更新启动器。
