@@ -849,8 +849,8 @@ class NativeClaudeDesktopCliTests(KeychainIsolationMixin):
                 patch.object(apiagent, "prepare_claude_desktop_profile") as prepare,
                 patch.object(
                     apiagent,
-                    "sync_claude_shared_mcp",
-                    return_value=(True, {}),
+                    "refresh_claude_shared",
+                    return_value=True,
                 ),
                 patch.object(
                     apiagent,

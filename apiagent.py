@@ -20,6 +20,7 @@ import re
 import secrets
 import shutil
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -57,6 +58,15 @@ from codex_vision_proxy import (
 )
 from codex_vision_mcp import run_vision_mcp
 from claude_shared_config import merge_shared_mcp_servers as merge_claude_shared_mcp
+from claude_shared_files import (
+    INSTRUCTIONS_FILE_NAME as CLAUDE_SHARED_INSTRUCTIONS_FILE_NAME,
+    apply_shared_instructions as apply_claude_shared_instructions,
+    apply_shared_skills as apply_claude_shared_skills,
+    discover_shared_skills as discover_claude_shared_skills,
+    path_key as claude_shared_path_key,
+    plan_shared_instructions as plan_claude_shared_instructions,
+    plan_shared_skills as plan_claude_shared_skills,
+)
 from codex_shared_config import (
     merge_shared_mcp_servers as merge_codex_shared_mcp,
     preserve_mcp_server_sections,
@@ -124,13 +134,52 @@ GEMINI_VISION_CREDENTIAL_ID = "vision:gemini"
 CODEX_API_AUTH_MARKER = "apicodex-managed-key-in-child-environment"
 CODEX_AUTH_STORE = "keyring"
 CODEX_EPHEMERAL_AUTH_OVERRIDE = 'cli_auth_credentials_store="ephemeral"'
-CODEX_INSTALL_SCRIPT = "$env:CODEX_NON_INTERACTIVE=1; irm https://chatgpt.com/codex/install.ps1 | iex"
+CODEX_INSTALL_SCRIPT = r"""
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+$env:CODEX_NON_INTERACTIVE = '1'
+$installerPath = Join-Path ([IO.Path]::GetTempPath()) ("apicodex-install-$([guid]::NewGuid().ToString('N')).ps1")
+try {
+    $downloaded = $false
+    foreach ($uri in @(
+        'https://releases.openai.com/codex/install.ps1',
+        'https://raw.githubusercontent.com/openai/codex/main/scripts/install/install.ps1'
+    )) {
+        try {
+            Invoke-WebRequest -Uri $uri -OutFile $installerPath -TimeoutSec 60
+            $downloaded = $true
+            break
+        } catch {
+            Write-Warning "Could not download the Codex installer from ${uri}: $($_.Exception.Message)"
+        }
+    }
+    if (-not $downloaded) {
+        throw 'Could not download the official Codex installer from either source.'
+    }
+    & $installerPath -Release latest
+    if (-not $?) {
+        throw 'The official Codex installer failed.'
+    }
+} catch {
+    [Console]::Error.WriteLine("Error: Codex update failed: $($_.Exception.Message)")
+    exit 1
+} finally {
+    Remove-Item -LiteralPath $installerPath -Force -ErrorAction SilentlyContinue
+}
+""".strip()
 APICODEX_CODEX_EXE_ENV = "APICODEX_CODEX_EXE"
 CODEX_ACCOUNT_IMAGE_REPAIR_TASK = "ApiCodex Account History Image Repair"
 CODEX_SHARED_MCP_STATE_NAME = "shared-mcp.json"
 CODEX_SHARED_MCP_BACKUP_DIR = "shared-mcp-backups"
 CLAUDE_SHARED_MCP_STATE_NAME = "shared-mcp.json"
 CLAUDE_SHARED_MCP_BACKUP_DIR = "shared-mcp-backups"
+CLAUDE_SHARED_FILES_STATE_NAME = "shared-files.json"
+CLAUDE_SHARED_FILES_BACKUP_DIR = "shared-files-backups"
+CLAUDE_SHARED_COMPONENT_FLAGS = {
+    "--mcp": "mcp",
+    "--instructions": "instructions",
+    "--skills": "skills",
+}
 CLAUDE_DESKTOP_CODE_CONFIG_DIR_NAME = "claude-code-config"
 HIDDEN_PREFIX_CHARS = "\ufeff\u200b\u200c\u200d\u2060\ufffd"
 VISION_TEST_IMAGE = (
@@ -2018,6 +2067,7 @@ def codex_vision_main(args: list[str]) -> int:
 def fetch_codex_provider_models(
     base_url: str, api_key: str, *, timeout: float = 20,
     retry_timeouts: bool = False,
+    retry_ssl_eof: bool = False,
 ) -> list[str]:
     parsed = urlparse(base_url)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
@@ -2031,7 +2081,7 @@ def fetch_codex_provider_models(
             "User-Agent": "apicodex/1.0",
         },
     )
-    attempts = 2 if retry_timeouts else 1
+    attempts = 2 if retry_timeouts or retry_ssl_eof else 1
     for attempt in range(attempts):
         try:
             with urlopen(request, timeout=timeout) as response:
@@ -2042,12 +2092,24 @@ def fetch_codex_provider_models(
         except (URLError, OSError) as exc:
             reason = exc.reason if isinstance(exc, URLError) else exc
             if isinstance(reason, TimeoutError):
-                if attempt + 1 < attempts:
+                if retry_timeouts and attempt + 1 < attempts:
                     print("Model discovery timed out; retrying once with the same API key...", file=sys.stderr)
                     continue
                 raise ValueError(
-                    f"model discovery timed out after {attempts} attempt(s) "
+                    f"model discovery timed out after {attempt + 1} attempt(s) "
                     f"(socket timeout: {timeout:g}s)"
+                ) from exc
+            if isinstance(reason, ssl.SSLEOFError):
+                if retry_ssl_eof and attempt + 1 < attempts:
+                    print(
+                        "Model discovery TLS connection closed unexpectedly; "
+                        "retrying once with the same API key...",
+                        file=sys.stderr,
+                    )
+                    continue
+                raise ValueError(
+                    "model discovery TLS connection closed unexpectedly "
+                    f"after {attempt + 1} attempt(s)"
                 ) from exc
             raise ValueError(f"model discovery failed: {reason}") from exc
     if len(raw) > 4 * 1024 * 1024:
@@ -2855,13 +2917,14 @@ def add_codex_profile(
         return 1
     cleaned_api_key = clean_hidden_prefix(api_key)
     if model is None and model_catalog is None:
-        print("Fetching provider models (60s network timeout; one retry on timeout)...")
+        print("Fetching provider models (60s network timeout; one retry on timeout or TLS disconnect)...")
         try:
             discovered_models = fetch_codex_provider_models(
                 provider_url,
                 cleaned_api_key,
                 timeout=60,
                 retry_timeouts=True,
+                retry_ssl_eof=True,
             )
             compatible_models = [
                 item for item in discovered_models if is_codex_text_model(item)
@@ -3104,6 +3167,7 @@ def upgrade_codex() -> int:
             "-Command",
             CODEX_INSTALL_SCRIPT,
         ],
+        env_remove=CODEX_API_ENV_REMOVE,
     )
 
 
@@ -4446,28 +4510,386 @@ def _print_claude_shared_mcp_report(report: dict[str, Any]) -> None:
         print(f"Backup: {report['backup']}")
 
 
+def claude_account_instructions_path() -> Path:
+    return HOME / ".claude" / "CLAUDE.md"
+
+
+def claude_account_skills_path() -> Path:
+    return HOME / ".claude" / "skills"
+
+
+def claude_shared_files_state_path() -> Path:
+    return CLAUDE_NODES_ROOT / CLAUDE_SHARED_FILES_STATE_NAME
+
+
+def load_claude_shared_files_state() -> dict[str, Any]:
+    raw = read_json(claude_shared_files_state_path(), {})
+    state: dict[str, Any] = raw if isinstance(raw, dict) else {}
+    for key in ("managedInstructions", "managedSkills"):
+        managed = state.get(key)
+        state[key] = (
+            {
+                str(path): str(value)
+                for path, value in managed.items()
+                if isinstance(path, str) and isinstance(value, str)
+            }
+            if isinstance(managed, dict)
+            else {}
+        )
+    return state
+
+
+def _claude_shared_files_targets(config: dict[str, Any]) -> list[tuple[str, Path]]:
+    """List the node config dirs that do not read the account ~/.claude."""
+
+    targets: list[tuple[str, Path]] = []
+    seen: set[Path] = set()
+    account_home = (HOME / ".claude").resolve()
+    for name, node in (config.get("nodes") or {}).items():
+        if not isinstance(name, str) or not isinstance(node, dict):
+            continue
+        if claude_node_isolation(node) != "isolated" and not is_claude_codex_bridge(node):
+            continue
+        if not is_safe_claude_node_home(name, node):
+            raise ValueError(f"unsafe isolated config dir for Claude node '{name}'")
+        home = claude_node_home(name, node)
+        resolved = home.resolve()
+        if resolved == account_home or resolved in seen:
+            continue
+        seen.add(resolved)
+        targets.append((f"node:{name}", home))
+    return targets
+
+
+def _backup_claude_shared_instructions(
+    changes: list[tuple[str, Path]],
+) -> Path | None:
+    existing = [(label, path) for label, path in changes if path.exists()]
+    if not existing:
+        return None
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    backup_root = CLAUDE_NODES_ROOT / CLAUDE_SHARED_FILES_BACKUP_DIR / stamp
+    backup_root.mkdir(parents=True, exist_ok=False)
+    manifest: list[dict[str, Any]] = []
+    for index, (label, path) in enumerate(existing, 1):
+        backup_path = backup_root / f"{index:02d}-{slugify(label)}.CLAUDE.md"
+        shutil.copy2(path, backup_path)
+        manifest.append(
+            {"target": label, "source": str(path), "backup": str(backup_path)}
+        )
+    write_json_atomic(
+        backup_root / "manifest.json",
+        {"version": 1, "createdAt": now_iso(), "files": manifest},
+    )
+    return backup_root
+
+
+def sync_claude_shared_files(
+    config: dict[str, Any],
+    *,
+    instructions: bool | None = None,
+    skills: bool | None = None,
+    dry_run: bool = False,
+    quiet: bool = False,
+) -> tuple[bool, dict[str, Any]]:
+    """Refresh node copies of the account CLAUDE.md and links to its skills.
+
+    ``None`` keeps a component's saved on/off state. Nothing under the account
+    directory is read unless a component is, or is being switched, on.
+    A step that fails midway is not rolled back: the saved state is written
+    last, and the next run adopts whatever already matches the account.
+    """
+
+    state = load_claude_shared_files_state()
+    was_instructions = state.get("accountInstructionsEnabled") is True
+    was_skills = state.get("accountSkillsEnabled") is True
+    want_instructions = was_instructions if instructions is None else instructions
+    want_skills = was_skills if skills is None else skills
+    report: dict[str, Any] = {
+        "instructionsEnabled": want_instructions,
+        "skillsEnabled": want_skills,
+        "instructionTargets": [],
+        "instructionRemovals": [],
+        "instructionConflicts": [],
+        "skills": [],
+        "skillLinks": {},
+        "skillRemovals": {},
+        "skillConflicts": {},
+        "warnings": [],
+        "backup": None,
+        "dryRun": dry_run,
+    }
+    if not (want_instructions or was_instructions or want_skills or was_skills):
+        return True, report
+
+    instructions_path = claude_account_instructions_path()
+    skills_path = claude_account_skills_path()
+    instructions_plan = None
+    skills_plan = None
+    source_bytes: bytes | None = None
+    try:
+        targets = _claude_shared_files_targets(config)
+        if want_instructions:
+            try:
+                source_bytes = instructions_path.read_bytes()
+            except FileNotFoundError:
+                report["warnings"].append(
+                    f"account instructions were not found at {instructions_path}; "
+                    "node copies were left unchanged"
+                )
+            else:
+                instructions_plan = plan_claude_shared_instructions(
+                    source_bytes, targets, state["managedInstructions"]
+                )
+        elif was_instructions:
+            instructions_plan = plan_claude_shared_instructions(
+                None, targets, state["managedInstructions"]
+            )
+        if want_skills:
+            try:
+                shared_skills = discover_claude_shared_skills(skills_path)
+            except FileNotFoundError:
+                report["warnings"].append(
+                    f"account skills were not found at {skills_path}; "
+                    "node skill links were left unchanged"
+                )
+            else:
+                skills_plan = plan_claude_shared_skills(
+                    shared_skills, targets, state["managedSkills"]
+                )
+        elif was_skills:
+            skills_plan = plan_claude_shared_skills(
+                None, targets, state["managedSkills"]
+            )
+    except (OSError, ValueError) as exc:
+        if not quiet:
+            print(
+                f"Error: failed to prepare shared Claude files sync: {exc}",
+                file=sys.stderr,
+            )
+        return False, report
+
+    if instructions_plan is not None:
+        report["instructionTargets"] = [label for label, _path in instructions_plan.writes]
+        report["instructionRemovals"] = [label for label, _path in instructions_plan.removes]
+        report["instructionConflicts"] = list(instructions_plan.conflicts)
+    if skills_plan is not None:
+        report["skills"] = list(skills_plan.skills)
+        for label, link, _target in (*skills_plan.links, *skills_plan.relinks):
+            report["skillLinks"].setdefault(label, []).append(link.name)
+        for label, link in skills_plan.unlinks:
+            report["skillRemovals"].setdefault(label, []).append(link.name)
+        report["skillConflicts"] = {
+            label: list(names) for label, names in skills_plan.conflicts.items()
+        }
+
+    next_state = dict(state)
+    next_state.update(
+        {
+            "version": 1,
+            "accountInstructionsEnabled": want_instructions,
+            "accountSkillsEnabled": want_skills,
+            "managedInstructions": (
+                instructions_plan.managed
+                if instructions_plan is not None
+                else state["managedInstructions"]
+            ),
+            "managedSkills": (
+                skills_plan.managed
+                if skills_plan is not None
+                else state["managedSkills"]
+            ),
+        }
+    )
+    state_changed = any(
+        next_state.get(key) != state.get(key)
+        for key in next_state
+        if key != "updatedAt"
+    )
+    if dry_run:
+        return True, report
+
+    try:
+        if instructions_plan is not None:
+            backup_root = _backup_claude_shared_instructions(
+                [*instructions_plan.writes, *instructions_plan.removes]
+            )
+            report["backup"] = str(backup_root) if backup_root else None
+            apply_claude_shared_instructions(instructions_plan, source_bytes)
+        if skills_plan is not None:
+            apply_claude_shared_skills(skills_plan)
+        if state_changed:
+            next_state["updatedAt"] = now_iso()
+            write_json_atomic(claude_shared_files_state_path(), next_state)
+    except (OSError, ValueError) as exc:
+        if not quiet:
+            print(f"Error: shared Claude files sync failed: {exc}", file=sys.stderr)
+        return False, report
+    return True, report
+
+
+def release_claude_shared_files(home: Path) -> None:
+    """Detach a node that is going away from the account's shared files.
+
+    Its skill links are removed, so the archived directory no longer reaches
+    into the account's skill directories. The instructions copy is an ordinary
+    file and stays in the archive; only its record is dropped.
+    """
+
+    state = load_claude_shared_files_state()
+    plan = plan_claude_shared_skills(None, [("node", home)], state["managedSkills"])
+    apply_claude_shared_skills(plan)
+    instructions = dict(state["managedInstructions"])
+    instructions.pop(
+        claude_shared_path_key(home / CLAUDE_SHARED_INSTRUCTIONS_FILE_NAME), None
+    )
+    if (
+        plan.managed == state["managedSkills"]
+        and instructions == state["managedInstructions"]
+    ):
+        return
+    state["managedSkills"] = plan.managed
+    state["managedInstructions"] = instructions
+    state["updatedAt"] = now_iso()
+    write_json_atomic(claude_shared_files_state_path(), state)
+
+
+def _print_claude_shared_groups(title: str, groups: dict[str, list[str]]) -> None:
+    if not groups:
+        print(f"{title}: (none)")
+        return
+    print(f"{title}:")
+    for target, names in groups.items():
+        print(f"  {target}: {', '.join(names)}")
+
+
+def _print_claude_shared_files_report(report: dict[str, Any]) -> None:
+    dry_run = report.get("dryRun")
+    update = "Would update" if dry_run else "Updated"
+    remove = "Would remove" if dry_run else "Removed"
+
+    status = "enabled" if report.get("instructionsEnabled") else "disabled"
+    print(f"Account instructions sharing: {status}")
+    changed = report.get("instructionTargets") or []
+    print(f"{update} instruction copies: {', '.join(changed) if changed else '(none)'}")
+    removed = report.get("instructionRemovals") or []
+    if removed:
+        print(f"{remove} instruction copies: {', '.join(removed)}")
+    for target in report.get("instructionConflicts") or []:
+        print(
+            f"Conflict in '{target}' (kept target-local): CLAUDE.md",
+            file=sys.stderr,
+        )
+
+    status = "enabled" if report.get("skillsEnabled") else "disabled"
+    print(f"Account skills sharing: {status}")
+    names = report.get("skills") or []
+    print(f"Shared skills: {', '.join(names) if names else '(none)'}")
+    _print_claude_shared_groups(f"{update} skill links", report.get("skillLinks") or {})
+    if report.get("skillRemovals"):
+        _print_claude_shared_groups(f"{remove} skill links", report["skillRemovals"])
+    for target, kept in (report.get("skillConflicts") or {}).items():
+        print(
+            f"Conflict in '{target}' (kept target-local): {', '.join(kept)}",
+            file=sys.stderr,
+        )
+
+    for warning in report.get("warnings") or []:
+        print(f"Warning: {warning}", file=sys.stderr)
+    if report.get("backup"):
+        print(f"Backup: {report['backup']}")
+
+
+def _print_claude_shared_files_status(state: dict[str, Any]) -> None:
+    status = "enabled" if state.get("accountInstructionsEnabled") is True else "disabled"
+    print(f"Account instructions sharing: {status}")
+    print(f"Instructions source: {claude_account_instructions_path()}")
+    print(f"Managed instruction copies: {len(state.get('managedInstructions') or {})}")
+    status = "enabled" if state.get("accountSkillsEnabled") is True else "disabled"
+    print(f"Account skills sharing: {status}")
+    print(f"Skills source: {claude_account_skills_path()}")
+    print(f"Managed skill links: {len(state.get('managedSkills') or {})}")
+
+
+def refresh_claude_shared(config: dict[str, Any], name: str | None = None) -> bool:
+    """Refresh every enabled account-sharing component before a launch.
+
+    A failed MCP refresh stops the launch, as it always has. Claude starts fine
+    without fresh instructions or skills, so a failure there is reported and
+    the node keeps what it already has. ``name`` is the node being launched;
+    content it keeps instead of the account version is pointed out, because a
+    node that silently stops following the account is easy to miss.
+    """
+
+    mcp_ok, _mcp_report = sync_claude_shared_mcp(config)
+    if not mcp_ok:
+        return False
+    ok, report = sync_claude_shared_files(config)
+    for warning in report.get("warnings") or []:
+        print(f"Warning: {warning}", file=sys.stderr)
+    if not ok:
+        print(
+            "Warning: launching with the node's existing instructions and skills.",
+            file=sys.stderr,
+        )
+        return True
+    label = f"node:{name}"
+    if label in (report.get("instructionConflicts") or []):
+        print(
+            f"Warning: node '{name}' keeps its own edited CLAUDE.md, so account "
+            "instructions are not synced to it. Remove that file to resume "
+            "syncing, or copy it over the account file to keep its changes.",
+            file=sys.stderr,
+        )
+    kept_skills = (report.get("skillConflicts") or {}).get(label)
+    if kept_skills:
+        print(
+            f"Warning: node '{name}' keeps its own copy of these skills instead "
+            f"of the account version: {', '.join(kept_skills)}.",
+            file=sys.stderr,
+        )
+    return True
+
+
 def claude_shared_main(args: list[str]) -> int:
     action = args[0] if args else "status"
     flags = set(args[1:])
-    allowed_flags = {"--account", "--dry-run"}
+    allowed_flags = {"--account", "--dry-run", "--all", *CLAUDE_SHARED_COMPONENT_FLAGS}
     if action not in {"enable", "sync", "status", "disable"} or not flags.issubset(
         allowed_flags
     ):
         print(
-            "Usage: apiclaude shared <enable|sync|status|disable> "
-            "[--account] [--dry-run]",
+            "Usage: apiclaude shared <enable|sync|status|disable> [--account] "
+            "[--mcp] [--instructions] [--skills] [--all] [--dry-run]",
             file=sys.stderr,
         )
         return 1
     if action == "enable" and "--account" not in flags:
         print(
-            "Error: shared enable requires --account to authorize reading "
-            "~/.claude.json.",
+            "Error: shared enable requires --account to authorize reading the "
+            "account Claude configuration (~/.claude.json, ~/.claude/CLAUDE.md, "
+            "~/.claude/skills).",
+            file=sys.stderr,
+        )
+        return 1
+
+    components = {
+        component
+        for flag, component in CLAUDE_SHARED_COMPONENT_FLAGS.items()
+        if flag in flags
+    }
+    if "--all" in flags:
+        components = set(CLAUDE_SHARED_COMPONENT_FLAGS.values())
+    if components and action in {"sync", "status"}:
+        print(
+            f"Error: shared {action} covers every enabled component and does "
+            "not take --mcp, --instructions, --skills or --all.",
             file=sys.stderr,
         )
         return 1
 
     state = load_claude_shared_mcp_state()
+    files_state = load_claude_shared_files_state()
     if action == "status":
         report = {
             "enabled": state.get("accountMcpEnabled") is True,
@@ -4478,29 +4900,60 @@ def claude_shared_main(args: list[str]) -> int:
         }
         _print_claude_shared_mcp_report(report)
         print(f"Source: {state.get('source') or claude_account_mcp_config_path()}")
+        _print_claude_shared_files_status(files_state)
         return 0
-    if action == "sync" and state.get("accountMcpEnabled") is not True:
-        print(
-            "Error: account MCP sharing is disabled. Run "
-            "'apiclaude shared enable --account' first.",
-            file=sys.stderr,
+
+    file_components = components & {"instructions", "skills"}
+    if action == "sync":
+        mcp_selected = state.get("accountMcpEnabled") is True
+        files_selected = (
+            files_state.get("accountInstructionsEnabled") is True
+            or files_state.get("accountSkillsEnabled") is True
         )
-        return 1
+        if not mcp_selected and not files_selected:
+            print(
+                "Error: account sharing is disabled. Run "
+                "'apiclaude shared enable --account' first.",
+                file=sys.stderr,
+            )
+            return 1
+    else:
+        # Without a component flag, enable and disable keep their original
+        # MCP-only meaning.
+        mcp_selected = "mcp" in components or not components
+        files_selected = bool(file_components)
 
     config = load_claude_config()
     requested_enabled = True if action == "enable" else False if action == "disable" else None
-    ok, report = sync_claude_shared_mcp(
-        config,
-        enabled=requested_enabled,
-        dry_run="--dry-run" in flags,
-    )
-    if ok:
-        _print_claude_shared_mcp_report(report)
-        if action == "enable" and not report.get("dryRun"):
-            print(
-                "Future ApiClaude isolated nodes will refresh shared MCP servers "
-                "from the account user config."
-            )
+    dry_run = "--dry-run" in flags
+    ok = True
+    if mcp_selected:
+        ok, report = sync_claude_shared_mcp(
+            config,
+            enabled=requested_enabled,
+            dry_run=dry_run,
+        )
+        if ok:
+            _print_claude_shared_mcp_report(report)
+            if action == "enable" and not report.get("dryRun"):
+                print(
+                    "Future ApiClaude isolated nodes will refresh shared MCP servers "
+                    "from the account user config."
+                )
+    if ok and files_selected:
+        ok, files_report = sync_claude_shared_files(
+            config,
+            instructions=requested_enabled if "instructions" in file_components else None,
+            skills=requested_enabled if "skills" in file_components else None,
+            dry_run=dry_run,
+        )
+        if ok:
+            _print_claude_shared_files_report(files_report)
+            if action == "enable" and not dry_run:
+                print(
+                    "Future ApiClaude launches will refresh the shared instructions "
+                    "and skill links from the account directory."
+                )
     return 0 if ok else 1
 
 
@@ -4801,7 +5254,7 @@ def add_claude_node(config: dict[str, Any], requested: str | None = None) -> int
     if not config.get("current"):
         config["current"] = name
     save_claude_config(config)
-    if not sync_claude_shared_mcp(config)[0]:
+    if not refresh_claude_shared(config, name):
         return 1
     print(f"Saved Claude node '{name}' ({mode}).")
     return 0
@@ -4925,7 +5378,7 @@ def add_claude_codex_bridge(
     if not config.get("current"):
         config["current"] = name
     save_claude_config(config)
-    if not sync_claude_shared_mcp(config)[0]:
+    if not refresh_claude_shared(config, name):
         return 1
     print(
         f"Saved isolated Claude bridge node '{name}' from Codex profile "
@@ -4979,6 +5432,7 @@ def remove_claude_node(config: dict[str, Any], name: str | None) -> int:
                 archive_path = Path(f"{archive_base}-{suffix}")
                 suffix += 1
             try:
+                release_claude_shared_files(home)
                 shutil.move(str(home), str(archive_path))
             except OSError as exc:
                 print(
@@ -5371,7 +5825,7 @@ def run_claude_desktop_worker(
                     ),
                     claude_config_dir=claude_config_dir,
                 )
-                if not sync_claude_shared_mcp(config)[0]:
+                if not refresh_claude_shared(config, name):
                     return 1
                 migrated_sessions = migrate_claude_desktop_sessions(
                     profile_dir / CLAUDE_DESKTOP_CODE_CONFIG_DIR_NAME,
@@ -5650,7 +6104,7 @@ def run_claude_node(config: dict[str, Any], name: str, claude_args: list[str]) -
     if not node:
         print(f"Error: Claude node '{name}' was not found.", file=sys.stderr)
         return 1
-    if not sync_claude_shared_mcp(config)[0]:
+    if not refresh_claude_shared(config, name):
         return 1
     if is_claude_codex_bridge(node):
         return run_claude_codex_bridge_node(config, name, node, claude_args)
@@ -5686,7 +6140,7 @@ def launch_claude_vscode(config: dict[str, Any], name: str) -> int:
     if not node:
         print(f"Error: Claude node '{name}' was not found.", file=sys.stderr)
         return 1
-    if not sync_claude_shared_mcp(config)[0]:
+    if not refresh_claude_shared(config, name):
         return 1
     if is_claude_codex_bridge(node):
         print(
@@ -5770,7 +6224,7 @@ def set_claude_node_mode(config: dict[str, Any], name: str, requested: str | Non
             return 1
         node["isolation"] = "isolated"
         save_claude_config(config)
-        if not sync_claude_shared_mcp(config)[0]:
+        if not refresh_claude_shared(config, name):
             return 1
         print(f"Node '{name}' switched to isolated (CLAUDE_CONFIG_DIR={home}).")
         print(
@@ -5847,9 +6301,14 @@ def claude_help() -> None:
   apiclaude --up                   Update Claude Code
   apiclaude --api-help             Show this help
   apiclaude shared enable --account Share account user MCP with isolated nodes
-  apiclaude shared sync             Refresh shared MCP config now
-  apiclaude shared status           Show account MCP sharing status
-  apiclaude shared disable          Remove managed MCP copies from isolated nodes
+  apiclaude shared enable --account --instructions --skills
+                                    Also share ~/.claude/CLAUDE.md and skills
+                                    (--all selects MCP, instructions and skills)
+  apiclaude shared sync             Refresh everything that is shared now
+  apiclaude shared status           Show account sharing status
+  apiclaude shared disable [--instructions] [--skills] [--all]
+                                    Remove managed copies from isolated nodes
+                                    (MCP only unless a component is named)
   apiclaude mode NAME [MODE]       Show or switch a node between isolated/shared
                                    isolated: node-scoped CLAUDE_CONFIG_DIR
                                    shared:   default ~/.claude (legacy behavior)

@@ -23,7 +23,8 @@
 
 当本项目可用 `apicodex_delegate` MCP 工具时，允许主代理主动将用户范围内、
 可独立执行和验证的子任务交给已配置账号；简单任务直接处理。先查看账号与权限，
-`spawn` 显式传入当前项目 cwd，默认 `context=auto`，重试复用 request_id；
+`spawn` 显式传入当前项目 cwd 和 `context=none`，仅传简短任务说明、必要事实、
+文件位置及验收条件，禁止复制父会话历史或聊天 JSON；重试复用 request_id。
 用 `wait` 收回结果并独立验收，用 `send_message` 继续原任务，不反复创建副本。
 只有工具报告完成且结果验证通过才可报完成；父代理保留规划、整合和最终责任。
 不得借委派扩大用户授权或绕过父任务权限，不得递归委派；工具不可用时说明并本地处理，
@@ -31,12 +32,44 @@
 
 ## 协作修改记录
 
+### 2026-11-14：合并远端修复并发布本地积累改动
+
+- 修改简介：按用户要求将 `main` 快进至远端 `8a409c7`，恢复本地改动并合并双方 `AGENTS.md` 记录；本批发布 Claude 规则与 skills 共享、模型发现 TLS 断连重试、Windows CLI 更新入口及跨账户委派目录/额度/简短任务改进，包含对应测试、Skill 和历史验收资料。
+- 修改原因：本机已积累多批未发布改动，同时缺少远端 Windows Desktop 输入管道 BOM 修复，需要合并验证后供其他机器通过 Git 获取。
+- 验证情况：合并时除 `AGENTS.md` 外的 20 个改动文件均与同步前快照一致，双方协作记录完整保留；完整 `python -m pytest tests/ -q` 为 508 passed、38 skipped、302 subtests passed。发布版验收 JSON 的真实账号标识改为 `account-b`，其他历史验收内容保留。
+- 保存边界：同步前全部已跟踪和未跟踪改动保存在 stash `64b620d45b0f677284f72eadad542af98a4fdd1c`，未删除该快照；本轮不更新 `C:/tools`、不改认证或节点配置、不重启用户进程。既有真实新密钥添加及 Claude 启动刷新等未验证项继续留在项目接续记录中。
+
+### 2026-11-13：账户 CLAUDE.md 与 skills 下发到隔离 Claude 节点
+
+- 修改简介：新增 `claude_shared_files.py`，`apiclaude shared` 增加 `--instructions`、`--skills`、`--mcp`、`--all`；启用后每次启动经统一入口 `refresh_claude_shared` 刷新。`~/.claude/CLAUDE.md` 按字节复制到各隔离节点，账户 skill 以目录联接（Windows Junction，其他系统符号链接）挂进节点 `skills/`。状态独立存于 `~/.apiclaude/shared-files.json`，被替换的副本备份到 `shared-files-backups`。不带组件旗标的 `enable`/`disable` 仍只管 MCP。
+- 修改原因：隔离节点不读 `~/.claude`，启动器此前只同步 MCP，全局规则和 skills 要逐节点手工复制，新建节点没有规则，旧副本也会与账户版本漂移。
+- 验证情况：新增 `tests/test_claude_shared_files.py`；完整 `python -m pytest tests/ -q` 为 507 passed、38 skipped、298 subtests passed；Python 3.10 语法解析与 `git diff --check` 通过。已同步到 `C:/tools`（部署前备份 `C:/tools/backups/claude-shared-files-20261113-195023/apiagent.py`）并在本机启用：5 个隔离节点的 `CLAUDE.md` 与账户文件哈希一致，各有 7 个可读的技能联接；改动账户文件后 `apiclaude shared sync` 更新了 5 份副本并留有备份，重复同步无变化。经真实启动路径触发的刷新和非 Windows 的符号链接分支未实测。未提交或推送。
+- 安全说明：只在显式 `--account` 启用后读取 `~/.claude/CLAUDE.md` 与 `~/.claude/skills`，不写入账号目录，不涉及凭据。节点里非本工具建立的文件、目录和链接一律保留并报冲突；删除只针对本工具建立且未被改动的副本与链接，从不删除链接指向的真实目录。文件与技能刷新失败时只告警、不阻止启动。
+
 ### 2026-11-08：修复 UTF-8 Windows 下 Desktop 审计入口添加 BOM
 
 - 修改简介：Windows 审计 EXE 仅在隐藏启动、重定向标准输入时显式使用无 BOM 的 UTF-8 编码；新增实际编译入口的字节管道回归，覆盖审计与备用原生启动、中文和跨缓冲区消息。
 - 修改原因：本机账号登录菜单 2 卡在 ChatGPT 标志；.NET Framework 创建子进程标准输入时提前写入 UTF-8 BOM，导致官方 app-server 无法解析首条 initialize 消息。测试在旧实现明确复现额外的 `EF BB BF`。
 - 验证情况：专项基线 29 passed，修复后 30 passed；完整 `python -m pytest tests/ -q` 为 452 passed / 38 skipped。通过正常启动菜单 0→2 打开原具名账号，真实日志确认新入口完成 initialize 且进入 connected，用户明确确认主界面已加载；Python 3.10 语法及 `git diff --check` 通过。
 - 文档与安全说明：依据 Microsoft 官方 [Console.InputEncoding](https://learn.microsoft.com/en-us/dotnet/api/system.console.inputencoding?view=netframework-4.8.1) 与 [UTF8Encoding(Boolean)](https://learn.microsoft.com/en-us/dotnet/api/system.text.utf8encoding.-ctor?view=netframework-4.8.1) 确认编码可显式设置且 false 不提供 BOM；仅修启动器，不更改 Windows 编码、认证或官方应用。未发送模型任务或下载依赖，其他既有 Desktop 实例及正常打开的目标窗口保留；按用户要求将本次源码、回归测试和本条记录提交并推送远端，不包含本机诊断文件或账号数据。
+
+### 2026-11-04：模型发现遇到 TLS 意外断连时有限重试
+
+- 修改简介：交互添加 API Profile 的模型发现对 `SSLEOFError`（含 `URLError.reason` 包装）最多重试一次，提示网络断连；证书校验错误、认证错误仍立即失败，重试失败不保存密钥。同步更新 README、回归测试及 `C:/tools/apiagent.py` 安装入口。
+- 修改原因：用户在 403 修复后遇到 TLS `UNEXPECTED_EOF_WHILE_READING`；本机经系统代理可进入密钥校验，直连超时，连接存在偶发中断，适合对只读模型列表请求做一次有界复试。
+- 验证情况：回归测试先复现失败，修复后 `tests/test_apiagent_auth.py` 为 64 passed、18 subtests passed；Python 3.10 语法解析及 `git diff --check` 通过。安装版模拟断连后成功，站点无效测试密钥返回 HTTP 401。真实新密钥仍待用户重试验证；安装副本备份 `C:/tools/backups/model-discovery-tls-eof-20261104-212853/apiagent.py`，未提交或推送。
+
+### 2026-11-04：同步模型发现修复到本机 apicodex 安装入口
+
+- 修改简介：确认全局 `apicodex.bat` 调用 `C:/tools/apiagent.py`，其旧版缺少远端 `64d9e8a` 的模型发现修复；备份原文件后，仅将已合并修复的 `apiagent.py` 同步到该入口，保留安装副本原有的更新脚本改动。
+- 修改原因：仓库虽已拉取，用户实际运行的安装副本未更新，添加 `zzzcoding666` 仍因旧请求标识返回 HTTP 403。
+- 验证情况：安装文件与工作区 SHA-256 一致；专项 6 passed、10 subtests passed；安装模块的无密钥模拟检查确认请求标识、60 秒超时及一次重试。站点无效测试密钥实测旧标识 HTTP 403、新标识 HTTP 401；用户的新密钥未保存，实际添加仍需本人重新输入。原文件备份于 `C:/tools/backups/model-discovery-20261104-2109/apiagent.py`。
+
+### 2026-11-04：拉取远端最新提交
+
+- 修改简介：`main` 快进到 `origin/main` 的 `64d9e8a`；原有未提交改动先临时保存，拉取后无冲突恢复，未提交或推送本地改动。
+- 修改原因：用户要求拉取最新远端，同时保留当前工作区内容。
+- 验证情况：`main` 与 `origin/main` SHA 一致；`git diff --check` 通过；`tests/test_apiagent_auth.py` 和 `tests/test_codex_upgrade.py` 共 66 passed、12 subtests passed。
 
 ### 2026-11-04：发布模型发现 403 与超时修复
 
@@ -81,6 +114,7 @@
 - 修改原因：Chrome 已跟随系统代理，但 node_repl 子进程没有 HTTP(S)_PROXY，TUN 关闭时页面读取的认证联网请求失败；修复启动链路，避免依赖临时 TUN 或反复编辑生成配置。
 - 验证情况：完整 pytest 457 passed、38 skipped、278 subtests；安装模块专项29 passed。真实原生 app-server 的隔离、临时线程对照验证：旧版 MCP 子进程无代理，源码版与安装版均获得127.0.0.1:7897；无模型调用或持久聊天。作者重启后真实Chrome页面读取及截图均成功，已读取交大LaTeX项目文件树、英文编辑器与PDF预览；TUN前后均为false、系统代理127.0.0.1:7897，完成验收。
 - 安全说明：只转发标准代理变量名，不改 MCP 命令、可信代码目录或安全策略，不写代理凭据到参数或日志；未知请求逐字节转发，不记录正文。原文件、测试脚本及验证清单见 C:/tools/backups/browser-system-proxy-20261015。
+
 
 ### 2026-10-10：本机 SFM 联合同步 TPS 日志只读方案
 
@@ -182,6 +216,12 @@
 - 修改原因：用户反馈 Sol CLI 不可用且启动时弹窗较多，要求直接同步远端；旧补丁仅针对 daemon socket 路径长度，本轮不继续修补或宣称解决上述问题。
 - 验证情况：同步前专项 33 passed、1 skipped；同步后专项 38 passed、1 skipped，完整 pytest 383 passed、17 skipped；本地与 `origin/main` 提交一致，源码及测试与远端一致，`git diff --check` 通过。
 - 安全边界：保留完整 stash 和历史记录，未修改账号目录、凭据、全局部署副本或运行中的 Desktop；本轮未复现或实测修复用户反馈的 CLI 问题。
+### 2026-10-07：官方账号 TPS 默认关闭并保留显式采集
+
+- 修改简介：TPS 普通启动仅采集 API，增加单次 `--include-official`；具名账号启动器仅接受已安装 TPS 的显式采集记录、匹配账号/官方上游/标记及实际 Windows 监听进程，配置同步后再次校验。账号模块已备份部署至 C:/tools。
+- 修改原因：TPS 默认接管官方账号连接，与具名账号禁止地址覆盖的规则冲突；用户要求官方默认不开启，但保留以后按需审计的能力。
+- 验证情况：apicodex 完整 pytest 398 passed、17 skipped、256 subtests；TPS 101 passed、4 subtests。隔离真实进程/端口校验、无关 PID 拒绝及恢复通过；两个真实具名账号经部署入口执行 features list 均退出 0。三个官方配置已按恢复记录撤销采集地址，10 个 API 配置哈希及监听端口保持。
+- 验收边界：未发送额外模型请求，未重启 Desktop；现有旧 TPS 进程继续承载 API 流量，新默认策略在下次实际启动采集器时加载。详见 `关于账户登录的更新/TPS可选官方采集验收-20261007.md`；备份 `C:/tools/backups/tps-optional-20261007`。
 
 ### 2026-09-29：独立恢复多实例官方托盘
 
@@ -229,6 +269,39 @@
 - 修改简介：`apiclaude --up` 清理节点专用环境时保留终端的 HTTP(S) 代理变量，普通节点启动仍按原规则隔离代理；增加更新环境回归测试。
 - 修改原因：9 月 3 日远程代理整合后，代理变量进入通用清理列表，导致关闭 Clash TUN 时更新器直连下载站失败。
 - 验证情况：关闭 TUN 时已部署入口实测更新检查成功；仓库针对性测试 8 passed、4 subtests，完整测试 383 passed、16 skipped、235 subtests。
+
+### 2026-09-23：Codex 状态栏额度改为显示剩余
+
+- 修改简介：将 token-tracker 的 Codex hook 中 5h/7d 百分比和进度条改为剩余额度，保留 Ctx 的已用口径；同步源码模板、安装模板和当前运行脚本。
+- 修改原因：原界面只显示已用 43%，容易被误认为剩余；现明确标记“剩余 57%”。
+- 验证情况：按已用 0%、43%、100% 检查限额显示，检查 Ctx 9% 保持原口径及风险颜色；生成脚本语法编译通过。
+
+### 2026-09-22：撤销 AWPL 项目推理强度覆盖
+
+- 修改简介：按用户要求删除 `C:/Users/SFM/Desktop/AWPL数据/AWPL论文/.codex/config.toml` 中的 `high` 设置及对应注释，并在论文项目记录撤销原因。
+- 修改原因：日常写作建议被固化为优先级更高的项目配置，覆盖 tiantiansub2api 的 `xhigh`，干扰用户在 Desktop 选择推理强度。
+- 验证情况：读回解析确认项目配置为空、TOML 有效，profile 默认仍为 `xhigh`；未修改启动器源码或进行 Desktop 界面复验。
+
+### 2026-09-21：移除委派的父会话历史注入
+
+- 修改简介：spawn 默认仅发送简短任务说明，移除父历史读取、JSON 拼接及 fork；旧 auto 参数兼容为无历史。旧历史任务禁止追问、仍可等待或中断；全局 Skill、工具说明及两项目约定同步。
+- 修改原因：用户实测发现大量无关父对话占用 B 输入额度，要求停止整段历史传入；由主代理只提供当前任务必要事实和验收条件。
+- 验证情况：完整 pytest 382 passed、16 skipped、235 subtests；官方隔离空线程验证 1 passed，未启动模型请求。覆盖大父历史不读取、默认/none/auto 仅发送原说明、旧任务禁止 steer/resume 且保留结果；Skill 校验、Python 3.10 语法/编译、部署读回通过。两来源新 MCP 均返回 7 工具、默认 none 与 task-brief-only。
+- 部署边界：C:/tools 与全局 Skill 已备份更新，备份 delegate-brief-20260921-124117。当前会话实查仍连接旧进程，须重启 MCP 或退出对应 Codex 实例再打开；仅新建对话不保证重载。旧服务上显式 context=none 可避免新派发附带历史。保留原额度保底、认证、沙箱和历史记录。详见 `关于账户登录的更新/简短任务委派验收-20260921.md`。
+
+### 2026-09-21：额度查询工具与 10% 委派保底
+
+- 修改简介：新增只读 `get_usage` 和独立额度解析模块；新派发、续聊及追加指令前经官方接口重新查额度。任一返回的 5h/7d 窗口剩余 ≤10%、官方限制或数据不可确认时返回 quota_blocked，已有任务继续，等待和手动中断保持可用；Skill 同步查询与恢复规则。
+- 修改原因：用户明确选择保留 10%，让当前任务完成、停止后续派发和追问；把保底置于控制器入口，避免仅靠模型提醒，查询失败先暂停。
+- 验证情况：完整 pytest 382 passed、16 skipped、232 subtests；覆盖两个窗口边界、多个计费桶、无效/过期/缺失数据、运行中阻止追问但可完成、恢复保留原线程及客户端清理。新 MCP 真实只读查询 B 成功（5h/7d 均已用 0%），两个来源官方发现 7 个工具；没有运行模型回复或消耗重置额度。Skill 校验、Python 3.10 语法/编译、部署哈希和 diff 检查通过。
+- 部署边界：模块和全局 Skill 已备份部署；账号、沙箱及工具信任不变，重载 MCP 或新开任务生效。10% 是准入保底，当前任务或其他客户端仍可能继续消耗；详见 `关于账户登录的更新/额度保底验收-20260921.md`。
+
+### 2026-09-21：全局项目目录与 Plus 子代理 Skill
+
+- 修改简介：新增显式 `--all-workspaces` / `workspacePolicy=any`，在任意已有项目目录委派，每次必须传绝对 cwd；旧白名单模式兼容。新增可维护的 `skills/plus-agent`，安装到用户级 `.agents/skills`，支持 `$plus-agent` 和正常隐式匹配。
+- 修改原因：用户要求换文件夹无需登记，且通过 Skill 调用；保留 B 账号、workspace-write 沙箱和已批准的三个工具信任，不放大全盘写权限或修改其他 profile。
+- 验证情况：完整 pytest 372 passed、16 skipped、218 subtests；Skill 官方校验通过。官方 app-server 在旧白名单之外的临时项目中，从当前 API profile 和账号 A 均发现唯一、启用的 user-scope plus-agent；两入口发现 6 个 MCP 工具，无错误。新测试覆盖跨目录派发 cwd/沙箱绑定、恢复、缺省及相对路径拒绝、安装预览与互斥参数。
+- 部署说明：两个控制器模块备份部署至 C:/tools（保留并带上 9 月 19 日已入库的异常处理修补），两入口 settings 备份后切为全局目录，账号/沙箱/原 MCP 信任读回保持；没有运行额外真实模型任务，现有窗口需重载 MCP 或新开任务。详见 `关于账户登录的更新/全局Plus-Skill验收-20260921.md`。
 
 ### 2026-09-19：委派控制器审查修补（非破坏性）
 
@@ -1208,3 +1281,11 @@
 - 修改原因：Desktop 每次启动重写可信代码路径，原共享缓存的真实路径位于账号外，导致 Trusted RPC 依赖无法加载；单次追加路径会在下次启动失效。
 - 验证情况：完整测试450 passed、38 skipped、263 subtests；两个账号各2863个文件逐项哈希一致，真实路径位于各自 home，重复迁移不移动本地缓存，配置合并保留账号 node_repl。重置内核后已能发现Chrome、Edge及内置浏览器。
 - 边界：浏览器标签页通信仍报 nodeRepl.fetch request failed，扩展及本地通信注册检查通过。实测桌面/内核继承7897代理，但node_repl进程没有代理变量；直连DNS失败。等待作者批准临时TUN验证，尚未访问或修改Overleaf。未复制凭据或改网站权限，备份与部署清单见 C:/tools/backups/browser-local-cache-20261014。
+
+### 2026-10-24 09:33:48 +08:00 · Codex / 未提供 / 未提供 · 接入方式未提供：修复 Windows CLI 更新入口
+
+- 修改简介：Windows 更新从官方 releases.openai.com 下载独立安装器，下载失败时尝试 openai/codex 官方仓库；临时脚本以文件执行并清理，显式选择 latest，失败返回非零。源码 apiagent.py 已同步 C:/tools，README 与对应测试同步更新。
+- 修改原因：原 chatgpt.com/codex/install.ps1 实测返回 404；保留现有官方独立安装目录与原有 CLI 选择规则，无需引入 npm 运行依赖。更新子进程清除继承的 Codex 账号/认证环境，保留终端代理。
+- 验证情况（已验证）：PowerShell 主源成功、备用源成功、双源失败、安装失败 4 项真实脚本测试通过；专项 69 passed / 4 subtests，完整 pytest 461 passed / 38 skipped / 278 subtests；Python 3.10 语法与 diff check 通过。真实 apicodex --up 将 0.156.0 升至 0.164.0，再次更新退出码 0；普通 codex 和 ApiCodex 官方解析器均报告 0.164.0，current 联接指向新版本。
+- 保存边界：改动前源码/部署入口及已有 README、AGENTS 修改保存在 C:/tools/backups/codex-upgrade-20261024；0.156.0 原官方包仍保留。未提交或推送；原有 delegate、skills、README、AGENTS 未提交内容保留。未主动关闭用户窗口、未修改认证或模型配置。
+- 未关问题与下一步：本次修复与升级已完成，无待用户决定事项；后续仍使用 apicodex --up 更新官方 CLI。未来若两个官方来源都失效，按明确错误提示检查来源，避免改为第三方二进制。

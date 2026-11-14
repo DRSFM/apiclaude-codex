@@ -63,7 +63,7 @@ class CliReliabilityTests(unittest.TestCase):
         updating["nodes"]["second"] = copy.deepcopy(updating["nodes"]["relay"])
         api.save_claude_config(updating)
         with (
-            patch.object(api, "sync_claude_shared_mcp", return_value=(True, {})),
+            patch.object(api, "refresh_claude_shared", return_value=True),
             patch.object(api, "get_claude_secret", return_value="synthetic-placeholder"),
             patch.object(api, "run_command", return_value=0),
             redirect_stdout(io.StringIO()),

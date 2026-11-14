@@ -320,6 +320,29 @@ this source-owned MCP entry. Reload MCP tools or open a new session to activate;
 existing windows are not restarted. To disable it, set `enabled = false` in
 `[mcp_servers.apicodex_delegate]`; task histories and artifacts remain.
 
+For use from any project directory, replace all `--workspace` arguments with
+`--all-workspaces`. This selects `workspacePolicy = "any"`; each `spawn` must
+still pass an existing absolute project `cwd`. The worker sandbox applies to
+that task's cwd, not to an entire drive. Existing installations without this
+setting retain their original allowlist behavior. Keep `--trust-tools` when
+reinstalling if you have already explicitly approved those three tool policies.
+
+The optional `skills/plus-agent` folder contains a concise skill for this MCP.
+Copy it to the user's `~/.agents/skills/plus-agent` directory for discovery
+across projects. Invoke `$plus-agent` with a task, or select it from the client’s
+Skills picker (`/skills` in Codex CLI). For example:
+
+```text
+$plus-agent Ask account B to review this project's error handling; you verify the findings.
+```
+
+The skill chooses the current project cwd and handles dispatch, waiting and
+verification, without requiring project-specific AGENTS.md additions. It also
+supports normal implicit matching when the user requests B/Plus delegation.
+The source profile must still have this MCP configured: user-level skill
+discovery does not register the server in unrelated accounts/profiles. Reload
+MCP or start a new session after upgrading an already-running controller.
+
 By default, official MCP approval rules still apply to dispatch, follow-up and
 interruption. With `approval_policy = "never"`, those calls can be rejected
 before reaching the controller. After explicitly deciding to trust this local
@@ -330,7 +353,7 @@ the worker sandbox or other tools' approval policies. Reinstall without that
 flag to remove this explicit trust. Do not relabel writes as read-only to avoid
 approval, and do not enable trust in response to a rejection without user consent.
 
-The model receives `list_accounts`, `spawn`, `list_tasks`, `wait`, `send_message`
+The model receives `list_accounts`, `get_usage`, `spawn`, `list_tasks`, `wait`, `send_message`
 and `interrupt`. Pass the current project `cwd` when spawning, use a stable
 `request_id` for retries, and wait for a confirmed terminal status before final
 acceptance. Follow-ups resume the same official B thread/account. Only the
@@ -339,17 +362,45 @@ delegated task per target account may run at a time across controllers; no
 automatic account/model fallback occurs. A disconnected controller reports
 `detached`; continuation is blocked while another controller holds the account.
 
-`context=auto` tries official fork for eligible legacy sessions. Current
-paginated sessions use official `thread/read` to supply supported visible user,
-assistant and tool history as background to a new thread. The result reports
-the actual mode. Hidden reasoning is excluded from that adapter, and images or
-unsupported item types are not guaranteed equivalent. History above 1 MiB is
-rejected without truncation; use `context=none` with an explicit task in that
-case. This does not clone the native subagent UI or its complete internal state.
+`get_usage` reads the selected account's official `account/rateLimits/read`
+endpoint without starting a model turn, forcing login/refresh, or consuming a
+reset credit. It reports remaining percentages, window durations, Unix reset
+times and a `guard.allowNewCalls` decision. No extra tool approval is configured
+for this read-only query.
+
+The controller reserves **10%**: before starting a new task, resuming a completed
+task, or steering running work, it fetches fresh usage and refuses that new call
+when any reported 5-hour or 7-day bucket has 10% or less remaining. Official
+usage restrictions, incomplete data, missing permission, stale reset data and
+query failures also block new calls. Multiple buckets are checked conservatively
+and are not summed or guessed to be interchangeable model budgets.
+
+A refusal returns `status = "quota_blocked"`. A blocked follow-up also returns
+`accepted = false` and the original `taskStatus`; its existing answer/thread are
+retained. Already-running work may finish, and `wait`/`interrupt` stay available.
+After a fresh healthy reading, explicitly continue the original task, or retry
+the same request ID and arguments when a blocked spawn never created a thread.
+Reset timestamps alone do not authorize recovery; no automatic retry, reset-credit
+spending, fallback account or forced interruption is performed. One running task
+or concurrent use elsewhere may consume part of the reserve: this is an admission
+check, not an exact quota cap. The Plus skill follows these same rules.
+
+`spawn` defaults to `context=none`: send a concise task brief containing necessary
+facts, file paths, scope and acceptance criteria. Never paste parent transcripts,
+chat JSON or unrelated tool logs. The controller does not read, copy or fork parent
+history. Legacy `context=auto` is accepted but also omits history. Explicit `none`
+is recommended for callers that may still be connected to an older MCP process.
+New tasks start independent official threads; follow-ups retain only that task's
+own conversation. Legacy tasks containing inherited parent history reject follow-ups:
+let running work finish, then create a new task with a short brief and new request ID.
+Their results and records remain available. This does not clone the native subagent UI.
+Restart the MCP server to activate installed code; a new conversation alone may
+reuse an existing process.
 
 The host fixes the sandbox at install time (`read-only` by default, or official
 `workspace-write`); it does **not** dynamically inherit the parent's current
-approval settings. Only configured project directories can be selected as cwd.
+approval settings. In allowlist mode, cwd is limited to configured directories;
+in global mode, each task must explicitly select its existing project directory.
 Official workspace-write rules still govern filesystem writes, and shared MCP
 tools retain their own permissions. Interactive approval/input requests stop for
 attention instead of being approved by the controller. Apps/plugins are disabled
@@ -360,8 +411,8 @@ Records are under `子代理任务/<date_time_account_model_task>/`: task input,
 visible execution log, result and status metadata, with a README index. They are
 local, not a guarantee that Desktop places the thread in its native subagent
 panel. Controller shutdown interrupts active workers and preserves resumable
-official histories. B's subscription must support the chosen model; inheriting
-context consumes B's own quota. Inspect failed/uncertain tasks before retrying.
+official histories. B's subscription must support the chosen model; task input and
+execution consume B's own quota. Inspect failed/uncertain tasks before retrying.
 
 ### Optional two-line usage display
 
@@ -490,7 +541,7 @@ preserves the credential instead of asking for a replacement API key. Use
 `apicodex --api-add --api-profile NAME` when you explicitly want to replace one.
 An older protected Keychain item may still require one macOS authorization during
 its first migration. `apicodex --up` uses the official CLI's `codex update` on
-macOS/Linux; the Windows installer remains unchanged.
+macOS/Linux; Windows uses the official standalone installer.
 
 ## Install On Windows
 
@@ -541,8 +592,9 @@ argument; it is read through a hidden prompt, used in memory for discovery, and
 stored in the platform secure store. Normal Codex arguments such as
 `apicodex --model MODEL` continue to pass through to Codex.
 
-Guided setup uses a 60-second network timeout and retries a timeout once without
-asking for the API key again. Authentication errors are reported immediately.
+Guided setup uses a 60-second network timeout and retries a timeout or abruptly
+closed TLS connection once without asking for the API key again. Authentication
+and certificate verification errors are reported immediately.
 If discovery still fails, the existing profile and stored credential are
 preserved, and setup reports that the new key was not saved.
 
@@ -1023,8 +1075,13 @@ apicodex --up
 apicodex --api-help
 ```
 
-`apicodex --up` runs the official Codex installer to update the standalone
-Codex CLI. On Windows, PowerShell (`pwsh` or `powershell`) must be available.
+`apicodex --up` updates the official Codex CLI to the latest stable release.
+On Windows it downloads the standalone installer from
+`https://releases.openai.com/codex/install.ps1`, with the official
+`openai/codex` GitHub repository as a download fallback. The installer verifies
+release checksums and keeps the existing standalone command location. Download
+or installation errors return a nonzero exit code. PowerShell 7 (`pwsh`) is
+preferred; Windows PowerShell is used only when `pwsh` is unavailable.
 
 ## Claude Usage
 
@@ -1125,6 +1182,51 @@ This machine registers `SDW_Search` in both the ApiCodex account MCP source and
 the Claude user MCP source. Its Codex definition is synchronized to every
 ApiCodex profile, and its Claude definition is synchronized to every isolated
 ApiClaude node.
+
+### Shared Claude instructions and skills
+
+An isolated node reads `CLAUDE.md` and `skills/` from its own config directory,
+not from `~/.claude`, so a new node starts with neither. Sharing them is a
+separate opt-in on top of MCP sharing:
+
+```powershell
+apiclaude shared enable --account --instructions --skills --dry-run
+apiclaude shared enable --account --instructions --skills
+apiclaude shared enable --account --all      # MCP, instructions and skills
+apiclaude shared status
+apiclaude shared sync
+apiclaude shared disable --instructions --skills
+```
+
+`shared enable --account` and `shared disable` without a component flag keep
+their original meaning and change MCP sharing only. `shared sync` and
+`shared status` cover every enabled component and take no component flag.
+
+- **Instructions.** `~/.claude/CLAUDE.md` is copied byte for byte into each
+  isolated node. Edit the account file; the copies follow on the next launch of
+  any node. A node copy that was edited in place is kept and reported as a
+  conflict, and launching that node prints a warning, because it no longer
+  follows the account file. Replaced copies are backed up under
+  `~/.apiclaude/shared-files-backups`.
+- **Skills.** Each directory in `~/.claude/skills` that contains a `SKILL.md`
+  becomes a directory link (a junction on Windows, a symlink elsewhere) inside
+  the node's `skills/`, pointing at the directory that really holds the skill.
+  The node therefore always reads the current version and nothing is copied. A
+  skill directory or link that already exists in a node and was not created by
+  ApiClaude is kept and reported as a conflict; move it away to let the account
+  version take its place.
+- **Removal.** `disable`, and skills deleted from the account, remove only the
+  copies and links that ApiClaude created and that are unchanged since. Links
+  are removed as links; the directory a link points at is never touched.
+- **Failures.** A missing `~/.claude/CLAUDE.md` or `~/.claude/skills` produces a
+  warning and leaves node content as it is. If refreshing instructions or
+  skills fails during a launch, Claude still starts with what the node already
+  has. A failed MCP refresh still stops the launch, as before.
+
+Sharing state is stored in `~/.apiclaude/shared-files.json`, separate from
+`shared-mcp.json`. Shared-mode nodes already read `~/.claude` directly and are
+not touched. The Claude Code VS Code extension and `apiclaude --desktop` use the
+same node config directory, so they see the same instructions and skills.
 
 ### Experimental Codex Profile bridge
 

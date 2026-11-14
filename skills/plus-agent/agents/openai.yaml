@@ -1,0 +1,6 @@
+interface:
+  display_name: "Plus 账号子代理"
+  short_description: "在任意项目调用闲置 Plus 账号执行子任务，由主模型规划并验收结果"
+  default_prompt: "使用 $plus-agent，以 context=none 和简短任务说明将独立子任务交给 B，不附带父对话历史；你负责规划和最终验收。"
+policy:
+  allow_implicit_invocation: true

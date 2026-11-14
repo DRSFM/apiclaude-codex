@@ -1,0 +1,26 @@
+{
+  "backup": "C:\\tools\\backups\\delegate-brief-20260921-124117",
+  "deployedFiles": [
+    "C:\\tools\\codex_delegate.py",
+    "C:\\Users\\SFM\\.agents\\skills\\plus-agent\\SKILL.md",
+    "C:\\Users\\SFM\\.agents\\skills\\plus-agent\\agents\\openai.yaml"
+  ],
+  "freshMcp": [
+    {
+      "settings": "C:\\Users\\SFM\\.codex-api\\delegation\\settings-b10ad3eecc529529.json",
+      "tools": 7,
+      "contextDefault": "none",
+      "contextPolicy": "task-brief-only",
+      "quotaReservePercent": 10
+    },
+    {
+      "settings": "C:\\Users\\SFM\\.codex-api\\delegation\\settings-5ce95913832132e4.json",
+      "tools": 7,
+      "contextDefault": "none",
+      "contextPolicy": "task-brief-only",
+      "quotaReservePercent": 10
+    }
+  ],
+  "activeHostReloaded": false,
+  "modelTurnsStarted": 0
+}

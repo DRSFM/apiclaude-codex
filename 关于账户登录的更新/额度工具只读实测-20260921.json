@@ -1,0 +1,42 @@
+{
+  "toolCount": 7,
+  "getUsageReadOnly": true,
+  "usage": {
+    "accountId": "account-b",
+    "queriedAt": "2026-09-21T01:18:02.048372+00:00",
+    "available": true,
+    "ordinaryUsageAllowed": true,
+    "buckets": [
+      {
+        "limitId": "codex",
+        "windows": [
+          {
+            "slot": "primary",
+            "label": "5h",
+            "windowDurationMins": 300,
+            "usedPercent": 0,
+            "remainingPercent": 100.0,
+            "resetsAt": 1789971481
+          },
+          {
+            "slot": "secondary",
+            "label": "7d",
+            "windowDurationMins": 10080,
+            "usedPercent": 0,
+            "remainingPercent": 100.0,
+            "resetsAt": 1790558281
+          }
+        ],
+        "planType": "plus",
+        "serviceBlocked": false
+      }
+    ],
+    "guard": {
+      "reservePercent": 10,
+      "allowNewCalls": true,
+      "reason": null,
+      "activeTaskPolicy": "finish",
+      "scope": "all_reported_5h_and_7d_windows"
+    }
+  }
+}

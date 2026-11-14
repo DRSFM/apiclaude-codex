@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -667,6 +668,7 @@ class ApiAgentAuthTests(KeychainIsolationMixin):
                 apiagent.CODEX_INSTALL_SCRIPT,
             ],
         )
+        self.assertEqual(run.call_args.kwargs["env_remove"], apiagent.CODEX_API_ENV_REMOVE)
 
     def test_codex_config_uses_profile_scoped_environment_key(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -869,6 +871,61 @@ class ApiAgentAuthTests(KeychainIsolationMixin):
                 if isinstance(first, SlowResponse):
                     self.assertTrue(first.closed)
 
+    def test_model_discovery_retries_interrupted_tls_once(self) -> None:
+        class InterruptedResponse(io.BytesIO):
+            def read(self, size=-1):
+                raise ssl.SSLEOFError(8, "unexpected EOF")
+
+        for first in (
+            ssl.SSLEOFError(8, "unexpected EOF"),
+            URLError(ssl.SSLEOFError(8, "unexpected EOF")),
+            InterruptedResponse(),
+        ):
+            with (
+                self.subTest(first=type(first).__name__),
+                patch.object(apiagent, "urlopen", side_effect=[
+                    first, io.BytesIO(b'{"data": [{"id": "vendor-model"}]}'),
+                ]) as request,
+                redirect_stderr(io.StringIO()) as error,
+            ):
+                models = apiagent.fetch_codex_provider_models(
+                    "https://example.test/v1", "sk-test-secret",
+                    timeout=60, retry_ssl_eof=True,
+                )
+                self.assertEqual(models, ["vendor-model"])
+                self.assertEqual(request.call_count, 2)
+                self.assertIn("TLS connection closed unexpectedly; retrying once", error.getvalue())
+                self.assertNotIn("sk-test-secret", error.getvalue())
+                if isinstance(first, InterruptedResponse):
+                    self.assertTrue(first.closed)
+
+    def test_model_discovery_tls_retry_is_bounded_and_rejects_bad_certificates(self) -> None:
+        for retry, attempts in ((False, 1), (True, 2)):
+            with (
+                self.subTest(retry=retry),
+                patch.object(apiagent, "urlopen", side_effect=ssl.SSLEOFError(8, "unexpected EOF")) as request,
+                redirect_stderr(io.StringIO()) as error,
+            ):
+                with self.assertRaisesRegex(ValueError, "TLS connection closed unexpectedly") as caught:
+                    apiagent.fetch_codex_provider_models(
+                        "https://example.test/v1", "sk-test-secret", retry_ssl_eof=retry,
+                    )
+                self.assertEqual(request.call_count, attempts)
+                self.assertNotIn("sk-test-secret", str(caught.exception))
+                self.assertNotIn("sk-test-secret", error.getvalue())
+
+        with (
+            patch.object(apiagent, "urlopen", side_effect=ssl.SSLCertVerificationError(1, "bad certificate")) as request,
+            redirect_stderr(io.StringIO()) as error,
+        ):
+            with self.assertRaises(ValueError):
+                apiagent.fetch_codex_provider_models(
+                    "https://example.test/v1", "sk-test-secret",
+                    retry_timeouts=True, retry_ssl_eof=True,
+                )
+            self.assertEqual(request.call_count, 1)
+            self.assertNotIn("retrying", error.getvalue())
+
     def test_model_discovery_does_not_retry_non_timeout_failures(self) -> None:
         failures = [
             HTTPError("https://example.test/v1/models", code, "Rejected", {}, None)
@@ -919,7 +976,7 @@ class ApiAgentAuthTests(KeychainIsolationMixin):
             patch.object(apiagent, "getpass", return_value="\ufeffsk-new-secret") as prompt,
             patch("builtins.input", return_value=""),
             patch.object(apiagent, "urlopen", side_effect=[
-                TimeoutError("The read operation timed out"),
+                ssl.SSLEOFError(8, "unexpected EOF"),
                 io.BytesIO(b'{"data": [{"id": "saved-model"}]}'),
             ]) as request,
             redirect_stderr(io.StringIO()),
@@ -945,6 +1002,7 @@ class ApiAgentAuthTests(KeychainIsolationMixin):
         failures = [
             (HTTPError("https://example.test/v1/models", 403, "Forbidden", {}, None), "HTTP 403", 1),
             (TimeoutError("The read operation timed out"), "model discovery timed out", 2),
+            (ssl.SSLEOFError(8, "unexpected EOF"), "TLS connection closed unexpectedly", 2),
         ]
         for failure, message, attempts in failures:
             with (
@@ -1055,6 +1113,7 @@ class ApiAgentAuthTests(KeychainIsolationMixin):
                 "sk-vendor-secret",
                 timeout=60,
                 retry_timeouts=True,
+                retry_ssl_eof=True,
             )
             profile = save_profiles.call_args.args[0][0]
             self.assertEqual(profile["model"], "DeepSeek-V4-Flash-0731")

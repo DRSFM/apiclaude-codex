@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import time
 import unittest
 import uuid
 from types import SimpleNamespace
@@ -29,6 +30,7 @@ class FakeClient:
         self.closed = False
         self.thread = str(uuid.uuid4())
         self.turn = None
+        self.quota_used = 0
         self.instances.append(self)
 
     def start(self):
@@ -36,6 +38,10 @@ class FakeClient:
 
     def request(self, method, params, **kwargs):
         self.requests.append((method, params))
+        if method == 'account/rateLimits/read':
+            return {'ordinaryUsageAllowed': True, 'rateLimits': {'limitId': 'codex',
+                'primary': {'usedPercent': self.quota_used, 'windowDurationMins': 300, 'resetsAt': int(time.time()) + 1000},
+                'secondary': {'usedPercent': 0, 'windowDurationMins': 10080, 'resetsAt': int(time.time()) + 10000}}}
         if method in {'thread/start', 'thread/fork'}:
             return {'thread': {'id': self.thread}}
         if method == 'turn/start':
@@ -112,15 +118,15 @@ class DelegateTests(unittest.TestCase):
     def spawn(self, **kwargs):
         return self.manager.spawn(self.owner, message='Find the reference.', request_id='task-1', **kwargs)
 
-    def test_context_target_binding_result_archive_and_idempotency(self):
+    def test_brief_target_binding_result_archive_and_idempotency(self):
         result = self.spawn()
         self.assertEqual(result['status'], 'running')
         self.assertEqual(result['accountId'], self.profile['id'])
-        self.assertEqual(result['context']['mode'], 'official_visible_history')
+        self.assertEqual(result['context']['mode'], 'none')
         client = FakeClient.instances[-1]
         self.assertEqual(client.home, accounts.profile_home(self.profile, api))
         prompt = next(params['input'][0]['text'] for method, params in client.requests if method == 'turn/start')
-        self.assertIn('BLUE-7312', prompt)
+        self.assertEqual(prompt, 'Find the reference.')
         self.assertNotIn('hidden-canary', prompt)
         self.assertIn('agents.enabled=false', client.kwargs['config_overrides'])
         repeat = self.spawn()
@@ -136,22 +142,49 @@ class DelegateTests(unittest.TestCase):
         self.assertEqual((Path(done['artifacts']) / '结果.md').read_text(), 'BLUE-7312')
         self.assertFalse(list((client.home / '.apicodex-runs').glob('*.json')))
 
-    def test_native_legacy_fork_is_preferred(self):
+    def test_default_none_and_legacy_auto_never_open_parent_or_fork(self):
+        # Even a huge available parent transcript must never reach B.
         path = self.source / 'sessions' / 'sample.jsonl'
         path.parent.mkdir()
-        path.write_text(json.dumps({'payload': {'history_mode': 'legacy'}}) + '\n')
-        read = FakeSource.read_thread
-        def source(instance, owner, **kwargs):
-            return {**read(instance, owner, **kwargs), 'path': str(path)}
-        with patch.object(FakeSource, 'read_thread', source):
-            result = self.spawn()
-        self.assertEqual(result['context']['mode'], 'official_fork')
-        self.assertIn('thread/fork', [method for method, _ in FakeClient.instances[-1].requests])
+        history = json.dumps({'payload': {'history_mode': 'legacy'},
+                              'text': 'PARENT-CANARY' * 100000})
+        path.write_text(history, encoding='utf-8')
+        with patch.object(FakeSource, '__init__', side_effect=AssertionError('parent runtime opened')):
+            for mode in (None, 'none', 'auto'):
+                with self.subTest(context=mode):
+                    result = self.manager.spawn(self.owner, message='Find the reference.',
+                        request_id='brief-' + str(mode), **({} if mode is None else {'context': mode}))
+                    self.assertEqual(result['status'], 'running')
+                    self.assertEqual(result['context'], {'mode': 'none'})
+                    client = FakeClient.instances[-1]
+                    self.assertNotIn('thread/fork', [m for m, _ in client.requests])
+                    self.assertNotIn('thread/read', [m for m, _ in client.requests])
+                    prompt = next(p['input'][0]['text'] for m, p in client.requests if m == 'turn/start')
+                    self.assertEqual(prompt, 'Find the reference.')
+                    client.complete()
+                    self.manager.wait(self.owner, result['taskId'], 0)
+        self.assertEqual(path.read_text(encoding='utf-8'), history)
 
-    def test_no_context_is_explicit_and_does_not_read_parent(self):
-        with patch.object(FakeSource, 'read_thread', side_effect=AssertionError('read parent')):
-            result = self.spawn(context='none')
-        self.assertEqual(result['context'], {'mode': 'none'})
+    def test_legacy_history_tasks_cannot_be_steered_or_resumed(self):
+        for mode in ('official_fork', 'official_visible_history'):
+            result = self.manager.spawn(self.owner, message='Brief', request_id=mode)
+            task = self.manager.tasks[result['taskId']]
+            task.record['context'] = {'mode': mode}
+            self.manager._persist(task)
+            client = FakeClient.instances[-1]
+            before = len(client.requests)
+            with self.assertRaisesRegex(delegate.DelegateError, 'contains parent history'):
+                self.manager.send_message(self.owner, result['taskId'], 'Continue')
+            self.assertEqual(len(client.requests), before)
+            client.complete('Existing result retained')
+            done = self.manager.wait(self.owner, result['taskId'], 0)
+            self.assertEqual(done['status'], 'completed')
+            restarted = self.make_manager()
+            count = len(FakeClient.instances)
+            with self.assertRaisesRegex(delegate.DelegateError, 'contains parent history'):
+                restarted.send_message(self.owner, result['taskId'], 'Continue')
+            self.assertEqual(len(FakeClient.instances), count)
+            self.assertEqual(restarted.inspect(self.owner, result['taskId'])['answer'], 'Existing result retained')
 
     def test_wrong_owner_and_disallowed_workspace_account_are_rejected(self):
         result = self.spawn()
@@ -194,11 +227,10 @@ class DelegateTests(unittest.TestCase):
         self.assertEqual(failed['status'], 'failed')
         self.assertEqual(len(FakeClient.instances), 1)
 
-    def test_context_size_and_empty_context_fail_without_summary_fallback(self):
-        with self.assertRaises(delegate.DelegateError):
-            delegate.visible_context({'turns': []})
-        with self.assertRaises(delegate.DelegateError):
-            delegate.visible_context({'turns': [{'items': [{'type': 'agentMessage', 'text': 'x' * (delegate.MAX_CONTEXT + 1)}]}]})
+    def test_tool_contract_defaults_to_brief_only(self):
+        tool = next(t for t in delegate.tool_definitions() if t['name'] == 'spawn')
+        self.assertEqual(tool['inputSchema']['properties']['context']['default'], 'none')
+        self.assertEqual(self.manager.list_accounts()['contextPolicy'], 'task-brief-only')
 
     def test_retry_from_second_controller_does_not_duplicate_or_overwrite_active_task(self):
         other = self.make_manager()
@@ -255,7 +287,12 @@ class DelegateTests(unittest.TestCase):
         self.assertEqual(self.manager.send_message(self.owner, result['taskId'], 'Retry explicitly.')['status'], 'running')
 
     def test_runtime_failure_retains_record_redacts_error_and_releases_lease(self):
-        with patch.object(FakeClient, 'request', side_effect=AppServerError('token=synthetic-secret')):
+        original = FakeClient.request
+        def fail_runtime(client, method, params, **kwargs):
+            if method == 'account/rateLimits/read':
+                return original(client, method, params, **kwargs)
+            raise AppServerError('token=synthetic-secret')
+        with patch.object(FakeClient, 'request', fail_runtime):
             result = self.spawn(context='none')
         self.assertEqual(result['status'], 'failed')
         self.assertNotIn('synthetic-secret', json.dumps(result))
@@ -308,10 +345,13 @@ class DelegateTests(unittest.TestCase):
         self.assertTrue(FakeClient.instances[-1].closed)
         resumed = self.manager.send_message(self.owner, result['taskId'], 'continue')
         self.assertEqual(resumed['status'], 'running')
-        self.assertEqual(FakeClient.instances[-1].requests[0][0], 'thread/resume')
+        self.assertIn('thread/resume', [m for m, _ in FakeClient.instances[-1].requests])
 
     def test_malformed_official_response_fails_task_and_releases_lease(self):
-        with patch.object(FakeClient, 'request', return_value={}):
+        original = FakeClient.request
+        def malformed(client, method, params, **kwargs):
+            return original(client, method, params, **kwargs) if method == 'account/rateLimits/read' else {}
+        with patch.object(FakeClient, 'request', malformed):
             result = self.spawn(context='none')
         self.assertEqual(result['status'], 'failed')
         self.assertTrue(FakeClient.instances[-1].closed)
@@ -341,7 +381,7 @@ class DelegateTests(unittest.TestCase):
         server = delegate.DelegateMcpServer(self.manager)
         base = {'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call'}
         tools = server.handle({'id': 2, 'method': 'tools/list'})['result']['tools']
-        self.assertEqual(len(tools), 6)
+        self.assertEqual(len(tools), 7)
         missing = server.handle({**base, 'params': {'name': 'spawn', 'arguments': {'message': 'hi', 'request_id': 'one'}}})
         self.assertTrue(missing['result']['isError'])
         good = server.handle({**base, 'params': {'name': 'spawn', '_meta': {'threadId': self.owner},
@@ -386,6 +426,47 @@ class DelegateTests(unittest.TestCase):
         delegate.install(ns, api)
         self.assertNotIn('approval_mode', path.read_text())
 
+    def test_global_workspaces_bind_each_task_and_restore_outside_old_roots(self):
+        other_work = self.root / 'another-project'
+        other_work.mkdir()
+        with self.assertRaises(delegate.DelegateError):
+            self.manager._cwd(str(other_work))
+        self.config.update(workspacePolicy='any', workspaces=[])
+        manager = self.make_manager()
+        for cwd in (None, '.', str(other_work / 'missing')):
+            with self.assertRaises(delegate.DelegateError):
+                manager.spawn(self.owner, message='global task', request_id='global-task', cwd=cwd, context='none')
+        result = manager.spawn(self.owner, message='global task', request_id='global-task', cwd=str(other_work), context='none')
+        self.assertEqual(result['status'], 'running')
+        self.assertEqual(Path(result['cwd']), other_work)
+        self.assertTrue(Path(result['artifacts']).is_relative_to(other_work))
+        params = next(p for m, p in FakeClient.instances[-1].requests if m == 'thread/start')
+        self.assertEqual(params['cwd'], str(other_work))
+        self.assertEqual(params['sandbox'], 'read-only')
+        FakeClient.instances[-1].complete()
+        manager.wait(self.owner, result['taskId'], 0)
+        restored = self.make_manager().inspect(self.owner, result['taskId'])
+        self.assertEqual(restored['status'], 'completed')
+        self.assertEqual(restored['cwd'], str(other_work))
+        self.assertEqual(manager.list_accounts()['workspacePolicy'], 'any')
+
+    def test_global_install_preview_and_scope_are_explicit(self):
+        ns = argparse.Namespace(source_home=self.source, target_account=['b'], workspace=None,
+                                all_workspaces=True, sandbox='workspace-write', dry_run=True, trust_tools=True)
+        before = (self.source / 'config.toml').read_bytes()
+        result = delegate.install(ns, api)
+        self.assertEqual(result['workspacePolicy'], 'any')
+        self.assertEqual((self.source / 'config.toml').read_bytes(), before)
+        ns.dry_run = False
+        delegate.install(ns, api)
+        config = json.loads(Path(result['config']).read_text(encoding='utf-8'))
+        self.assertEqual(config['workspacePolicy'], 'any')
+        self.assertEqual(config['workspaces'], [])
+        self.assertEqual(config['sandbox'], 'workspace-write')
+        ns.workspace = [self.work]
+        with self.assertRaises(delegate.DelegateError):
+            delegate.install(ns, api)
+
 
 class DelegateTransportTests(unittest.TestCase):
     def test_notifications_progress_without_an_outstanding_request_and_approval_is_not_granted(self):
@@ -413,53 +494,19 @@ class DelegateTransportTests(unittest.TestCase):
 class NativeDelegateTests(unittest.TestCase):
     setUp = DelegateTests.setUp
     make_manager = DelegateTests.make_manager
-    # Only synthetic histories and empty temporary account homes; no turns or
-    # model requests are started in these interface compatibility checks.
-    def test_official_legacy_fork_and_paginated_context_adapter(self):
-        from codex_app_server import CodexAppServer
-        from tests.test_codex_paginated_import import modern_rows
-        from tests.test_codex_conversation_pool import write_rollout
+    # Temporary empty account homes; no turns or model requests are started.
+    def test_official_empty_thread_without_parent_history(self):
         executable = os.environ['APICODEX_TEST_NATIVE_DELEGATE']
         self.manager.close()
         self.manager = delegate.DelegateManager(self.config, api, executable=executable)
         self.addCleanup(self.manager.close)
-        for mode in ('legacy', 'paginated'):
-            rows = modern_rows(self.work)
-            tid = str(uuid.uuid4())
-            rows[0]['payload'].update(id=tid, session_id=tid, cwd=str(self.work), model_provider='openai',
-                history_mode=mode, base_instructions={'text': 'Synthetic context'}, dynamic_tools=[], git=None)
-            if mode == 'legacy':
-                rows[-1:-1] = [
-                    {'timestamp': '2026-01-01T00:00:02Z', 'type': 'event_msg', 'payload': {
-                        'type': 'user_message', 'message': '完整问题', 'images': [], 'local_images': []}},
-                    {'timestamp': '2026-01-01T00:00:02Z', 'type': 'event_msg', 'payload': {
-                        'type': 'agent_message', 'message': '完整回答', 'phase': 'final_answer'}},
-                ]
-            for i, row in enumerate(rows):
-                row['ordinal'] = i
-                if 'thread_id' in row['payload']:
-                    row['payload']['thread_id'] = tid
-            path = self.source / 'sessions' / f'rollout-2026-01-01T00-00-00-{tid}.jsonl'
-            write_rollout(path, rows)
-            with CodexAppServer(self.source, codex_command=executable) as source:
-                source.request('thread/resume', {'threadId': tid, 'path': str(path),
-                    'cwd': str(self.work), 'model': 'gpt-test', 'modelProvider': 'openai',
-                    'excludeTurns': True, 'deferGoalContinuation': True})
-            folder = self.work / '子代理任务' / mode
-            folder.mkdir(parents=True)
-            task = delegate.Task({'owner': tid, 'cwd': str(self.work), 'model': 'gpt-test', 'artifacts': str(folder)}, folder/'record.json')
-            try:
-                self.manager._open(task, self.profile)
-                thread_id, prefix = self.manager._thread(task, 'auto')
-                self.assertNotEqual(thread_id, tid)
-                if mode == 'legacy':
-                    self.assertEqual(task.record['context']['mode'], 'official_fork')
-                    actual = task.client.read_thread(thread_id, include_turns=True)
-                    self.assertTrue(actual['turns'])
-                else:
-                    self.assertEqual(task.record['context']['mode'], 'official_visible_history')
-                    self.assertIn('完整问题', prefix)
-                    self.assertIn('完整回答', prefix)
-                    self.assertIn('commandExecution', prefix)
-            finally:
-                self.manager._release(task)
+        task = delegate.Task({'owner': self.owner, 'cwd': str(self.work),
+                              'model': 'gpt-test'}, self.work / 'record.json')
+        try:
+            self.manager._open(task, self.profile)
+            thread_id = self.manager._thread(task)
+            self.assertNotEqual(thread_id, self.owner)
+            self.assertEqual(task.record['context'], {'mode': 'none'})
+            self.assertFalse((self.source / 'sessions').exists())
+        finally:
+            self.manager._release(task)
