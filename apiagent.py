@@ -310,16 +310,21 @@ def write_json_atomic(path: Path, data: Any) -> None:
     write_text_atomic(path, json.dumps(data, indent=2, ensure_ascii=False))
 
 
+def _claude_npm_shim_text(executable: str) -> str:
+    shim = Path(executable)
+    if shim.name.lower() not in {"claude.cmd", "claude.bat"}:
+        return ""
+    try:
+        with shim.open(encoding="utf-8-sig") as stream:
+            return stream.read(65536).replace("/", "\\").lower()
+    except (OSError, UnicodeError):
+        return ""
+
+
 def _claude_npm_command(executable: str, environment: dict[str, str]) -> list[str] | None:
     """Use the installed npm target directly, so prompts never pass through cmd."""
     shim = Path(executable)
-    if shim.name.lower() not in {"claude.cmd", "claude.bat"}:
-        return None
-    try:
-        with shim.open(encoding="utf-8-sig") as stream:
-            text = stream.read(65536).replace("/", "\\").lower()
-    except (OSError, UnicodeError):
-        return None
+    text = _claude_npm_shim_text(executable)
     for relative in (
         "node_modules/@anthropic-ai/claude-code/bin/claude.exe",
         "node_modules/@anthropic-ai/claude-code/cli.js",
@@ -338,6 +343,57 @@ def _claude_npm_command(executable: str, environment: dict[str, str]) -> list[st
     return None
 
 
+def find_claude_cli_command(environment: dict[str, str]) -> list[str] | None:
+    """Keep PATH precedence, then recover native/npm installs with missing shims."""
+    executable = shutil.which("claude", path=environment.get("PATH"))
+    prefixes: list[Path] = []
+    if executable:
+        if os.name != "nt" or Path(executable).suffix.lower() not in {".cmd", ".bat"}:
+            return [executable]
+        command = _claude_npm_command(executable, environment)
+        if command:
+            return command
+        # Only bypass a recognizable, stale npm shim. Custom PATH wrappers
+        # retain their behavior and the batch argument checks in run_command.
+        if "node_modules\\@anthropic-ai\\claude-code\\" not in _claude_npm_shim_text(executable):
+            return [executable]
+        prefixes.append(Path(executable).parent)
+
+    native = HOME / ".local" / "bin" / ("claude.exe" if os.name == "nt" else "claude")
+    if native.is_file() and (os.name == "nt" or os.access(native, os.X_OK)):
+        return [str(native)]
+
+    for key in ("NPM_CONFIG_PREFIX", "npm_config_prefix"):
+        if environment.get(key):
+            prefixes.append(Path(environment[key]).expanduser())
+    prefixes.extend(
+        Path(entry.strip('"')).expanduser()
+        for entry in environment.get("PATH", "").split(os.pathsep)
+        if entry.strip('"')
+    )
+    if os.name == "nt":
+        appdata = Path(environment["APPDATA"]) if environment.get("APPDATA") else HOME / "AppData" / "Roaming"
+        prefixes.append(appdata / "npm")
+
+    for prefix in dict.fromkeys(prefixes):
+        packages = [prefix / "node_modules" / "@anthropic-ai" / "claude-code"]
+        if os.name != "nt":
+            packages.append(prefix / "lib" / "node_modules" / "@anthropic-ai" / "claude-code")
+            if prefix.name == "bin":
+                packages.append(prefix.parent / "lib" / "node_modules" / "@anthropic-ai" / "claude-code")
+        for package in packages:
+            binary = package / "bin" / ("claude.exe" if os.name == "nt" else "claude")
+            if binary.is_file() and (os.name == "nt" or os.access(binary, os.X_OK)):
+                return [str(binary)]
+            script = package / "cli.js"
+            if script.is_file():
+                local_node = prefix / ("node.exe" if os.name == "nt" else "node")
+                runtime = str(local_node) if local_node.is_file() else shutil.which("node", path=environment.get("PATH"))
+                if runtime and (os.name != "nt" or Path(runtime).suffix.lower() == ".exe"):
+                    return [runtime, str(script)]
+    return None
+
+
 def run_command(
     command: str,
     args: list[str],
@@ -345,16 +401,21 @@ def run_command(
     input_text: str | None = None,
     env_remove: tuple[str, ...] | list[str] = (),
 ) -> int:
-    exe = shutil.which(command)
-    if not exe:
-        print(f"Error: command not found: {command}", file=sys.stderr)
-        return 1
-
     proc_env = os.environ.copy()
     for key in env_remove:
         proc_env.pop(key, None)
     if env:
         proc_env.update(env)
+
+    if command == "claude":
+        command_prefix = find_claude_cli_command(proc_env)
+    else:
+        executable = shutil.which(command)
+        command_prefix = [executable] if executable else None
+    if not command_prefix:
+        print(f"Error: command not found: {command}", file=sys.stderr)
+        return 1
+    exe = command_prefix[0]
 
     # At the OS home, Claude also treats ~/.claude/settings.json as project
     # settings, overriding an isolated CLAUDE_CONFIG_DIR's saved /model choice.
@@ -391,9 +452,9 @@ def run_command(
                     command_line += " " + subprocess.list2cmdline(args)
                 cmd = f"{subprocess.list2cmdline([comspec])} /v:off /d /s /c call {command_line}"
         else:
-            cmd = [exe, *args]
+            cmd = [*command_prefix, *args]
     else:
-        cmd = [exe, *args]
+        cmd = [*command_prefix, *args]
 
     try:
         completed = subprocess.run(

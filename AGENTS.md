@@ -32,6 +32,13 @@
 
 ## 协作修改记录
 
+### 2026-11-14：兼容 Claude Code 的 npm 与原生启动入口
+
+- 修改简介：启动时优先沿用 PATH；命令缺失或已知 npm shim 失效时，查找官方原生位置与 npm 安装目录，兼容原生程序、旧版 cli.js、自定义 npm prefix，更新命令复用同一逻辑。新增 12 项回归测试并更新 README。
+- 修改原因：现有安装可用时，启动器仍可能因 npm 命令文件缺失或 PATH 未包含原生目录而报告 command not found。保留自定义 wrapper 优先级及 Windows 参数安全检查；原生路径依据 [Claude Code 官方安装文档](https://code.claude.com/docs/en/troubleshoot-install#verify-your-path)。
+- 验证情况：新测试在旧实现上 8 failed / 4 passed；修复后专项 52 passed，完整 `python -m pytest tests/ -q` 为 520 passed / 38 skipped，安装副本专项 52 passed。仓库和 npm 两个启动入口在普通及视频 venv 环境的版本检查通过，真实二进制的缺失 shim 回退和原生路径回退通过；Python 3.10 语法与 `git diff --check` 通过。非 Windows 实机未验证。
+- 发布范围：仅包含启动兼容代码、测试、使用说明和本条记录；本机原有协作记录及备份保留在本地。启动查找不安装软件、不修改全局 PATH，也不切换 API 节点或模型。
+
 ### 2026-11-14：合并远端修复并发布本地积累改动
 
 - 修改简介：按用户要求将 `main` 快进至远端 `8a409c7`，恢复本地改动并合并双方 `AGENTS.md` 记录；本批发布 Claude 规则与 skills 共享、模型发现 TLS 断连重试、Windows CLI 更新入口及跨账户委派目录/额度/简短任务改进，包含对应测试、Skill 和历史验收资料。

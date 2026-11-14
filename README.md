@@ -562,6 +562,17 @@ For a copied installation such as `C:\tools`, also copy the updated root-level
 The next `apicodex --desktop` launch enables independent profile tray icons.
 `apicodex --up` updates the official Codex CLI; it does not update this launcher.
 
+Claude Code may be installed through npm or the native installer. `apiclaude`
+uses the existing `claude` command on PATH first. If it is missing, or a known
+npm wrapper points to a removed target, it checks the [official native location](https://code.claude.com/docs/en/troubleshoot-install#verify-your-path)
+(`~/.local/bin/claude.exe` on Windows, `~/.local/bin/claude` elsewhere), then
+npm prefixes from `NPM_CONFIG_PREFIX`, PATH, and Windows `%APPDATA%\npm`.
+Both npm native binaries and older `cli.js` installations with Node.js are
+supported. Recognized Windows npm targets run directly so prompt arguments stay
+literal. This lookup also applies to `apiclaude --up`; it does not install
+software, change PATH, or change the selected API node/model. Custom PATH
+wrappers keep their existing behavior.
+
 ## Codex Usage
 
 Add or update a Codex API profile with the guided setup:
