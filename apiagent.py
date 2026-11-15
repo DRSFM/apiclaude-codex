@@ -2406,7 +2406,10 @@ def refresh_codex_models(
         if len(known) != len(existing):
             raise ValueError("duplicate model catalog entries")
         base_url = str(profile.get("baseUrl") or DEFAULT_CODEX_BASE_URL)
-        source_hash = hashlib.sha256(base_url.encode("utf-8")).hexdigest()
+        source_identity = base_url
+        if profile.get('apiKeys'):
+            source_identity += '\0' + str(profile.get('credentialId') or codex_credential_id(profile))
+        source_hash = hashlib.sha256(source_identity.encode("utf-8")).hexdigest()
         catalog_hash = hashlib.sha256(original).hexdigest()
         if not force and not dry_run and state_path.is_file():
             try:
@@ -2619,6 +2622,10 @@ def resolve_codex_api_key(
     profile: dict[str, Any], profiles: list[dict[str, Any]]
 ) -> str | None:
     """Ask for a missing key; never replace a credential after a storage error."""
+    if 'apiKeys' in profile:
+        from codex_api_keys import choose_for_launch
+        if not choose_for_launch(profile, profiles, sys.modules[__name__]):
+            return None
     try:
         return get_codex_secret(profile)
     except SecureStoreError as exc:
@@ -2629,6 +2636,9 @@ def resolve_codex_api_key(
         )
         return None
     except KeyError:
+        if 'apiKeys' in profile:
+            print('Error: the selected saved API key is missing; no other key was used or replaced.', file=sys.stderr)
+            return None
         print(f"Profile '{profile.get('name')}' has no saved API key yet.")
     api_key = clean_hidden_prefix(getpass("API key: "))
     if not api_key.strip():
@@ -3023,7 +3033,7 @@ def add_codex_profile(
             print(f"Error: {exc}", file=sys.stderr)
             print("Profile and API key were not saved.", file=sys.stderr)
             return 1
-    credential_id = codex_credential_id(profile)
+    credential_id = (profile.get('credentialId') if profile.get('apiKeys') else None) or codex_credential_id(profile)
     SECRET_STORE.set(credential_id, cleaned_api_key)
     if catalog_payload is not None:
         install_codex_model_catalog(home, catalog_payload)
@@ -3083,6 +3093,14 @@ def remove_codex_profile(requested: str | None = None) -> int:
             file=sys.stderr,
         )
         return 1
+    credential_ids = [profile['credentialId']] if profile.get('credentialId') else []
+    if 'apiKeys' in profile:
+        from codex_api_keys import ApiKeyError, saved_keys
+        try:
+            credential_ids.extend(item['credentialId'] for item in saved_keys(profile))
+        except ApiKeyError as exc:
+            print(f'Error: {exc}', file=sys.stderr)
+            return 1
     if input(f"Unregister '{profile['name']}'? Type YES to confirm: ") != "YES":
         print("Cancelled.")
         return 0
@@ -3112,9 +3130,9 @@ def remove_codex_profile(requested: str | None = None) -> int:
                 return 1
         print(f"Error: failed to unregister profile; credentials retained: {exc}", file=sys.stderr)
         return 1
-    if profile.get("credentialId"):
+    for credential_id in dict.fromkeys(credential_ids):
         try:
-            SECRET_STORE.clear(profile["credentialId"])
+            SECRET_STORE.clear(credential_id)
         except (OSError, SecureStoreError) as exc:
             print(f"Error: profile unregistered, but credential cleanup failed: {exc}", file=sys.stderr)
             return 1
@@ -3487,9 +3505,16 @@ def launch_codex_vscode(
             selected.get("reasoningEffort") or DEFAULT_CODEX_REASONING_EFFORT,
         )
 
+    if 'apiKeys' in selected:
+        from codex_api_keys import choose_for_launch
+        if not choose_for_launch(selected, profiles, sys.modules[__name__]):
+            return 1
     try:
         api_key = get_codex_secret(selected)
     except (KeyError, SecureStoreError):
+        if 'apiKeys' in selected:
+            print('Error: could not read the selected saved API key; credentials were retained.', file=sys.stderr)
+            return 1
         print(f"Profile '{selected.get('name')}' has no saved API key yet.")
         api_key = getpass("API key: ")
         if not api_key.strip():
@@ -3540,6 +3565,9 @@ def codex_help() -> None:
   apicodex --api-list --json       List non-sensitive profile metadata as JSON
   apicodex --api-profile <name>    Start a specific API profile
   apicodex --api-remove            Unregister/archive a saved API profile
+  apicodex keys add PROFILE NAME   Save another API key with the same chat history
+  apicodex keys list PROFILE       List saved key names, never the key values
+  apicodex keys use PROFILE NAME   Select a saved key for non-interactive launches
   apicodex models refresh          Refresh local model catalogs with saved keys
   apicodex models refresh --all    Refresh every profile's local catalog override
   apicodex models refresh --api-profile NAME --dry-run
@@ -3608,6 +3636,9 @@ def codex_share_main(args: list[str]) -> int:
 
 
 def codex_main(args: list[str]) -> int:
+    if args and args[0] == 'keys':
+        from codex_api_keys import main as keys_main
+        return keys_main(args[1:], sys.modules[__name__])
     if args and args[0] == "delegate":
         from codex_delegate import main as delegate_main
         return delegate_main(args[1:], sys.modules[__name__])

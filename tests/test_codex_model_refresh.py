@@ -99,6 +99,15 @@ class CodexModelRefreshTests(unittest.TestCase):
         self.assertEqual(self.catalog_path.stat().st_mtime_ns, before)
         self.assertEqual(len(list(self.home.glob('models.json.backup-*'))), 1)
 
+    def test_switching_named_credential_invalidates_model_cache(self) -> None:
+        self.profile['apiKeys'] = [{'name': 'first', 'credentialId': 'custom-reference'},
+                                   {'name': 'second', 'credentialId': 'another-reference'}]
+        apiagent.refresh_codex_models(self.profile)
+        self.fetch_codex_provider_models.reset_mock()
+        self.profile['credentialId'] = 'another-reference'
+        self.assertEqual(apiagent.refresh_codex_models(self.profile)['status'], 'unchanged')
+        self.fetch_codex_provider_models.assert_called_once()
+
     def test_expiry_catalog_edit_and_source_change_invalidate_cache(self) -> None:
         apiagent.refresh_codex_models(self.profile)
         for change in ('expiry', 'catalog', 'source', 'corrupt-state'):

@@ -609,6 +609,43 @@ and certificate verification errors are reported immediately.
 If discovery still fails, the existing profile and stored credential are
 preserved, and setup reports that the new key was not saved.
 
+### Multiple API keys with the same conversation history
+
+Save a second account's key inside the existing API profile:
+
+```powershell
+apicodex keys add anyrouter account-2
+```
+
+Enter the second key at the hidden prompt. The existing credential becomes
+`account-1`; it stays selected and does not need to be entered again. Key values
+remain in SecureStore. The profile registry contains only names and credential
+references; the existing home, configuration, conversations, and Desktop data
+directory stay the same.
+
+```powershell
+apicodex keys list anyrouter
+apicodex --desktop --api-profile anyrouter
+```
+
+Interactive launches show the saved key names after profile selection. Press
+Enter to keep the last selection, or choose another number/name. Single-key
+profiles keep their existing startup flow. Exit the corresponding Desktop
+instance before relaunching with a different key; selecting a key does not
+replace the environment of a running client.
+
+Non-interactive launches use the saved selection without prompting. To choose
+explicitly before a script runs:
+
+```powershell
+apicodex keys use anyrouter account-2
+```
+
+`--api-add --api-profile anyrouter` updates the currently selected key and keeps
+the other saved keys. Adding a name that already exists is rejected. A missing
+or unreadable selected key does not fall back to another key. Switching named
+keys also causes the local model catalog to be checked with the selected key.
+
 ### Refresh Codex model catalogs
 
 CLI, VS Code, and Desktop launches automatically check the provider's model
