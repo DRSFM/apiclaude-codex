@@ -249,6 +249,13 @@ class AccountTests(unittest.TestCase):
         after = {p.relative_to(self.root): p.read_bytes() for p in self.root.rglob('*') if p.is_file()}
         self.assertEqual(before, after)
 
+    def test_resource_error_is_reported_without_internal_exception(self):
+        profile = self.create()
+        from codex_account_resources import ResourceError
+        with patch('codex_account_resources.sync', side_effect=ResourceError('Selected account config.toml contains invalid TOML; configuration was not changed.')):
+            with self.assertRaisesRegex(accounts.AccountError, 'Selected account config.toml contains invalid TOML'):
+                accounts.sync_resources(profile, apiagent, dry_run=True)
+
     def test_config_auth_override_fails_before_launch(self):
         self.create()
         with patch.object(apiagent, 'run_command') as run:

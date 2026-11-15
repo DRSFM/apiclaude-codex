@@ -2788,15 +2788,25 @@ def ensure_codex_keyring_auth(
 
 
 def add_current_project_trust(home: Path) -> None:
+    from codex_account_resources import config_parts
+    from codex_shared_config import _split_toml_dotted_key
+
     cwd = str(Path.cwd())
     config_path = home / "config.toml"
     if not config_path.exists():
         return
     header = f"[projects.{toml_basic_string(cwd)}]"
     raw = config_path.read_text(encoding="utf-8-sig")
-    if header not in raw:
-        with config_path.open("a", encoding="utf-8") as handle:
-            handle.write(f'\n{header}\ntrust_level = "trusted"\n')
+    # Official clients also write literal (single-quoted) path keys. Compare
+    # decoded table keys so equivalent spellings never produce duplicate TOML.
+    for root, block in config_parts(raw):
+        if root != 'projects':
+            continue
+        match = re.fullmatch(r'\s*\[(?!\[)(.*?)\]\s*(?:#.*)?', block.splitlines()[0])
+        if match and _split_toml_dotted_key(match[1]) == ('projects', cwd):
+            return
+    with config_path.open("a", encoding="utf-8") as handle:
+        handle.write(f'\n{header}\ntrust_level = "trusted"\n')
 
 
 def find_profile(profiles: list[dict[str, Any]], name: str | None) -> dict[str, Any] | None:

@@ -220,12 +220,12 @@ def merge_config(target: str, source: str) -> str:
     except ModuleNotFoundError:  # Python 3.10: lexical checks above remain available.
         pass
     else:
-        try:
-            tomllib.loads(source)
-            tomllib.loads(target)
-            tomllib.loads(merged)
-        except tomllib.TOMLDecodeError:
-            raise ResourceError("Invalid shared/account TOML; configuration was not changed.") from None
+        for label, text in (("Official default", source), ("Selected account", target),
+                            ("Merged shared", merged)):
+            try:
+                tomllib.loads(text)
+            except tomllib.TOMLDecodeError:
+                raise ResourceError(f"{label} config.toml contains invalid TOML; configuration was not changed.") from None
     return merged
 
 

@@ -85,6 +85,16 @@ secret_auth_storage = false
         with self.assertRaises(resources.ResourceError):
             resources.merge_config(self.original, 'notify = ["unfinished"\n')
 
+    @unittest.skipIf(sys.version_info < (3, 11), 'TOML semantic validation requires Python 3.11+')
+    def test_duplicate_account_project_reports_selected_config_without_changing_it(self):
+        path = self.home / 'config.toml'
+        duplicate = (self.original + '\n[projects."E:\\\\paper"]\ntrust_level = "trusted"\n'
+                     '[projects.\'E:\\paper\']\ntrust_level = "trusted"\n')
+        path.write_text(duplicate)
+        with self.assertRaisesRegex(resources.ResourceError, 'Selected account config.toml contains invalid TOML'):
+            resources.sync(self.home, self.source, apiagent, dry_run=True)
+        self.assertEqual(path.read_text(), duplicate)
+
     def test_desktop_generated_node_repl_stays_account_local(self):
         source = '[mcp_servers.node_repl]\ncommand = "default-runtime"\nenv = { NODE_REPL_TRUSTED_CODE_PATHS = "default-home" }\n'
         target = self.original + '\n[mcp_servers.node_repl]\ncommand = "account-runtime"\n[mcp_servers.node_repl.env]\nNODE_REPL_TRUSTED_CODE_PATHS = "account-home"\n'

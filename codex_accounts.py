@@ -135,7 +135,9 @@ def sync_resources(profile: dict[str, Any], api: Any, *, dry_run: bool = False) 
         if report.get('deferredDirectories'):
             print("Plugin cache is in use; close this account's Desktop and restart it to finish sharing the cache.")
         return report
-    except (ResourceError, OSError, subprocess.SubprocessError):
+    except ResourceError as exc:
+        raise AccountError(str(exc)) from None
+    except (OSError, subprocess.SubprocessError):
         raise AccountError("Could not synchronize shared account resources; original resources/backups were retained.") from None
 
 
