@@ -1549,7 +1549,7 @@ class ApiAgentAuthTests(KeychainIsolationMixin):
             self.assertEqual(code, 0)
             self.assertEqual(
                 run.call_args.args[1],
-                ["--autocompact", "auto", "--model", "opus[1m]", "--version"],
+                ["--autocompact", "auto", "--version"],
             )
             self.assertNotIn("sk-test-secret", " ".join(run.call_args.args[1]))
             self.assertEqual(

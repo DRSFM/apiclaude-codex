@@ -91,12 +91,14 @@ class ApiClaudeCodexStyleCliTests(KeychainIsolationMixin):
             self.assertEqual(code, 0)
             self.assertEqual(
                 run.call_args.args[1],
-                ["--autocompact", "auto", "--model", "opus[1m]", "resume"],
+                ["--autocompact", "auto", "resume"],
             )
             env = run.call_args.kwargs["env"]
             self.assertEqual(env["ANTHROPIC_BASE_URL"], "https://relay.test")
             self.assertEqual(env["ANTHROPIC_AUTH_TOKEN"], "sk-test-relay")
-            self.assertEqual(env["ANTHROPIC_MODEL"], "opus[1m]")
+            self.assertNotIn("ANTHROPIC_MODEL", env)
+            self.assertNotIn("ANTHROPIC_DEFAULT_OPUS_MODEL", env)
+            self.assertIn("ANTHROPIC_MODEL", run.call_args.kwargs["env_remove"])
             self.assertEqual(config["current"], "relay")
 
     def test_api_profile_preserves_saved_model_when_default_override_disabled(self) -> None:
@@ -366,8 +368,6 @@ class ApiClaudeCodexStyleCliTests(KeychainIsolationMixin):
                 [
                     "--autocompact",
                     "auto",
-                    "--model",
-                    "opus[1m]",
                     "--permission-mode",
                     "bypassPermissions",
                 ],
@@ -397,8 +397,6 @@ class ApiClaudeCodexStyleCliTests(KeychainIsolationMixin):
                 [
                     "--autocompact",
                     "auto",
-                    "--model",
-                    "opus[1m]",
                     "--permission-mode",
                     "bypassPermissions",
                     "resume",

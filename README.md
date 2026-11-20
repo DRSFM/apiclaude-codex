@@ -17,7 +17,8 @@ and credential references.
 - Claude Code CLI available as `claude` for `apiclaude`
 - CLIProxyAPI (CPA) v7.2.101 or newer for new Codex-to-Claude bridge nodes
 - Optional: LiteLLM 1.93.0 or newer for legacy bridge nodes created before CPA
-- Optional: `cryptography` for Windows OAuth JSON import only (`python -m pip install cryptography`)
+- Optional: `cryptography` for cross-device upstream sync and Windows OAuth JSON import
+  (`python -m pip install cryptography`)
 
 Check:
 
@@ -34,6 +35,50 @@ python --version
 codex --version
 claude --version
 ```
+
+## Sync API upstreams between devices
+
+On Windows and macOS, `apiagent sync`, `apicodex sync`, and `apiclaude sync`
+run the same commands for both launchers. Install the optional `cryptography`
+package in the Python environment used by the launchers on each device. Use
+`python3` in place of `python` on macOS when needed.
+
+On the source, run `apicodex sync` or `apiclaude sync` to see the eligible
+upstreams. Enter one number or a list such as `1,3`. Codex and Claude entries
+have separate numbers, including when they share a name. Next choose the
+destination device numbers from the online Taildrop list, or enter `0` to
+save the encrypted bundle locally. Enter a strong passphrase in the hidden
+prompt. The bundle is saved under `~/.apiagent-sync`.
+
+The explicit export command accepts a filename. Repeat `--to` for multiple
+Taildrop devices and `--name` for selected upstream names. Omit `--name` to
+export all portable upstreams.
+
+```text
+apiagent sync export upstreams.apisync --to work-pc --to my-mac
+```
+
+On each destination, use the file from Downloads and enter the same bundle
+passphrase. `--dry-run` previews new upstreams and any eligible key updates.
+
+```text
+apiagent sync import ~/Downloads/upstreams.apisync --dry-run
+apiagent sync import ~/Downloads/upstreams.apisync
+```
+
+The bundle contains the upstream names, URLs, model defaults, and API keys,
+including named keys. It uses AES-256-GCM with a passphrase-derived Scrypt key.
+Import writes keys to Windows DPAPI or the macOS login Keychain. New nodes use
+device-local isolated directories. The bundle excludes account logins, bridge
+nodes, conversation history, and device-specific paths and proxy settings.
+Loopback endpoints are skipped. Private network URLs still require a route
+from the receiving device.
+
+By default, imports preserve same-name entries. For a later key rotation,
+preview and then import with `--update-keys`. This merges keys by name when
+the upstream URL matches, preserving the local active choice and other local
+settings. Reimporting identical keys has no effect. Launch the client again
+to use an updated key.
 
 ## CLI launch and configuration safety
 
@@ -1170,8 +1215,8 @@ shared behavior until switched.
 
 Legacy shared mode also shares the account's saved `/model` choice and login
 metadata. API authentication still takes precedence, but a node with
-`cli_force_default_model: false` will follow model changes made in the account
-CLI. Check `apiclaude mode NAME` before assuming an older node is isolated.
+no forced CLI model will follow model changes made in the account CLI. Check
+`apiclaude mode NAME` before assuming an older node is isolated.
 To separate an existing node while retaining history, copy and verify its
 transcripts and related files before switching; do not copy account credentials
 or the entire account configuration. Shared transcripts may lack provider tags,
@@ -1202,6 +1247,30 @@ a node archives its isolated directory under `~/.apiclaude/archived-nodes`.
 The isolated directory follows the node name, not the base URL or token, so
 editing a node's credentials — or changing the upstream behind a local proxy —
 never affects its local workspace.
+
+### Multiple API keys for one Claude node
+
+Save a second key on the existing native AnyRouter node:
+
+```powershell
+apiclaude keys add anyrouter account-2
+apiclaude keys list anyrouter
+apiclaude --api-profile anyrouter
+```
+
+Enter the second key at the hidden prompt. The original key remains selected
+as `account-1`. Key values stay in SecureStore. Both keys use the same node,
+Claude Code history, and Desktop and VS Code data directories.
+
+Interactive launches of Claude Code, Claude Desktop, and VS Code show the saved
+key names for nodes with multiple keys. Press Enter to reuse the previous choice,
+or choose a different key by number or name. Non-interactive launches use the
+saved choice. To set it ahead of time, run `apiclaude keys use anyrouter account-2`.
+Close the existing client before relaunching with the new key.
+
+`apiclaude --api-add --api-profile anyrouter` replaces the selected key when you
+provide the existing base URL. The other saved keys remain available. For a
+Codex bridge node, manage keys with `apicodex keys` on its linked profile.
 
 ### Shared Claude MCP Servers
 
@@ -1379,13 +1448,11 @@ with an explicit list or `--auto`. Codex/CPA bridge nodes use standard context;
 `desktop-models NODE --1m` is rejected because CPA does not implement this
 Anthropic request variant.
 
-The same node-level context mode applies to ordinary `apiclaude` / Claude Code
-launches. On native nodes, the first explicitly configured Desktop model, then
-the last discovered model list's first entry, becomes the CLI default and is
-launched with its `[1m]` variant. An explicit Claude `--model` is upgraded to the
-same variant. ApiClaude also supplies `--autocompact auto` unless the command
-already specifies `--autocompact`, so long sessions compact automatically before
-they reach the selected context limit. For example:
+Claude Code uses its saved model choice by default on native nodes. In 1M
+context mode, ApiClaude provides family aliases from the configured and
+discovered model lists and upgrades an explicit `--model` to its `[1m]` variant.
+ApiClaude also supplies `--autocompact auto` unless the command already
+specifies `--autocompact`. For example:
 
 ```bash
 apiclaude --api-profile anyrouter --resume SESSION_ID
@@ -1393,12 +1460,11 @@ apiclaude --api-profile anyrouter --model claude-fable-5-1 --resume SESSION_ID
 apiclaude --api-profile anyrouter --autocompact 180k --resume SESSION_ID
 ```
 
-To let Claude Code reuse its saved model selection across launches, set
-`"cli_force_default_model": false` on that node under `nodes` in
-`~/.apiclaude_config.json`. When no `--model` is supplied, ApiClaude leaves model
-selection to Claude Code and still provides `[1m]` family aliases from the
-configured and discovered model lists. An explicit `--model` takes precedence,
-and automatic compaction remains enabled. This setting defaults to `true`.
+To force a launcher-selected default in 1M context mode, set
+`"cli_force_default_model": true` on the node under `nodes` in
+`~/.apiclaude_config.json`. ApiClaude takes the first configured Desktop model,
+the first discovered model, or the node's model field, in that order, and falls
+back to `opus[1m]`. An explicit `--model` takes precedence.
 
 A CPA bridge node can also expose upstream Claude models by their native IDs.
 Repeat `--desktop-model` when creating or updating the node:

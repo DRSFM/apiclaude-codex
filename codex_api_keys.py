@@ -14,7 +14,7 @@ class ApiKeyError(ValueError):
     """Safe messages only; never include a credential or a storage exception."""
 
 
-def saved_keys(profile: dict[str, Any]) -> list[dict[str, str]]:
+def saved_keys(profile: dict[str, Any], *, active_field: str = 'credentialId') -> list[dict[str, str]]:
     entries = profile.get('apiKeys', [])
     if not isinstance(entries, list):
         raise ApiKeyError('Invalid saved API key list; profile was retained.')
@@ -32,7 +32,8 @@ def saved_keys(profile: dict[str, Any]) -> list[dict[str, str]]:
         names.add(name.casefold())
         references.add(reference)
         result.append({'name': name, 'credentialId': reference})
-    if result and profile.get('credentialId') not in references:
+    active = profile.get(active_field)
+    if result and (not isinstance(active, str) or active not in references):
         raise ApiKeyError('The active API key is not in the saved list; profile was retained.')
     return result
 
@@ -46,7 +47,7 @@ def _profile(profiles: list[dict[str, Any]], name: str, api: Any) -> dict[str, A
     return profile
 
 
-def _name(name: str) -> str:
+def validated_key_name(name: str) -> str:
     name = name.strip()
     if not name or len(name) > 80 or any(ord(c) < 32 or ord(c) == 127 for c in name):
         raise ApiKeyError('Choose an API key name of 1-80 printable characters.')
@@ -70,7 +71,7 @@ def _save(profiles: list[dict[str, Any]], profile: dict[str, Any], api: Any) -> 
 
 
 def add(name: str, label: str, api: Any) -> None:
-    label = _name(label)
+    label = validated_key_name(label)
     initial = _profile(registry_profiles(api), name, api)
     entries = saved_keys(initial)
     if not entries:
@@ -115,33 +116,45 @@ def use(name: str, label: str, api: Any, *, expected_home: str | None = None) ->
         return profile
 
 
+def prompt_key_choice(
+    name: str, entries: list[dict[str, str]], active: str, restart_message: str,
+) -> dict[str, str] | None:
+    default = next(i for i, item in enumerate(entries, 1) if item['credentialId'] == active)
+    print(f"Choose API key for '{name}' (same conversation history)")
+    print(restart_message)
+    for i, item in enumerate(entries, 1):
+        marker = ' (current)' if i == default else ''
+        print(f"[{i}] {item['name']}{marker}")
+    while True:
+        choice = input(f'Choose number or name [{default}], q to cancel: ').strip() or str(default)
+        if choice.casefold() == 'q':
+            return None
+        if choice.isdecimal() and len(choice) <= 80:
+            index = int(choice)
+            if 1 <= index <= len(entries):
+                return entries[index - 1]
+        for item in entries:
+            if item['name'].casefold() == choice.casefold():
+                return item
+        print('Choose a listed API key number or name.')
+
+
 def choose_for_launch(profile: dict[str, Any], profiles: list[dict[str, Any]], api: Any) -> bool:
     try:
         entries = saved_keys(profile)
         if len(entries) < 2 or not sys.stdin.isatty():
             return True
-        default = next(i for i, item in enumerate(entries, 1) if item['credentialId'] == profile['credentialId'])
-        print(f"Choose API key for '{profile['name']}' (same conversation history)")
-        print("Restart this profile's Desktop to apply a different key.")
-        for i, item in enumerate(entries, 1):
-            marker = ' (current)' if i == default else ''
-            print(f"[{i}] {item['name']}{marker}")
-        while True:
-            choice = input(f'Choose number or name [{default}], q to cancel: ').strip() or str(default)
-            if choice.casefold() == 'q':
-                return False
-            entry = (entries[int(choice) - 1] if choice.isdigit() and 1 <= int(choice) <= len(entries)
-                     else next((item for item in entries if item['name'].casefold() == choice.casefold()), None))
-            if entry is None:
-                print('Choose a listed API key number or name.')
-                continue
-            latest = use(str(profile['id']), entry['name'], api, expected_home=profile.get('home'))
-            profile.update(latest)
-            # Later preparation must not save an outdated key list over this choice.
-            for other in profiles:
-                if other.get('id') == profile['id']:
-                    other.update(latest)
-            return True
+        entry = prompt_key_choice(profile['name'], entries, profile['credentialId'],
+                                  "Restart this profile's Desktop to apply a different key.")
+        if entry is None:
+            return False
+        latest = use(str(profile['id']), entry['name'], api, expected_home=profile.get('home'))
+        profile.update(latest)
+        # Later preparation must not save an outdated key list over this choice.
+        for other in profiles:
+            if other.get('id') == profile['id']:
+                other.update(latest)
+        return True
     except (EOFError, KeyboardInterrupt):
         print('\nCancelled.')
         return False

@@ -32,6 +32,13 @@
 
 ## 协作修改记录
 
+### 2026-11-20：发布上游加密同步与 Claude 多 Key
+
+- 修改简介：为三个启动入口加入编号选择、加密导出和导入预览；原生 Claude 节点支持多 Key。未显式要求覆盖时，由 Claude Code 读取保存的模型选择。
+- 修改原因：让多设备复用上游配置，并让 Claude 节点在同一会话目录中切换 API Key。
+- 验证情况：`python -m pytest tests/ -q` 为 559 passed、38 skipped。Codex 和 Claude 同步入口、Claude 密钥管理帮助及 Python 3.10 语法通过检查。
+- 安全说明：同步包使用 AES-GCM 加密，凭据导入各平台 SecureStore。
+
 ### 2026-11-15：同一 API 配置保存多把密钥并在启动时选择
 
 - 修改简介：新增 `codex_api_keys.py` 与 `apicodex keys add/list/use`；现有密钥保留为 `account-1`，新密钥经隐藏提示录入并在 SecureStore 写入、读回验证后登记名称及引用。多密钥配置的交互启动增加选择菜单，回车沿用上次选择；非交互启动使用已选密钥。沿用同一聊天目录和 Desktop 数据目录；更新密钥只替换当前所选项，注销配置清理全部已登记凭据，模型目录缓存随所选密钥失效。更新 README 和回归测试。

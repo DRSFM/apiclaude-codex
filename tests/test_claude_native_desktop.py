@@ -595,6 +595,7 @@ class NativeClaudeDesktopCliTests(KeychainIsolationMixin):
 
     def test_native_cli_defaults_and_explicit_models_use_1m_with_autocompact(self) -> None:
         node = {
+            "cli_force_default_model": True,
             "desktop_models": ["claude-opus-5", "claude-fable-5-1"],
         }
         default_args, default_model = apiagent.prepare_native_claude_args(

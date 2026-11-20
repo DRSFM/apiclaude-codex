@@ -45,6 +45,7 @@ apiagent / apicodex / apiclaude：为 Codex CLI 和 Claude Code 提供多 API Pr
 - Python 3.10+，标准库优先，无第三方运行时依赖。
   例外：经用户授权，Windows OAuth 文件导入可选使用 `cryptography`；仅导入时
   加载，普通启动、官方登录和原有 API 功能不依赖它。
+  经用户授权，跨设备上游同步命令也可选用 `cryptography`，仅在读写加密同步包时加载。
   可选的 Token Tracker 状态显示安装在独立 Python 环境中，仅由 Codex Stop Hook
   调用，不作为核心启动器的运行依赖。
 - 类型标注沿用现有风格（`dict[str, Any]`、`| None`）。

@@ -29,7 +29,7 @@ from contextlib import ExitStack, contextmanager, suppress
 from datetime import datetime, timezone
 from getpass import getpass
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
@@ -3568,6 +3568,7 @@ def codex_help() -> None:
   apicodex keys add PROFILE NAME   Save another API key with the same chat history
   apicodex keys list PROFILE       List saved key names, never the key values
   apicodex keys use PROFILE NAME   Select a saved key for non-interactive launches
+  apicodex sync                    Choose which API upstreams to sync between devices
   apicodex models refresh          Refresh local model catalogs with saved keys
   apicodex models refresh --all    Refresh every profile's local catalog override
   apicodex models refresh --api-profile NAME --dry-run
@@ -3636,6 +3637,8 @@ def codex_share_main(args: list[str]) -> int:
 
 
 def codex_main(args: list[str]) -> int:
+    if args and args[0] == "sync":
+        return upstream_sync_main(args[1:])
     if args and args[0] == 'keys':
         from codex_api_keys import main as keys_main
         return keys_main(args[1:], sys.modules[__name__])
@@ -4094,10 +4097,25 @@ def load_claude_config() -> dict[str, Any]:
 
 def save_claude_config(config: dict[str, Any]) -> None:
     with _claude_config_lock():
-        updated = _merge_claude_edits(config.baseline, config, _read_claude_config()) if isinstance(config, _ClaudeConfig) else config
-        write_json_atomic(CLAUDE_CONFIG_PATH, updated)
-        if isinstance(config, _ClaudeConfig):
-            config.baseline = copy.deepcopy(dict(config))
+        _save_claude_config_locked(config)
+
+
+def _save_claude_config_locked(config: dict[str, Any]) -> None:
+    updated = _merge_claude_edits(config.baseline, config, _read_claude_config()) if isinstance(config, _ClaudeConfig) else config
+    write_json_atomic(CLAUDE_CONFIG_PATH, updated)
+    if isinstance(config, _ClaudeConfig):
+        config.baseline = copy.deepcopy(dict(config))
+
+
+@contextmanager
+def _edit_claude_node(config: dict[str, Any], name: str) -> Iterator[Callable[[dict[str, Any]], None]]:
+    if not isinstance(config, _ClaudeConfig):
+        yield save_claude_config
+        return
+    with _claude_config_lock():
+        if _read_claude_config()["nodes"].get(name) != config.baseline["nodes"].get(name):
+            raise ValueError("Claude node changed in another process. Reload and retry.")
+        yield _save_claude_config_locked
 
 
 def claude_credential_id(name: str) -> str:
@@ -4279,7 +4297,7 @@ def prepare_native_claude_args(
 
     selected_model: str | None = None
     if claude_desktop_models_support_1m(node) and (
-        model_value is not None or node.get("cli_force_default_model", True)
+        model_value is not None or node.get("cli_force_default_model", False)
     ):
         selected_model = claude_model_with_1m(
             model_value or claude_native_default_model(node)
@@ -4300,7 +4318,7 @@ def claude_native_model_environment(
     node: dict[str, Any], selected_model: str | None
 ) -> dict[str, str]:
     if not selected_model and (
-        node.get("cli_force_default_model", True)
+        node.get("cli_force_default_model", False)
         or not claude_desktop_models_support_1m(node)
     ):
         return {}
@@ -5293,6 +5311,8 @@ def claude_desktop_models_main(args: list[str]) -> int:
 
 
 def add_claude_node(config: dict[str, Any], requested: str | None = None) -> int:
+    from claude_api_keys import node_keys, read_hidden_key, staged_credential
+
     print("Add or update a Claude API node")
     name = (requested or input("Node name: ")).strip()
     if not name:
@@ -5302,8 +5322,15 @@ def add_claude_node(config: dict[str, Any], requested: str | None = None) -> int
     if existing is not None and input(f"Node '{name}' exists. Overwrite? (y/N): ").strip().lower() != "y":
         print("Cancelled.")
         return 0
+    keys = node_keys(existing or {})
     base_url = clean_hidden_prefix(input("ANTHROPIC_BASE_URL: "))
-    token = clean_hidden_prefix(getpass("ANTHROPIC_AUTH_TOKEN: "))
+    if keys and base_url.rstrip("/") != str(existing.get("base_url", "")).rstrip("/"):
+        print("Error: use the existing base URL when updating a key on a multi-key node.", file=sys.stderr)
+        return 1
+    if keys:
+        token = clean_hidden_prefix(read_hidden_key(getpass, "ANTHROPIC_AUTH_TOKEN: "))
+    else:
+        token = clean_hidden_prefix(getpass("ANTHROPIC_AUTH_TOKEN: "))
     if not base_url or not token:
         print("Error: base URL and token cannot be empty.", file=sys.stderr)
         return 1
@@ -5334,11 +5361,9 @@ def add_claude_node(config: dict[str, Any], requested: str | None = None) -> int
     else:
         print("Error: proxy choice must be 'y' or 'n'.", file=sys.stderr)
         return 1
-    credential_id = claude_credential_id(name)
-    SECRET_STORE.set(credential_id, token)
     node: dict[str, Any] = {
+        **(existing if keys else {}),
         "base_url": base_url,
-        "credential_id": credential_id,
         "isolation": mode,
         "proxy_enabled": proxy_enabled,
         "proxy_url": (
@@ -5352,10 +5377,29 @@ def add_claude_node(config: dict[str, Any], requested: str | None = None) -> int
         node["home"] = existing["home"]
     if mode == "isolated" and not node.get("home"):
         node["home"] = default_claude_node_home(config, name)
-    config.setdefault("nodes", {})[name] = node
-    if not config.get("current"):
-        config["current"] = name
-    save_claude_config(config)
+    with _edit_claude_node(config, name) as save:
+        config.setdefault("nodes", {})[name] = node
+        if not config.get("current"):
+            config["current"] = name
+        if keys:
+            previous = node["credential_id"]
+            with staged_credential(SECRET_STORE, token) as reference:
+                for item in keys:
+                    if item["credentialId"] == previous:
+                        item["credentialId"] = reference
+                        break
+                node["apiKeys"] = keys
+                node["credential_id"] = reference
+                save(config)
+            stored = _read_claude_config()["nodes"][name]
+            if stored.get("credential_id") != reference or node_keys(stored) != keys:
+                raise ValueError("Could not verify the updated key registration. Both credentials were retained.")
+            SECRET_STORE.clear(previous)
+        else:
+            credential_id = claude_credential_id(name)
+            SECRET_STORE.set(credential_id, token)
+            node["credential_id"] = credential_id
+            save(config)
     if not refresh_claude_shared(config, name):
         return 1
     print(f"Saved Claude node '{name}' ({mode}).")
@@ -5511,8 +5555,22 @@ def remove_claude_node(config: dict[str, Any], name: str | None) -> int:
     if input(f"Remove '{name}'? Type YES to confirm: ") != "YES":
         print("Cancelled.")
         return 0
+    with _edit_claude_node(config, name) as save:
+        return _remove_claude_node_locked(config, name, save)
+
+
+def _remove_claude_node_locked(
+    config: dict[str, Any], name: str, save: Callable[[dict[str, Any]], None],
+) -> int:
+    from claude_api_keys import node_keys
+
+    nodes = config["nodes"]
     node = nodes[name]
-    credential_id = node.get("credential_id") or claude_credential_id(name)
+    credentials = []
+    if not is_claude_codex_bridge(node):
+        credentials = [item["credentialId"] for item in node_keys(node)]
+        if not credentials:
+            credentials = [node.get("credential_id") or claude_credential_id(name)]
     archived_path: Path | None = None
     if claude_node_isolation(node) == "isolated":
         if not is_safe_claude_node_home(name, node):
@@ -5543,14 +5601,32 @@ def remove_claude_node(config: dict[str, Any], name: str | None) -> int:
                 )
                 return 1
             archived_path = archive_path
+    current = config.get("current")
     del nodes[name]
-    if config.get("current") == name:
+    if current == name:
         config["current"] = None
-    save_claude_config(config)
-    if not is_claude_codex_bridge(node):
-        SECRET_STORE.clear(credential_id)
+    try:
+        save(config)
+    except (OSError, ValueError):
+        nodes[name] = node
+        config["current"] = current
+        if archived_path is not None and not home.exists():
+            try:
+                shutil.move(str(archived_path), str(home))
+            except OSError:
+                print(f"Error: could not restore the retained archive at {archived_path} to {home}.", file=sys.stderr)
+        raise
+    cleanup_failed = False
+    for reference in credentials:
+        try:
+            SECRET_STORE.clear(reference)
+        except (OSError, SecureStoreError):
+            cleanup_failed = True
     if archived_path is not None:
         print(f"Archived node config dir to {archived_path}")
+    if cleanup_failed:
+        print("Error: node was unregistered but some credentials could not be cleared.", file=sys.stderr)
+        return 1
     print(f"Removed Claude node '{name}'.")
     return 0
 
@@ -5791,6 +5867,7 @@ def run_claude_desktop_worker(
     name: str,
     *,
     port: int | None = None,
+    key_reference: str | None = None,
 ) -> int:
     if os.name != "nt":
         print("Error: Claude Desktop currently requires Windows.", file=sys.stderr)
@@ -5804,6 +5881,15 @@ def run_claude_desktop_worker(
         node = resolve_claude_desktop_node(config, name)
         if node is None:
             return 1
+        credential_node = node
+        if key_reference is not None:
+            from claude_api_keys import node_keys
+
+            if is_claude_codex_bridge(node) or not any(
+                item["credentialId"] == key_reference for item in node_keys(node)
+            ):
+                raise ClaudeDesktopError("the selected API key changed. Restart this node and select an available key")
+            credential_node = {**node, "credential_id": key_reference}
         try:
             desktop_models = normalize_claude_desktop_models(
                 node.get("desktop_models")
@@ -5845,7 +5931,7 @@ def run_claude_desktop_worker(
                         str(node.get("base_url") or "")
                     ).rstrip("/")
                     upstream_api_key = clean_hidden_prefix(
-                        get_claude_secret(name, node)
+                        get_claude_secret(name, credential_node)
                     )
             except (KeyError, SecureStoreError) as exc:
                 raise ClaudeDesktopError(
@@ -6004,6 +6090,7 @@ def _spawn_claude_desktop_worker(
     name: str,
     *,
     port: int | None,
+    key_reference: str | None = None,
 ) -> int:
     clear_runtime_state(profile_dir)
     clear_startup_error(profile_dir)
@@ -6020,6 +6107,8 @@ def _spawn_claude_desktop_worker(
     ]
     if port is not None:
         command.extend(["--desktop-port", str(port)])
+    if key_reference is not None:
+        command.extend(["--key-reference", key_reference])
     environment = os.environ.copy()
     for key in (*CLAUDE_PROFILE_ENV, "OPENAI_API_KEY", "OPENAI_BASE_URL", "APICODEX_API_KEY"):
         environment.pop(key, None)
@@ -6096,6 +6185,11 @@ def launch_claude_desktop_bridge(
             file=sys.stderr,
         )
         return 1
+    if not is_claude_codex_bridge(node):
+        from claude_api_keys import choose_for_launch
+
+        if not choose_for_launch(config, name, sys.modules[__name__]):
+            return 1
     config["current"] = name
     node["lastUsedAt"] = now_iso()
     save_claude_config(config)
@@ -6105,6 +6199,8 @@ def launch_claude_desktop_bridge(
             "Closing its window will stop the bridge."
         )
         return run_claude_desktop_worker(config, name, port=port)
+    if not is_claude_codex_bridge(node) and node.get("apiKeys"):
+        return _spawn_claude_desktop_worker(profile_dir, name, port=port, key_reference=node["credential_id"])
     return _spawn_claude_desktop_worker(profile_dir, name, port=port)
 
 
@@ -6210,10 +6306,19 @@ def run_claude_node(config: dict[str, Any], name: str, claude_args: list[str]) -
         return 1
     if is_claude_codex_bridge(node):
         return run_claude_codex_bridge_node(config, name, node, claude_args)
+    from claude_api_keys import choose_for_launch
+
+    if not choose_for_launch(config, name, sys.modules[__name__]):
+        return 1
+    try:
+        token = get_claude_secret(name, node)
+    except (KeyError, SecureStoreError, OSError):
+        print(f"Error: could not read the saved API key for Claude node '{name}'.", file=sys.stderr)
+        return 1
     prepared_args, selected_model = prepare_native_claude_args(node, claude_args)
     env = {
         "ANTHROPIC_BASE_URL": clean_hidden_prefix(node.get("base_url", "")),
-        "ANTHROPIC_AUTH_TOKEN": get_claude_secret(name, node),
+        "ANTHROPIC_AUTH_TOKEN": token,
     }
     env.update(claude_native_model_environment(node, selected_model))
     add_claude_proxy_environment(env, node)
@@ -6250,6 +6355,10 @@ def launch_claude_vscode(config: dict[str, Any], name: str) -> int:
             "persistent gateway lifecycle and is not enabled yet.",
             file=sys.stderr,
         )
+        return 1
+    from claude_api_keys import choose_for_launch
+
+    if not choose_for_launch(config, name, sys.modules[__name__]):
         return 1
     try:
         token = get_claude_secret(name, node)
@@ -6383,6 +6492,10 @@ def claude_help() -> None:
   apiclaude --api-profile <name>   Start a specific API node
   apiclaude --yolo                 Start with all permission checks bypassed
   apiclaude --api-remove           Unregister/archive a saved API node
+  apiclaude keys add NODE NAME     Save an additional API key on a native node
+  apiclaude keys list NODE         List key names and the current choice
+  apiclaude keys use NODE NAME     Select a saved API key for the next launch
+  apiclaude sync                  Choose which API upstreams to sync between devices
   apiclaude --proxy                Choose a node and enable/disable its proxy
   apiclaude --proxy --api-profile <name>
                                    Configure the proxy for a specific node
@@ -6489,11 +6602,15 @@ def claude_bridge_main(args: list[str]) -> int:
 def claude_desktop_worker_main(args: list[str]) -> int:
     requested: str | None = None
     port: int | None = None
+    key_reference: str | None = None
     i = 0
     while i < len(args):
         option = args[i]
         if option == "--api-profile" and i + 1 < len(args):
             requested = args[i + 1]
+            i += 1
+        elif option == "--key-reference" and i + 1 < len(args):
+            key_reference = args[i + 1]
             i += 1
         elif option == "--desktop-port" and i + 1 < len(args):
             try:
@@ -6512,7 +6629,7 @@ def claude_desktop_worker_main(args: list[str]) -> int:
     if port is not None and not 1 <= port <= 65535:
         print("Error: --desktop-port must be between 1 and 65535.", file=sys.stderr)
         return 1
-    return run_claude_desktop_worker(load_claude_config(), requested, port=port)
+    return run_claude_desktop_worker(load_claude_config(), requested, port=port, key_reference=key_reference)
 
 
 def claude_legacy_main(args: list[str]) -> int:
@@ -6586,6 +6703,12 @@ def claude_legacy_main(args: list[str]) -> int:
 
 
 def claude_main(args: list[str]) -> int:
+    if args and args[0] == "sync":
+        return upstream_sync_main(args[1:])
+    if args and args[0] == "keys":
+        from claude_api_keys import main as keys_main
+
+        return keys_main(args[1:], sys.modules[__name__])
     if args and args[0] == "--desktop-worker":
         return claude_desktop_worker_main(args[1:])
     if args and args[0] == "shared":
@@ -6768,12 +6891,19 @@ def apiagent_help() -> None:
   apiagent codex [ARGS]     Run/manage Codex API profiles
   apiagent claude [ARGS]    Run/manage Claude API nodes
   apiagent list             List both Codex profiles and Claude nodes
+  apiagent sync             Choose which API upstreams to sync between devices
   apiagent help             Show this help
 
 Shortcuts:
   apicodex [ARGS]
   apiclaude [ARGS]"""
     )
+
+
+def upstream_sync_main(args: list[str]) -> int:
+    from upstream_sync import main as sync_main
+
+    return sync_main(args, sys.modules[__name__])
 
 
 def apiagent_main(args: list[str]) -> int:
@@ -6786,6 +6916,8 @@ def apiagent_main(args: list[str]) -> int:
         return codex_main(rest)
     if target in ("claude", "cl"):
         return claude_main(rest)
+    if target == "sync":
+        return upstream_sync_main(rest)
     if target in ("list", "ls"):
         print("Codex API profiles")
         show_codex_profiles(load_codex_profiles())
