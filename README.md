@@ -262,8 +262,8 @@ profile also requires explicit `--update`. This is not live synchronization with
 Cockpit: refreshing the same copied account in both tools can invalidate an old
 refresh token. Use one active owner for each imported credential chain; separately
 authorized sessions are not the same copied chain. Accounts remain independent.
-macOS supports official account login, while this
-file-import adapter and Desktop launch currently support Windows only.
+macOS supports official account login and isolated Desktop instances. The OAuth
+file-import adapter currently supports Windows only.
 
 ```powershell
 apicodex account status execution --json
@@ -556,6 +556,23 @@ Clone the repo, then run:
 chmod +x install.sh
 ./install.sh
 ```
+
+On macOS, add a desktop shortcut for the profile picker with:
+
+```bash
+./install.sh --desktop-shortcut
+```
+
+Double-click `ChatGPT 多实例.command` on the desktop. Select an API profile
+to open its isolated window, or choose `0` then `1` for the ordinary official
+account. Under `0`, choose `a` to add another official account and sign in
+separately. Different profiles can run together; selecting an already running
+profile returns to its existing window. The `Codex` menu bar item switches
+between running API and named-account instances.
+
+The shortcut uses the installed launcher and contains no repository-specific
+path or credentials. The installer leaves an existing different shortcut in
+place and reports how to move it aside before installing.
 
 After that, use the commands directly:
 
